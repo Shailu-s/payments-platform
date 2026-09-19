@@ -6,6 +6,7 @@
 /bin/
 /build/
 
+CLAUDE.md
 # test and coverage
 *.test
 *.out
