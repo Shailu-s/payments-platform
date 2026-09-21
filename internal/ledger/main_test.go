@@ -2,36 +2,34 @@ package ledger
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
+	"github.com/Shailu-s/payments-platform/internal/testdb"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// These tests run against real Postgres. There is no in-memory substitute:
-// SELECT FOR UPDATE and SERIALIZABLE are the point of phase 3, and a fake that
-// does not implement them honestly would prove nothing.
-const defaultTestDSN = "postgres://payments:payments@localhost:5433/payments?sslmode=disable"
+// Each package gets its own schema, so `go test ./...` can run them in parallel
+// without one package's truncate deleting another's rows. Tests run against
+// real Postgres because phase 3 turns on SELECT FOR UPDATE and SERIALIZABLE,
+// and no in-memory substitute implements those honestly.
+const testSchema = "test_ledger"
 
 var testPool *pgxpool.Pool
 
 func TestMain(m *testing.M) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = defaultTestDSN
-	}
-
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err == nil {
-		err = pool.Ping(ctx)
-	}
+
+	pool, err := testdb.Connect(ctx, testSchema)
 	if err != nil {
-		// Skip rather than fail: a machine without the container running should
-		// report "no database", not a wall of confusing assertion failures.
-		println("skipping ledger tests, no database at " + dsn + ": " + err.Error())
-		println("run `make up && make migrate-up` first")
-		os.Exit(0)
+		// Fail, do not skip: a suite reporting ok having run zero tests is a
+		// green light CI would believe.
+		fmt.Fprint(os.Stderr, testdb.ConnectionHint(err))
+		if os.Getenv("LEDGER_TESTS") == "skip" {
+			os.Exit(0)
+		}
+		os.Exit(1)
 	}
 	testPool = pool
 
@@ -40,21 +38,21 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// resetDB empties the three tables. Registered with t.Cleanup as well as run up
-// front, because cross-test leakage turns one real failure into several fake ones.
+// resetDB empties this package's schema. Registered with t.Cleanup as well as
+// run up front, because cross-test leakage turns one real failure into several
+// fake ones.
 func resetDB(t *testing.T) {
 	t.Helper()
 	truncate := func() {
-		if _, err := testPool.Exec(context.Background(),
-			`TRUNCATE ledger_entries, ledger_transactions, accounts`); err != nil {
-			t.Fatalf("truncate: %v", err)
+		if err := testdb.TruncateAll(context.Background(), testPool, testSchema); err != nil {
+			t.Fatalf("reset: %v", err)
 		}
 	}
 	truncate()
 	t.Cleanup(truncate)
 }
 
-// createAccount inserts an account directly. Phase 1 has no account package yet;
+// createAccount inserts an account directly. Phase 1 has no account package;
 // the ledger only needs the row to exist for the foreign key.
 func createAccount(t *testing.T, id string) {
 	t.Helper()
@@ -64,7 +62,7 @@ func createAccount(t *testing.T, id string) {
 	}
 }
 
-// countRows returns the number of ledger transactions and entries in the database.
+// countRows returns the number of ledger transactions and entries.
 func countRows(t *testing.T) (txns, entries int) {
 	t.Helper()
 	ctx := context.Background()
