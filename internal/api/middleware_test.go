@@ -266,23 +266,12 @@ func TestWrongMethodIsRejected(t *testing.T) {
 	}
 }
 
-// The transfer endpoints are honestly unimplemented rather than faking success.
-func TestTransferEndpointsAreNotImplementedYet(t *testing.T) {
+// The transfer endpoints now exist; a wrong verb is still rejected by the mux.
+func TestTransferRoutesRejectAWrongMethod(t *testing.T) {
 	h, key := newTestServer(t)
 
-	for _, rt := range []struct{ method, path, body string }{
-		{"POST", "/v1/transfers", `{}`},
-		{"GET", "/v1/transfers/tr_1", ""},
-		{"GET", "/v1/transfers", ""},
-	} {
-		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
-			rec := do(t, h, rt.method, rt.path, key, rt.body)
-			if rec.Code != http.StatusNotImplemented {
-				t.Fatalf("status = %d, want 501", rec.Code)
-			}
-			if got := decodeError(t, rec).Code; got != CodeNotImplemented {
-				t.Errorf("error code = %q, want %q", got, CodeNotImplemented)
-			}
-		})
+	rec := do(t, h, "PUT", "/v1/transfers", key, `{}`)
+	if rec.Code == http.StatusOK || rec.Code == http.StatusAccepted {
+		t.Fatalf("PUT /v1/transfers returned %d", rec.Code)
 	}
 }

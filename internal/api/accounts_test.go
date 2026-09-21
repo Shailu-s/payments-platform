@@ -77,8 +77,11 @@ func TestCreateAccountRejectsUnknownFieldsRatherThanIgnoringThem(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 
+	// Excluding the settlement account, which the harness restores because
+	// migration 000003 creates it and every transfer credits it.
 	var count int
-	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM accounts`).Scan(&count); err != nil {
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM accounts WHERE id <> 'acc_settlement_usd'`).Scan(&count); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 0 {
