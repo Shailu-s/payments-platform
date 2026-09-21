@@ -9,7 +9,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -87,6 +86,13 @@ func Insert(ctx context.Context, db Execer, key Key) error {
 // Verify resolves a plaintext key to its row. It returns ErrInvalidKey for
 // anything unknown and ErrRevokedKey for a key that existed and was withdrawn
 // — the caller maps both to 401, but the distinction matters in a log line.
+//
+// There is no constant-time comparison here, deliberately. Timing attacks
+// matter when a secret is compared byte by byte and an early mismatch returns
+// sooner, leaking the prefix one character at a time. This does not compare:
+// it hashes the presented key and asks the database for that exact hash, so
+// either a row exists or it does not. The lookup is an index probe whose timing
+// says nothing about how much of a wrong key was correct.
 func Verify(ctx context.Context, db Querier, plaintext string) (Key, error) {
 	// Cheap shape check first, so a malformed header never reaches the database.
 	if !strings.HasPrefix(plaintext, keyPrefix) || len(plaintext) != len(keyPrefix)+43 {
@@ -108,13 +114,6 @@ func Verify(ctx context.Context, db Querier, plaintext string) (Key, error) {
 	}
 	if err != nil {
 		return Key{}, fmt.Errorf("verify api key: %w", err)
-	}
-
-	// The row was found by its hash, so this can only fail if the database
-	// returned something other than what was asked for. Constant time anyway:
-	// comparison of secret material should not be the one place that leaks.
-	if subtle.ConstantTimeCompare([]byte(key.Hash), []byte(hashKey(plaintext))) != 1 {
-		return Key{}, ErrInvalidKey
 	}
 
 	if key.RevokedAt != nil {
