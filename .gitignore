@@ -6,6 +6,8 @@
 /bin/
 /build/
 
+CLAUDE.md
+PROGRESS.md
 # test and coverage
 *.test
 *.out

@@ -134,6 +134,32 @@ This is the difference between "93% test coverage" (which says nothing) and eigh
 promises with the proof attached. `shortn` opened with measured k6 throughput numbers; this
 one opens with correctness guarantees. Same move, different axis.
 
+## 7. The evidence rule — no claim without a number or a failure
+
+**Every architectural word in the README must be there because it was measured or because a
+failure case forced it.** Not because it is what payment systems have.
+
+If the README says a thing, one of these must be true and visible:
+
+```
+"we use SELECT FOR UPDATE"    → the benchmark against SERIALIZABLE, and why this one won
+"the outbox guarantees X"      → the killed-worker test that would lose the event without it
+"idempotent under concurrency" → the 100-goroutine test, and the double-spend it does without
+"Kafka"                        → the honest answer: a learning gap + the outbox story,
+                                 explicitly NOT "it scales"
+```
+
+This is the single strongest interview differentiator in the project, because almost nobody
+does it. The failure mode it prevents is the one he has: naming a mechanism he cannot justify.
+
+**Mechanically:** every phase below that makes a claim ends with the number or the failed test
+that earns it, produced *in that phase* while the context is fresh. There is no separate
+"benchmarking phase" — a phase that has not produced its evidence is not finished.
+
+**And the cost is:** every phase is ~20% longer, and some measurements will be boring or will
+contradict the assumption. Record the boring ones anyway; "I measured it and the difference was
+noise, so I picked the simpler one" is a senior answer.
+
 ---
 
 # How we build it — seven phases
@@ -188,7 +214,60 @@ CREATED → PROCESSING → SETTLED
                     ↘  FAILED
 ```
 
-**Ends with:** `curl POST /transfers` works end to end.
+### Authentication — API keys, and deliberately no tenancy
+
+**The constraint:** the moment this is a product other people call, an unauthenticated
+`POST /transfers` moves money for anyone who can reach the port. Authentication is not a
+feature here, it is the precondition for the API existing at all.
+
+```
+api_keys
+--------
+id
+key_hash      ← the hash, never the key
+prefix        ← first 8 chars, shown in logs and the dashboard so a key is identifiable
+name
+created_at
+revoked_at
+```
+
+The key is shown **once** at creation and never again, because we only store its hash. The
+`prefix` column exists so a key can be identified in a log line or revoked from the dashboard
+without ever storing the secret. Middleware resolves `Authorization: Bearer <key>` to a key
+row, 401s on missing/unknown/revoked.
+
+**Explicitly out: multi-tenancy.** No `tenant_id` on accounts, transfers or ledger entries. A
+valid key can act on any account. This is a real limitation and the interview answer is the
+honest one:
+
+> "V1 has authentication but not authorisation. Adding tenancy means a `tenant_id` on every
+> table and a scoping check on every read path, and I chose to spend that weekend on
+> correctness under failure instead. Here is exactly where it would go."
+
+Knowing precisely what is missing and why beats having quietly not thought about it.
+
+### Rate limiting — Postgres-backed, correct across instances
+
+**The constraint:** an in-memory counter is wrong the instant there are two API instances —
+two processes each allow the full quota, so the limit is silently double. The limit has to
+live in shared state, and the only shared state in V1 is Postgres.
+
+Sliding window or token bucket in a table, keyed by API key, incremented **atomically** —
+this is the same race as phase 3's idempotency wearing a different hat, and it should be
+recognised as such rather than solved from scratch. Over the limit returns `429` with
+`Retry-After`.
+
+**Evidence required (section 7):** a concurrent test that fires N+20 requests against a limit
+of N from multiple goroutines and asserts exactly N pass — which fails on the naive
+read-then-write implementation. Plus the measured per-request latency cost of the DB round
+trip, because that is the real objection to this design.
+
+**And the cost is:** a database write on every single request, on the hot path. Redis exists
+precisely to avoid that. The defence is that V1 volume does not care and it avoids a container
+for one feature — not that it is better.
+
+**Ends with:** `curl POST /transfers` works end to end with a key, 401s without one, and 429s
+when hammered.
 
 ## Phase 3 — idempotency and concurrency
 
@@ -231,6 +310,20 @@ API → Postgres → worker → MockBank
 
 Building the provider ourselves is a deliberate choice: we get to control exactly how it
 misbehaves, which is what Chaos Mode is built on. One provider is enough for V1.
+
+**The credibility gap — have this answer ready.** We wrote both the client and the provider,
+so we have never fought a real integration: no undocumented behaviour, no vendor support
+ticket, no rate limit we did not design ourselves. An interviewer will notice. The answer is
+not to pretend it is equivalent:
+
+> "I simulated the provider so I could control the failure modes, which means I have tested
+> against failures a real sandbox will not produce on demand — and *not* against the failures
+> I did not think of. That is the trade, and a real rail is V2."
+
+To narrow the gap cheaply, MockBank should be built to a **written API contract document**
+first (endpoints, error codes, webhook payloads, retry semantics) and the client coded against
+that document rather than against the implementation — so at least the integration is against
+a spec, not against shared memory of how it works.
 
 **Ends with:** a transfer that goes `PROCESSING` and later becomes `SETTLED` on its own.
 
@@ -404,8 +497,10 @@ better interview answer than an unjustified service mesh.
 # Scope fence for V1
 
 **In:** one currency (USD), one rail (MockBank), accounts, transfers, double-entry ledger,
-idempotency, concurrency, Kafka, outbox, webhooks in and out, retries, DLQ, reconciliation,
-chaos scenarios, a `/metrics` endpoint with a few counters, the four dashboard screens.
+idempotency, concurrency, **API-key authentication**, **Postgres-backed rate limiting**,
+Kafka, outbox, webhooks in and out, retries, DLQ, reconciliation, chaos scenarios, a
+`/metrics` endpoint with a few counters, the four dashboard screens, **and the measured
+evidence behind every claim (section 7)**.
 
 **Out — and this list is the reason the project will actually finish:**
 
@@ -413,11 +508,22 @@ chaos scenarios, a `/metrics` endpoint with a few counters, the four dashboard s
 cards          crypto         FX / multi-currency      real bank integration
 Kubernetes     fraud          KYC / AML                multi-region
 Redis          OpenTelemetry tracing                   Grafana dashboards
-microservices
+microservices  multi-tenancy / authorisation           OAuth / user accounts
 ```
 
-Redis is out because nothing in V1 needs it and `shortn` already covers Redis. Tracing is out
-until there is a latency question worth answering.
+Redis is out because nothing in V1 needs it and `shortn` already covers Redis — the rate
+limiter uses Postgres instead, and the cost of that is recorded in phase 2 rather than hidden.
+Tracing is out until there is a latency question worth answering.
+
+**Multi-tenancy is out, and this is the one to say out loud before being asked.** V1 has
+authentication (who is calling) but not authorisation (what they may touch): a valid API key
+can act on any account. Adding it means `tenant_id` on every table and a scoping check on
+every read path. Deliberate trade — that weekend went to correctness under failure.
+
+⚠️ **Scope was already expanded once, on day zero** (auth, rate limiting and the evidence rule
+were added on 2026-09-19 before any code existed). That is the exact behaviour that killed
+`card-engine`. Phase count stayed at seven on purpose. **Nothing else gets added to V1 until
+phase 4 is running.**
 
 Later versions, strictly after V1 is complete and only if wanted:
 
@@ -443,6 +549,11 @@ than the identity of the project.
 - **Every phase runs before the next begins.** No exceptions — this is what `card-engine`
   got wrong.
 - **Write the failing test first** for every one of the eight guarantees. Watch it fail.
+- **No claim without evidence (section 7).** A phase that has not produced the number or the
+  failed test behind its architectural claims is not finished, and the next phase does not
+  start.
+- **The scope fence is closed until phase 4 runs.** It was opened once on day zero; that was
+  the allowance, not a precedent.
 - **Small, reviewable commits** following the build order. No AI attribution trailers, ever.
   After the first commit, stop and let him review before continuing.
 - **Never commit secrets or generated files.** `git status --porcelain -uall` before staging.
@@ -470,5 +581,28 @@ Decisions made in the design conversation:
   because V1 volume needs it.
 - Standalone repo outside `interview-helper`, identity `Shailu-s` set locally.
 
+**2026-09-19 (same day, second session) — plan amended. Still nothing built.**
+Reviewed the plan against "is this good enough for a senior/staff portfolio?" Verdict: the
+idea is good (7.5/10 as designed, 9/10 if Chaos Mode ships) and further design work has near-
+zero return. Four gaps were found that the plan did not address; three were closed, one was
+recorded as a known limitation:
+- **Added section 7, the evidence rule** — his own framing, and the strongest change made:
+  every architectural word in the README must be earned by a measurement or a failure case.
+  Chosen over a separate Phase 8 benchmarking phase, so the phase count stays at seven and the
+  numbers get produced while the context is fresh.
+- **Added API-key auth to phase 2** — authn only, hashed keys with a visible prefix.
+  Multi-tenancy explicitly rejected for V1 because `tenant_id` would touch phase 1's schema and
+  every read path; the limitation is now stated in the scope fence rather than left to be
+  discovered in an interview.
+- **Added Postgres-backed rate limiting to phase 2** — chosen over in-memory (wrong with two
+  instances) and over Redis (contradicts the stated reason Redis is out). It is the phase 3
+  concurrency race in a different costume, deliberately.
+- **Recorded the MockBank credibility gap in phase 4** — we write both sides, so no real
+  integration was ever fought. Mitigation: build MockBank to a written API contract and code
+  the client against that document, not against the implementation.
+⚠️ Scope was expanded on day zero with no code written — named in the scope fence as the
+`card-engine` failure mode. Phase count held at seven; fence closed until phase 4 runs.
+
 **Next session — Phase 1:** the three tables, the balanced-transaction writer, the derived
-balance, and the two tests (books balance; float loses money).
+balance, and the two tests (books balance; float loses money). Auth and rate limiting are
+phase 2 — do not start them early.
