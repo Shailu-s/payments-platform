@@ -1,7 +1,7 @@
 DB_URL ?= postgres://payments:payments@localhost:5433/payments?sslmode=disable
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys
 
 up:
 	$(COMPOSE) up -d --wait
@@ -20,5 +20,16 @@ migrate-down:
 
 migrate-redo: migrate-down migrate-up
 
+# -p 1 runs one package at a time. Packages share one database and each
+# truncates every table, so running them in parallel has one package deleting
+# another's rows mid-test.
 test:
-	go test ./... -count=1
+	go test ./... -count=1 -p 1
+
+# Mint an API key and print it once. NAME is required: `make apikey NAME="local dev"`
+apikey:
+	@DATABASE_URL="$(DB_URL)" go run ./cmd/apikey -name "$(NAME)"
+
+# List keys. Shows the prefix, never the secret.
+apikeys:
+	@DATABASE_URL="$(DB_URL)" go run ./cmd/apikey -list
