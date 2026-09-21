@@ -10,6 +10,7 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,7 +55,7 @@ type Decision struct {
 // than interleave. This is exactly the mechanism phase 3 uses for idempotency,
 // and recognising it as the same race in different clothing is the point.
 func (l *Limiter) Allow(ctx context.Context, apiKeyID string) (Decision, error) {
-	windowStart := l.windowStart(time.Now())
+	windowStart := l.windowStart(nowUTC())
 	resetAt := windowStart.Add(l.window)
 
 	const q = `
@@ -90,6 +91,9 @@ func (l *Limiter) windowStart(now time.Time) time.Time {
 	return now.UTC().Truncate(l.window)
 }
 
+// nowUTC exists so tests can share one notion of the clock with Allow.
+func nowUTC() time.Time { return time.Now().UTC() }
+
 // Sweep deletes windows that have rolled over. Without it the table grows by
 // one row per key per window forever, which is the obvious follow-up question
 // to any counter kept in a database.
@@ -103,38 +107,32 @@ func (l *Limiter) Sweep(ctx context.Context, olderThan time.Duration) (int64, er
 	return tag.RowsAffected(), nil
 }
 
-// AllowNaive is the wrong implementation, kept because it is the evidence.
+// RunSweeper deletes rolled-over windows on a ticker until ctx is cancelled.
 //
-// It reads the count, decides, then writes — which is correct in a single
-// thread and broken the moment two requests overlap: both read the same value,
-// both conclude they are under the limit, and both write back the same
-// increment. The test fires N+20 concurrent requests at a limit of N and
-// watches this let far more than N through.
-//
-// Not called by the middleware. It exists so the failure can be demonstrated
-// rather than asserted.
-func (l *Limiter) AllowNaive(ctx context.Context, apiKeyID string) (Decision, error) {
-	windowStart := l.windowStart(time.Now())
+// Without it the table grows by one row per key per window forever. Running it
+// in the API process rather than as a scheduled job is a V1 shortcut: with
+// several instances every one of them sweeps, which is wasteful but harmless
+// because DELETE of an already-deleted row is a no-op. Phase 5 brings workers,
+// and this moves there.
+func (l *Limiter) RunSweeper(ctx context.Context, every, retain time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
 
-	var count int
-	const read = `SELECT count FROM rate_limits WHERE api_key_id = $1 AND window_start = $2`
-	err := l.db.QueryRow(ctx, read, apiKeyID, windowStart).Scan(&count)
-	if err != nil && err != pgx.ErrNoRows {
-		return Decision{}, fmt.Errorf("naive rate limit read %s: %w", apiKeyID, err)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			removed, err := l.Sweep(ctx, retain)
+			if err != nil {
+				// Logged, not fatal: a failed sweep wastes disk, while a
+				// crashed API refuses payments.
+				slog.WarnContext(ctx, "rate limit sweep failed", "error", err)
+				continue
+			}
+			if removed > 0 {
+				slog.InfoContext(ctx, "swept rate limit windows", "removed", removed)
+			}
+		}
 	}
-
-	if count >= l.limit {
-		return Decision{Allowed: false, Limit: l.limit}, nil
-	}
-
-	const write = `
-		INSERT INTO rate_limits (api_key_id, window_start, count)
-		VALUES ($1, $2, 1)
-		ON CONFLICT (api_key_id, window_start)
-		DO UPDATE SET count = rate_limits.count + 1`
-	if _, err := l.db.Exec(ctx, write, apiKeyID, windowStart); err != nil {
-		return Decision{}, fmt.Errorf("naive rate limit write %s: %w", apiKeyID, err)
-	}
-
-	return Decision{Allowed: true, Limit: l.limit, Remaining: l.limit - count - 1}, nil
 }

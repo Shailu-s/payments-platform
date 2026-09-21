@@ -205,7 +205,7 @@ func TestNaiveImplementationOvershootsUnderConcurrency(t *testing.T) {
 			defer done.Done()
 			start.Wait()
 
-			decision, err := limiter.AllowNaive(ctx, keyID)
+			decision, err := limiter.allowNaive(ctx, keyID)
 			if err == nil && decision.Allowed {
 				allowed.Add(1)
 			}
@@ -317,5 +317,60 @@ func TestSweepRemovesOldWindowsOnly(t *testing.T) {
 	}
 	if remaining != 1 {
 		t.Errorf("%d windows remain, want 1: the current window must survive", remaining)
+	}
+}
+
+// The sweeper must actually run on its ticker and stop when cancelled. A
+// background goroutine that silently does nothing is worse than no sweeper,
+// because the table grows while the code claims otherwise.
+func TestRunSweeperDeletesOnItsTickerAndStops(t *testing.T) {
+	keyID := newKey(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	limiter := New(testPool, 10, time.Minute)
+
+	// Two stale windows, written directly.
+	for _, age := range []time.Duration{2 * time.Hour, 3 * time.Hour} {
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO rate_limits (api_key_id, window_start, count) VALUES ($1, $2, 5)`,
+			keyID, time.Now().UTC().Add(-age)); err != nil {
+			t.Fatalf("insert stale window: %v", err)
+		}
+	}
+
+	go limiter.RunSweeper(ctx, 50*time.Millisecond, time.Hour)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var remaining int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM rate_limits`).Scan(&remaining); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the sweeper left %d stale windows after 3s", remaining)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// After cancellation it must stop: a new stale row survives.
+	cancel()
+	time.Sleep(150 * time.Millisecond)
+
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO rate_limits (api_key_id, window_start, count) VALUES ($1, $2, 5)`,
+		keyID, time.Now().UTC().Add(-4*time.Hour)); err != nil {
+		t.Fatalf("insert after cancel: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	var remaining int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM rate_limits`).Scan(&remaining); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if remaining != 1 {
+		t.Errorf("%d rows after cancellation, want 1: the sweeper did not stop", remaining)
 	}
 }

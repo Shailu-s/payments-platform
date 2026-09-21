@@ -38,6 +38,11 @@ type Server struct {
 const (
 	DefaultRateLimit  = 100
 	DefaultRateWindow = time.Minute
+
+	// Windows are retained well past their expiry so a sweep can never race a
+	// request that is still counting against one.
+	sweepInterval  = 5 * time.Minute
+	sweepRetention = time.Hour
 )
 
 func NewServer(pool *pgxpool.Pool) *Server {
@@ -45,6 +50,16 @@ func NewServer(pool *pgxpool.Pool) *Server {
 		db:      pool,
 		limiter: ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
 	}
+}
+
+// StartRateLimitSweeper removes rolled-over rate limit windows in the
+// background until ctx is cancelled. Without it the table grows by one row per
+// key per window forever.
+func (s *Server) StartRateLimitSweeper(ctx context.Context) {
+	if s.limiter == nil {
+		return
+	}
+	go s.limiter.RunSweeper(ctx, sweepInterval, sweepRetention)
 }
 
 // Handler builds the router. Routes are declared with their method, so a GET to

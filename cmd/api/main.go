@@ -38,9 +38,16 @@ func main() {
 	}
 	defer pool.Close()
 
+	// Cancelled on shutdown, which stops the background sweeper.
+	backgroundCtx, stopBackground := context.WithCancel(ctx)
+	defer stopBackground()
+
+	apiServer := api.NewServer(pool)
+	apiServer.StartRateLimitSweeper(backgroundCtx)
+
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: api.NewServer(pool).Handler(),
+		Handler: apiServer.Handler(),
 		// A client that opens a connection and sends nothing must not hold a
 		// slot forever; these bound how long one can.
 		ReadHeaderTimeout: 5 * time.Second,
@@ -65,6 +72,7 @@ func main() {
 
 	<-shutdown
 	slog.Info("shutting down, waiting for in-flight requests")
+	stopBackground()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
