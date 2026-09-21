@@ -23,6 +23,11 @@ const settlementAccountID = "acc_settlement_usd"
 const (
 	defaultPageSize = 25
 	maxPageSize     = 100
+
+	// Bounded because the value is stored on every transfer and appears in log
+	// lines. A uuid is 36 characters; this leaves room for a client's own
+	// scheme without letting one send a megabyte.
+	maxIdempotencyKeyLength = 255
 )
 
 type createTransferRequest struct {
@@ -82,6 +87,16 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The client generates this, and it has to: the server cannot tell a retry
+	// from a genuine second payment, because the two are byte for byte
+	// identical. The difference exists only in the caller's knowledge that it
+	// is sending the same instruction again.
+	idempotencyKey, msg, ok := idempotencyKeyFrom(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, msg)
+		return
+	}
+
 	var req createTransferRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -103,7 +118,7 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	transfer, err := s.createTransfer(r.Context(), req, key.ID)
+	transfer, err := s.createTransfer(r.Context(), req, key.ID, idempotencyKey)
 	if err != nil {
 		writeInternalError(w, r, err)
 		return
@@ -124,7 +139,27 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 // Note what makes this possible: ledger.Record takes a Beginner and
 // transfers.Insert takes a Querier, so both accept the pgx.Tx started here.
 // Had phase 1 typed those as *pgxpool.Pool, this handler could not be atomic.
-func (s *Server) createTransfer(ctx context.Context, req createTransferRequest, apiKeyID string) (transfers.Transfer, error) {
+func (s *Server) createTransfer(ctx context.Context, req createTransferRequest, apiKeyID, idempotencyKey string) (transfers.Transfer, error) {
+	// PHASE 3.1 — THE BROKEN VERSION. The fix is 3.2.
+	//
+	// Look for an existing transfer with this key, and only create one if
+	// nothing came back. This reads as obviously correct and it is the answer
+	// most people give.
+	//
+	// It is wrong. Two requests arriving together both run this query, both
+	// find nothing, and both go on to insert. The window between the read and
+	// the write is where the money doubles, and no amount of care in
+	// application code closes it — the two requests may be in different
+	// processes, so a mutex does not help either.
+	existing, err := transfers.FindByIdempotencyKey(ctx, s.db, idempotencyKey)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, transfers.ErrNotFound) {
+		return transfers.Transfer{}, err
+	}
+	// ↑ the gap. Everything that has already reached here is about to insert.
+
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return transfers.Transfer{}, fmt.Errorf("begin: %w", err)
@@ -141,8 +176,9 @@ func (s *Server) createTransfer(ctx context.Context, req createTransferRequest, 
 		Currency:           req.Currency,
 		// processing, not created: the instruction is accepted and the
 		// accounting is written, so there is no moment where it sits idle.
-		Status:   transfers.StatusProcessing,
-		APIKeyID: apiKeyID,
+		Status:         transfers.StatusProcessing,
+		APIKeyID:       apiKeyID,
+		IdempotencyKey: &idempotencyKey,
 	})
 	if err != nil {
 		return transfers.Transfer{}, err
@@ -168,6 +204,26 @@ func (s *Server) createTransfer(ctx context.Context, req createTransferRequest, 
 		return transfers.Transfer{}, fmt.Errorf("commit transfer %s: %w", transfer.ID, err)
 	}
 	return transfer, nil
+}
+
+// idempotencyKeyFrom reads and validates the Idempotency-Key header.
+//
+// Required, not optional. An optional key is forgotten exactly when it matters,
+// and the cost of forgetting it is a duplicate payment. Stripe makes it
+// optional for backward compatibility with clients that predate it; this API
+// has no such history.
+func idempotencyKeyFrom(r *http.Request) (key, message string, ok bool) {
+	key = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+
+	switch {
+	case key == "":
+		return "", "Idempotency-Key header is required: send a unique value per " +
+			"payment so a retry cannot create a second one", false
+	case len(key) > maxIdempotencyKeyLength:
+		return "", fmt.Sprintf("Idempotency-Key must be at most %d characters, got %d",
+			maxIdempotencyKeyLength, len(key)), false
+	}
+	return key, "", true
 }
 
 func validateTransferRequest(req *createTransferRequest) (string, bool) {

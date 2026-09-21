@@ -17,7 +17,8 @@ func createTransfer(t *testing.T, h http.Handler, key, source, destination strin
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":%d,"currency":"USD"}`,
 		source, destination, amount)
 
-	rec := do(t, h, "POST", "/v1/transfers", key, body)
+	// A fresh key per call: these are distinct payments, not retries of one.
+	rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), body)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("POST /v1/transfers status = %d, want 202: %s", rec.Code, rec.Body.String())
 	}
@@ -122,7 +123,7 @@ func TestRejectedTransferLeavesNothingBehind(t *testing.T) {
 	// would have to touch the database.
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":"acc_nope","amount":500,"currency":"USD"}`,
 		source.ID)
-	rec := do(t, h, "POST", "/v1/transfers", key, body)
+	rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), body)
 	if rec.Code == http.StatusAccepted {
 		t.Fatal("a transfer to a nonexistent account was accepted")
 	}
@@ -153,7 +154,7 @@ func TestCreateTransferRejectsBadInput(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := do(t, h, "POST", "/v1/transfers", key, tc.body)
+			rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), tc.body)
 			if rec.Code != tc.status {
 				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.status, rec.Body.String())
 			}
@@ -171,7 +172,7 @@ func TestCreateTransferRejectsAFractionalAmount(t *testing.T) {
 
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":500.75,"currency":"USD"}`,
 		source.ID, destination.ID)
-	rec := do(t, h, "POST", "/v1/transfers", key, body)
+	rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), body)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400: a fractional amount must not be truncated", rec.Code)
@@ -364,7 +365,7 @@ func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
 		source.ID, destination.ID)
-	rec := do(t, h, "POST", "/v1/transfers", key, body)
+	rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), body)
 
 	if rec.Code == http.StatusAccepted {
 		t.Fatal("a transfer was accepted although its ledger entries could not be written")
