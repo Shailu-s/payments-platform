@@ -33,8 +33,11 @@ const (
 	CodeIdempotencyInFlight = "idempotency_key_in_flight"
 	// The key was used for a different request. A client bug, not a retry.
 	CodeIdempotencyKeyReused = "idempotency_key_reused"
-	CodeNotImplemented       = "not_implemented"
-	CodeInternal             = "internal_error"
+	// The source account cannot cover the transfer. A client error: they asked
+	// to spend money that is not there.
+	CodeInsufficientFunds = "insufficient_funds"
+	CodeNotImplemented    = "not_implemented"
+	CodeInternal          = "internal_error"
 )
 
 // writeJSON sends a value as JSON. An encoding failure here is already too late

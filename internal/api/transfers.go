@@ -16,6 +16,11 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/transfers"
 )
 
+// ErrInsufficientFunds means the source account cannot cover the transfer.
+// Exported so the handler can map it to 422 rather than 500: a caller spending
+// money they do not have is a client error, not a system failure.
+var ErrInsufficientFunds = errors.New("insufficient funds")
+
 // The platform settlement account, created by migration 000003. Every transfer
 // credits this one account: at commit time the money is ours and earmarked, and
 // the destination is credited by a second ledger transaction in phase 4 when
@@ -121,6 +126,11 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transfer, status, err := s.createTransfer(r.Context(), req, key.ID, idempotencyKey)
+	if errors.Is(err, ErrInsufficientFunds) {
+		writeError(w, http.StatusUnprocessableEntity, CodeInsufficientFunds,
+			"the source account does not have enough money for this transfer")
+		return
+	}
 	if err != nil {
 		writeInternalError(w, r, err)
 		return
@@ -194,6 +204,27 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	// Harmless after a successful commit, and it is what releases the
 	// connection on every early return below.
 	defer tx.Rollback(ctx)
+
+	// PHASE 3.3 — THE BROKEN BALANCE CHECK. The fix is 3.4.
+	//
+	// Read the balance, decide, then write. The third instance of the same
+	// shape in this project, after the rate limiter and idempotency: two
+	// concurrent transfers both read $1,000, both conclude $700 is affordable,
+	// and both proceed. The account ends at -$400.
+	//
+	// Note what does NOT catch this. Each transfer is internally balanced —
+	// debits equal credits — so guarantee 1 holds perfectly the whole time. An
+	// invariant that is true of every transaction individually says nothing
+	// about their combination.
+	balance, err := ledger.Balance(ctx, tx, req.SourceAccount)
+	if err != nil {
+		return transfers.Transfer{}, err
+	}
+	if balance-req.Amount < 0 {
+		return transfers.Transfer{}, ErrInsufficientFunds
+	}
+	// ↑ the gap. Everything that has already read this balance is about to
+	// spend against it.
 
 	transfer, err := transfers.Insert(ctx, tx, transfers.Transfer{
 		ID:                 newID("tr"),
