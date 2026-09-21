@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -136,6 +137,47 @@ func withRecovery(next http.Handler) http.Handler {
 					"something went wrong on our side")
 			}
 		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withRateLimit caps requests per API key. It runs after auth because the limit
+// is per key: there is nothing to count against until the caller is known, and
+// counting by IP would let one caller behind a NAT exhaust everyone's quota.
+func (s *Server) withRateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.limiter == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		key, ok := APIKeyFrom(r.Context())
+		if !ok {
+			// Unreachable behind withAuth. Failing closed rather than open,
+			// because an unlimited path is worse than a rejected request.
+			writeError(w, http.StatusUnauthorized, CodeUnauthorized, "no authenticated api key")
+			return
+		}
+
+		decision, err := s.limiter.Allow(r.Context(), key.ID)
+		if err != nil {
+			writeInternalError(w, r, err)
+			return
+		}
+
+		// Sent on every response, not just refusals, so a caller can pace
+		// itself instead of discovering the limit by hitting it.
+		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(decision.Limit))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(decision.Remaining))
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(decision.ResetAt.Unix(), 10))
+
+		if !decision.Allowed {
+			w.Header().Set("Retry-After", strconv.Itoa(int(decision.RetryAfter.Seconds())))
+			writeError(w, http.StatusTooManyRequests, CodeRateLimited,
+				"rate limit exceeded, retry after "+decision.RetryAfter.String())
+			return
+		}
+
 		next.ServeHTTP(w, r)
 	})
 }

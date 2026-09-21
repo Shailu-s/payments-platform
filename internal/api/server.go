@@ -8,6 +8,9 @@ package api
 import (
 	"context"
 	"net/http"
+	"time"
+
+	"github.com/Shailu-s/payments-platform/internal/ratelimit"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -26,11 +29,22 @@ type DB interface {
 }
 
 type Server struct {
-	db DB
+	db      DB
+	limiter *ratelimit.Limiter
 }
 
+// Requests per key per window. Small on purpose: this is a portfolio system,
+// and a limit nobody can reach proves nothing.
+const (
+	DefaultRateLimit  = 100
+	DefaultRateWindow = time.Minute
+)
+
 func NewServer(pool *pgxpool.Pool) *Server {
-	return &Server{db: pool}
+	return &Server{
+		db:      pool,
+		limiter: ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
+	}
 }
 
 // Handler builds the router. Routes are declared with their method, so a GET to
@@ -48,7 +62,9 @@ func (s *Server) Handler() http.Handler {
 	// "alive" are different questions with different remedies.
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	authenticated := chain(s.routes(), s.withAuth)
+	// Auth before the rate limit: the limit is per key, so there is nothing to
+	// count against until the caller is known.
+	authenticated := chain(s.routes(), s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)
 
 	// Applied outermost first. Recovery wraps everything so a panic anywhere
