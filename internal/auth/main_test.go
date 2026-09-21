@@ -6,30 +6,20 @@ import (
 	"os"
 	"testing"
 
+	"github.com/Shailu-s/payments-platform/internal/testdb"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const defaultTestDSN = "postgres://payments:payments@localhost:5433/payments?sslmode=disable"
+const testSchema = "test_auth"
 
 var testPool *pgxpool.Pool
 
 func TestMain(m *testing.M) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = defaultTestDSN
-	}
-
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err == nil {
-		err = pool.Ping(ctx)
-	}
+
+	pool, err := testdb.Connect(ctx, testSchema)
 	if err != nil {
-		// Fail rather than skip: a suite reporting ok having run nothing is a
-		// green light CI would believe.
-		fmt.Fprintf(os.Stderr, "\nno database at %s: %v\n", dsn, err)
-		fmt.Fprintf(os.Stderr, "run `make up && make migrate-up` first, or set "+
-			"LEDGER_TESTS=skip to skip these deliberately\n\n")
+		fmt.Fprint(os.Stderr, testdb.ConnectionHint(err))
 		if os.Getenv("LEDGER_TESTS") == "skip" {
 			os.Exit(0)
 		}
@@ -45,32 +35,8 @@ func TestMain(m *testing.M) {
 func resetDB(t *testing.T) {
 	t.Helper()
 	truncate := func() {
-		// Every table except the migration bookkeeping. Listed by query rather
-		// than by hand: a hand-written list goes stale the moment a migration
-		// adds a table, and the failure is a confusing foreign key error in an
-		// unrelated package.
-		if _, err := testPool.Exec(context.Background(), `
-			DO $$
-			DECLARE tables text;
-			BEGIN
-				SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
-				INTO tables
-				FROM pg_tables
-				WHERE schemaname = 'public' AND tablename <> 'schema_migrations';
-				IF tables IS NOT NULL THEN
-					EXECUTE 'TRUNCATE ' || tables || ' CASCADE';
-				END IF;
-			END $$`); err != nil {
-			t.Fatalf("truncate: %v", err)
-		}
-		// Truncating accounts removes the settlement account that migration
-		// 000003 creates, and every transfer credits it. Restored here rather
-		// than in each test, so a forgotten setup cannot make a test pass for
-		// the wrong reason.
-		if _, err := testPool.Exec(context.Background(),
-			`INSERT INTO accounts (id, currency, type) VALUES ('acc_settlement_usd', 'USD', 'settlement')
-			 ON CONFLICT (id) DO NOTHING`); err != nil {
-			t.Fatalf("restore settlement account: %v", err)
+		if err := testdb.TruncateAll(context.Background(), testPool, testSchema); err != nil {
+			t.Fatalf("reset: %v", err)
 		}
 	}
 	truncate()

@@ -20,11 +20,11 @@ migrate-down:
 
 migrate-redo: migrate-down migrate-up
 
-# -p 1 runs one package at a time. Packages share one database and each
-# truncates every table, so running them in parallel has one package deleting
-# another's rows mid-test.
+# No -p 1: each package migrates into its own schema (internal/testdb), so
+# parallel packages cannot see each other's tables. `go test ./...` on its own
+# works too, which matters because that is what anyone cloning this runs.
 test:
-	go test ./... -count=1 -p 1
+	go test ./... -count=1
 
 # Walk through everything phase 2 built, against a running API.
 # Needs `make run` in another terminal.

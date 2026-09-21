@@ -10,28 +10,20 @@ import (
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/auth"
+	"github.com/Shailu-s/payments-platform/internal/testdb"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const defaultTestDSN = "postgres://payments:payments@localhost:5433/payments?sslmode=disable"
+const testSchema = "test_ratelimit"
 
 var testPool *pgxpool.Pool
 
 func TestMain(m *testing.M) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = defaultTestDSN
-	}
-
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err == nil {
-		err = pool.Ping(ctx)
-	}
+
+	pool, err := testdb.Connect(ctx, testSchema)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nno database at %s: %v\n", dsn, err)
-		fmt.Fprintf(os.Stderr, "run `make up && make migrate-up` first, or set "+
-			"LEDGER_TESTS=skip to skip these deliberately\n\n")
+		fmt.Fprint(os.Stderr, testdb.ConnectionHint(err))
 		if os.Getenv("LEDGER_TESTS") == "skip" {
 			os.Exit(0)
 		}
@@ -44,18 +36,21 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// newKey resets the tables and returns a live api key id to count against.
+// truncateAll empties this package's schema.
+func truncateAll(tb testing.TB) {
+	tb.Helper()
+	if err := testdb.TruncateAll(context.Background(), testPool, testSchema); err != nil {
+		tb.Fatalf("reset: %v", err)
+	}
+}
+
+// newKey resets the schema and returns a live api key id to count against.
 func newKey(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 
 	truncateAll(t)
-	t.Cleanup(func() {
-		truncateAll(t)
-		testPool.Exec(context.Background(),
-			`INSERT INTO accounts (id, currency, type) VALUES ('acc_settlement_usd', 'USD', 'settlement')
-			 ON CONFLICT (id) DO NOTHING`)
-	})
+	t.Cleanup(func() { truncateAll(t) })
 
 	_, key, err := auth.Generate("rate limit test")
 	if err != nil {
@@ -65,26 +60,6 @@ func newKey(t *testing.T) string {
 		t.Fatalf("Insert: %v", err)
 	}
 	return key.ID
-}
-
-// truncateAll empties every table, listed by query rather than by hand: a
-// hand-written list goes stale the moment a migration adds a table.
-func truncateAll(tb testing.TB) {
-	tb.Helper()
-	if _, err := testPool.Exec(context.Background(), `
-		DO $$
-		DECLARE tables text;
-		BEGIN
-			SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
-			INTO tables
-			FROM pg_tables
-			WHERE schemaname = 'public' AND tablename <> 'schema_migrations';
-			IF tables IS NOT NULL THEN
-				EXECUTE 'TRUNCATE ' || tables || ' CASCADE';
-			END IF;
-		END $$`); err != nil {
-		tb.Fatalf("truncate: %v", err)
-	}
 }
 
 func TestAllowPermitsUpToTheLimitThenRefuses(t *testing.T) {
