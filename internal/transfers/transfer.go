@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Status values. Mutable, unlike a ledger entry, and that distinction is
@@ -27,7 +29,13 @@ const (
 	StatusFailed     = "failed"
 )
 
-var ErrNotFound = errors.New("transfer not found")
+var (
+	ErrNotFound = errors.New("transfer not found")
+	// ErrDuplicateKey means the unique index on idempotency_key refused this
+	// insert: another request already owns the key. It is not a failure, it is
+	// the signal that this request is a retry.
+	ErrDuplicateKey = errors.New("idempotency key already used")
+)
 
 type Transfer struct {
 	ID                 string
@@ -42,8 +50,11 @@ type Transfer struct {
 	// because transfers created by anything other than the API — a reversal in
 	// phase 4, say — have no client instruction behind them.
 	IdempotencyKey *string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// A hash of the request that created this transfer. Same key with a
+	// different fingerprint is a client bug rather than a retry.
+	RequestFingerprint *string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // Querier is satisfied by a pool, a connection and a transaction alike, so
@@ -55,24 +66,41 @@ type Querier interface {
 }
 
 const columns = `id, source_account, destination_account, amount, currency,
-	status, ledger_txn_id, api_key_id, idempotency_key, created_at, updated_at`
+	status, ledger_txn_id, api_key_id, idempotency_key, request_fingerprint,
+	created_at, updated_at`
 
 // Insert writes a transfer row and returns it as stored.
 func Insert(ctx context.Context, db Querier, t Transfer) (Transfer, error) {
 	const q = `
 		INSERT INTO transfers (id, source_account, destination_account, amount,
-			currency, status, ledger_txn_id, api_key_id, idempotency_key)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			currency, status, ledger_txn_id, api_key_id, idempotency_key,
+			request_fingerprint)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING ` + columns
 
 	row := db.QueryRow(ctx, q, t.ID, t.SourceAccount, t.DestinationAccount, t.Amount,
-		t.Currency, t.Status, t.LedgerTxnID, t.APIKeyID, t.IdempotencyKey)
+		t.Currency, t.Status, t.LedgerTxnID, t.APIKeyID, t.IdempotencyKey,
+		t.RequestFingerprint)
 
 	stored, err := scan(row)
+	if IsDuplicateKey(err) {
+		// The unique index fired: another request holds this key. Returned
+		// unwrapped so the caller can branch on it without unwrapping first.
+		return Transfer{}, ErrDuplicateKey
+	}
 	if err != nil {
 		return Transfer{}, fmt.Errorf("insert transfer %s: %w", t.ID, err)
 	}
 	return stored, nil
+}
+
+// IsDuplicateKey reports whether an error is Postgres 23505, unique_violation.
+//
+// Branching on the SQLSTATE rather than on a string match of the message: the
+// message is localised and can change between versions, the code cannot.
+func IsDuplicateKey(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation
 }
 
 // SetLedgerTxn links a transfer to the ledger transaction that recorded its
@@ -174,6 +202,6 @@ func scan(row scannable) (Transfer, error) {
 	var t Transfer
 	err := row.Scan(&t.ID, &t.SourceAccount, &t.DestinationAccount, &t.Amount,
 		&t.Currency, &t.Status, &t.LedgerTxnID, &t.APIKeyID, &t.IdempotencyKey,
-		&t.CreatedAt, &t.UpdatedAt)
+		&t.RequestFingerprint, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }
