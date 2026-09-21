@@ -45,8 +45,22 @@ func TestMain(m *testing.M) {
 func resetDB(t *testing.T) {
 	t.Helper()
 	truncate := func() {
-		if _, err := testPool.Exec(context.Background(),
-			`TRUNCATE transfers, api_keys, ledger_entries, ledger_transactions, accounts`); err != nil {
+		// Every table except the migration bookkeeping. Listed by query rather
+		// than by hand: a hand-written list goes stale the moment a migration
+		// adds a table, and the failure is a confusing foreign key error in an
+		// unrelated package.
+		if _, err := testPool.Exec(context.Background(), `
+			DO $$
+			DECLARE tables text;
+			BEGIN
+				SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
+				INTO tables
+				FROM pg_tables
+				WHERE schemaname = 'public' AND tablename <> 'schema_migrations';
+				IF tables IS NOT NULL THEN
+					EXECUTE 'TRUNCATE ' || tables || ' CASCADE';
+				END IF;
+			END $$`); err != nil {
 			t.Fatalf("truncate: %v", err)
 		}
 		// Truncating accounts removes the settlement account that migration
