@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/auth"
+	"github.com/Shailu-s/payments-platform/internal/ratelimit"
 )
 
 // The precondition for the API existing at all: no key, no money moved.
@@ -273,5 +276,102 @@ func TestTransferRoutesRejectAWrongMethod(t *testing.T) {
 	rec := do(t, h, "PUT", "/v1/transfers", key, `{}`)
 	if rec.Code == http.StatusOK || rec.Code == http.StatusAccepted {
 		t.Fatalf("PUT /v1/transfers returned %d", rec.Code)
+	}
+}
+
+// The limit is enforced through the real middleware chain, not just in the
+// limiter package.
+func TestRateLimitReturns429ThroughTheChain(t *testing.T) {
+	resetDB(t)
+	ctx := context.Background()
+
+	plaintext, key, err := auth.Generate("rate limited")
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if err := auth.Insert(ctx, testPool, key); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	const limit = 3
+	s := &Server{db: testPool, limiter: ratelimit.New(testPool, limit, time.Minute)}
+	h := s.Handler()
+
+	for i := 1; i <= limit; i++ {
+		rec := do(t, h, "GET", "/v1/transfers", plaintext, "")
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d was rate limited, want allowed within a limit of %d", i, limit)
+		}
+		if got := rec.Header().Get("X-RateLimit-Limit"); got != "3" {
+			t.Errorf("X-RateLimit-Limit = %q, want 3", got)
+		}
+		if want := strconv.Itoa(limit - i); rec.Header().Get("X-RateLimit-Remaining") != want {
+			t.Errorf("request %d remaining = %q, want %q", i,
+				rec.Header().Get("X-RateLimit-Remaining"), want)
+		}
+	}
+
+	rec := do(t, h, "GET", "/v1/transfers", plaintext, "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if got := decodeError(t, rec).Code; got != CodeRateLimited {
+		t.Errorf("error code = %q, want %q", got, CodeRateLimited)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("a 429 carries no Retry-After header")
+	}
+}
+
+// A refused request must not have moved money. The limiter runs before the
+// handler, so nothing is written.
+func TestRateLimitedTransferWritesNothing(t *testing.T) {
+	resetDB(t)
+	ctx := context.Background()
+
+	plaintext, key, err := auth.Generate("limited")
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if err := auth.Insert(ctx, testPool, key); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// A limit of 2 covers the two account creations, so the transfer is refused.
+	s := &Server{db: testPool, limiter: ratelimit.New(testPool, 2, time.Minute)}
+	h := s.Handler()
+
+	source := createAccount(t, h, plaintext, "asset")
+	destination := createAccount(t, h, plaintext, "liability")
+
+	body := `{"source_account":"` + source.ID + `","destination_account":"` + destination.ID +
+		`","amount":50000,"currency":"USD"}`
+	rec := do(t, h, "POST", "/v1/transfers", plaintext, body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+
+	var transferCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&transferCount); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if transferCount != 0 {
+		t.Errorf("a rate limited request created %d transfers, want 0", transferCount)
+	}
+}
+
+// Liveness must not be rate limited: a probe refused with 429 looks like an
+// unhealthy instance and gets restarted.
+func TestHealthzIsNotRateLimited(t *testing.T) {
+	resetDB(t)
+
+	s := &Server{db: testPool, limiter: ratelimit.New(testPool, 1, time.Minute)}
+	h := s.Handler()
+
+	for i := 0; i < 5; i++ {
+		rec := do(t, h, "GET", "/healthz", "", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("healthz request %d status = %d, want 200", i, rec.Code)
+		}
 	}
 }
