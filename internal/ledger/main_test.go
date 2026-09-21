@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
@@ -27,11 +28,17 @@ func TestMain(m *testing.M) {
 		err = pool.Ping(ctx)
 	}
 	if err != nil {
-		// Skip rather than fail: a machine without the container running should
-		// report "no database", not a wall of confusing assertion failures.
-		println("skipping ledger tests, no database at " + dsn + ": " + err.Error())
-		println("run `make up && make migrate-up` first")
-		os.Exit(0)
+		// Fail, do not skip. A suite that reports ok having run zero tests is a
+		// green light CI would believe, and the whole argument of this project
+		// is that the tests prove something. Skipping is opt-in and explicit.
+		fmt.Fprintf(os.Stderr, "\nno database at %s: %v\n", dsn, err)
+		fmt.Fprintf(os.Stderr, "run `make up && make migrate-up` first, or set "+
+			"LEDGER_TESTS=skip to skip these deliberately\n\n")
+		if os.Getenv("LEDGER_TESTS") == "skip" {
+			fmt.Fprintf(os.Stderr, "LEDGER_TESTS=skip set: skipping\n")
+			os.Exit(0)
+		}
+		os.Exit(1)
 	}
 	testPool = pool
 
@@ -40,13 +47,14 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// resetDB empties the three tables. Registered with t.Cleanup as well as run up
+// resetDB empties every table. Registered with t.Cleanup as well as run up
 // front, because cross-test leakage turns one real failure into several fake ones.
+// Every new table must be added here: a stale list leaks rows silently.
 func resetDB(t *testing.T) {
 	t.Helper()
 	truncate := func() {
 		if _, err := testPool.Exec(context.Background(),
-			`TRUNCATE ledger_entries, ledger_transactions, accounts`); err != nil {
+			`TRUNCATE transfers, api_keys, ledger_entries, ledger_transactions, accounts`); err != nil {
 			t.Fatalf("truncate: %v", err)
 		}
 	}

@@ -15,8 +15,10 @@ import (
 // guessable id is an enumeration hole the moment this is an API.
 func newID(prefix string) string {
 	var b [16]byte
-	// rand.Read is documented never to return an error; it panics internally
-	// on a broken entropy source rather than returning short reads.
-	rand.Read(b[:])
+	// Since Go 1.24 crypto/rand.Read never returns an error: it panics
+	// internally if the system entropy source fails, rather than returning a
+	// short read a caller might ignore. The error is discarded explicitly so
+	// that is a decision on the page rather than an omission.
+	_, _ = rand.Read(b[:])
 	return prefix + "_" + hex.EncodeToString(b[:])
 }
