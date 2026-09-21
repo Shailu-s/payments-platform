@@ -131,8 +131,8 @@ The README will open with these, each backed by a named automated test. They are
 8. **Provider discrepancies are always detected by reconciliation.**
 
 This is the difference between "93% test coverage" (which says nothing) and eight specific
-promises with the proof attached. `shortn` opened with measured k6 throughput numbers; this
-one opens with correctness guarantees. Same move, different axis.
+promises with the proof attached. A README that opens with what the system *guarantees*, each
+line backed by a named test, says more than any coverage percentage.
 
 ## 7. The evidence rule — no claim without a number or a failure
 
@@ -511,8 +511,18 @@ Redis          OpenTelemetry tracing                   Grafana dashboards
 microservices  multi-tenancy / authorisation           OAuth / user accounts
 ```
 
-Redis is out because nothing in V1 needs it and `shortn` already covers Redis — the rate
-limiter uses Postgres instead, and the cost of that is recorded in phase 2 rather than hidden.
+**Redis is out of V1, and the honest reasoning matters more than the decision.** Rate limiting
+in the primary database is *not* what a production system does: Redis gives you TTL, so expired
+counters delete themselves and there is no cleanup component at all, and it keeps a hot-path
+write per request off the database that holds the money. The V1 choice is Postgres because the
+only alternative available was an in-memory counter, which is silently wrong the moment there
+are two instances — so the comparison is Postgres against something provably broken, not
+Postgres against Redis. The cost is measured in phase 2 rather than hidden, and the number is
+what says when this stops being acceptable.
+
+**Redis is the first thing added in the scalability pass** (see V5), for rate limiting and
+anywhere else a hot-path counter or cache belongs outside the primary database.
+
 Tracing is out until there is a latency question worth answering.
 
 **Multi-tenancy is out, and this is the one to say out loud before being asked.** V1 has
@@ -533,7 +543,7 @@ V3  FX + multi-currency (expiring quotes, the race when a quote dies mid-convers
 V4  a stablecoin rail  ← the differentiator: settlement that is slow AND probabilistic
                           (confirmations, reorgs, gas failure). Mentioned in interviews,
                           never the pitch.
-V5  load testing at scale
+V5  scalability pass: Redis for rate limiting and hot-path counters, load testing at scale
 ```
 
 **Crypto is deliberately V4 and deliberately quiet.** It keeps the project domain-neutral —
@@ -575,11 +585,11 @@ Decisions made in the design conversation:
 - Chose: rail-agnostic payment infrastructure, one rail in V1, crypto as V4.
 - Chose: Chaos Mode folded in as a feature of the provider simulator rather than a separate
   project, because it makes the correctness claims demonstrable.
-- Chose: the eight guarantees as the README centrepiece, mirroring `shortn`'s
-  measured-numbers opening.
+- Chose: the eight guarantees as the README centrepiece — specific promises with tests
+  attached, rather than a coverage number.
 - Kafka kept, but for the honest reason (a named learning gap + the outbox story), not
   because V1 volume needs it.
-- Standalone repo outside `interview-helper`, identity `Shailu-s` set locally.
+- Standalone public repo, identity `Shailu-s` set locally.
 
 **2026-09-19 (same day, second session) — plan amended. Still nothing built.**
 Reviewed the plan against "is this good enough for a senior/staff portfolio?" Verdict: the
