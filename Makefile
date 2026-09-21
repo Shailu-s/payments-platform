@@ -1,7 +1,7 @@
 DB_URL ?= postgres://payments:payments@localhost:5433/payments?sslmode=disable
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run demo
 
 up:
 	$(COMPOSE) up -d --wait
@@ -25,6 +25,11 @@ migrate-redo: migrate-down migrate-up
 # another's rows mid-test.
 test:
 	go test ./... -count=1 -p 1
+
+# Walk through everything phase 2 built, against a running API.
+# Needs `make run` in another terminal.
+demo:
+	@./scripts/demo.sh
 
 # Serve the API on :8080
 run:
