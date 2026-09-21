@@ -57,6 +57,15 @@ func resetDB(t *testing.T) {
 			`TRUNCATE transfers, api_keys, ledger_entries, ledger_transactions, accounts`); err != nil {
 			t.Fatalf("truncate: %v", err)
 		}
+		// Truncating accounts removes the settlement account that migration
+		// 000003 creates, and every transfer credits it. Restored here rather
+		// than in each test, so a forgotten setup cannot make a test pass for
+		// the wrong reason.
+		if _, err := testPool.Exec(context.Background(),
+			`INSERT INTO accounts (id, currency, type) VALUES ('acc_settlement_usd', 'USD', 'settlement')
+			 ON CONFLICT (id) DO NOTHING`); err != nil {
+			t.Fatalf("restore settlement account: %v", err)
+		}
 	}
 	truncate()
 	t.Cleanup(truncate)
