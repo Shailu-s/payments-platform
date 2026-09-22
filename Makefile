@@ -1,7 +1,7 @@
 DB_URL ?= postgres://payments:payments@localhost:5433/payments?sslmode=disable
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run demo
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run mock-bank demo
 
 up:
 	$(COMPOSE) up -d --wait
@@ -30,6 +30,10 @@ test:
 # Needs `make run` in another terminal.
 demo:
 	@./scripts/demo.sh
+
+# Serve MockBank on :8081. Run it alongside `make run`.
+mock-bank:
+	@WEBHOOK_URL="http://localhost:8080/v1/webhooks/mockbank" go run ./cmd/mock-bank
 
 # Serve the API on :8080
 run:
