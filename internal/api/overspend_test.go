@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 )
@@ -103,14 +105,37 @@ func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 		t.Errorf("source balance is %d, want 30000: exactly one transfer should have happened", balance)
 	}
 
-	// And the losers must have written NOTHING. An error response means little
-	// if half a transfer was committed.
+	// And the losers must have written NOTHING — not a transfer row, and not
+	// ledger entries either. An error response means little if half a transfer
+	// was committed.
 	var created int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&created); err != nil {
-		t.Fatalf("count: %v", err)
+		t.Fatalf("count transfers: %v", err)
 	}
 	if created != 1 {
 		t.Errorf("%d transfers exist, want 1", created)
+	}
+
+	// One funding transaction plus exactly one transfer movement.
+	var movements int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM ledger_transactions WHERE reference LIKE 'transfer %'`).Scan(&movements); err != nil {
+		t.Fatalf("count movements: %v", err)
+	}
+	if movements != 1 {
+		t.Errorf("%d transfer ledger transactions exist, want 1: a rejected "+
+			"transfer must leave no accounting behind", movements)
+	}
+
+	var entries int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM ledger_entries e
+		JOIN ledger_transactions t ON t.id = e.txn_id
+		WHERE t.reference LIKE 'transfer %'`).Scan(&entries); err != nil {
+		t.Fatalf("count entries: %v", err)
+	}
+	if entries != 2 {
+		t.Errorf("%d transfer ledger entries exist, want 2", entries)
 	}
 }
 
@@ -298,5 +323,83 @@ func TestExactlyAffordableConcurrentTransfersAllSucceed(t *testing.T) {
 	}
 	if balance != 0 {
 		t.Errorf("balance = %d, want 0", balance)
+	}
+}
+
+// Where the check lives is the decision, not merely where it happens to sit.
+//
+// The balance must be read inside the transaction that writes the transfer. A
+// read taken before BEGIN — or on any other connection — sees a snapshot a
+// concurrent transaction is about to invalidate, which is the bug the row lock
+// exists to prevent. This asserts the property directly rather than trusting
+// that the code still looks right.
+func TestBalanceIsReadInsideTheWritingTransaction(t *testing.T) {
+	ctx := context.Background()
+	resetDB(t)
+
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO accounts (id, currency, type) VALUES ('acc_inside', 'USD', 'asset')`); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if _, err := ledger.Record(ctx, testPool, "funding", []ledger.Entry{
+		{AccountID: settlementAccountID, Direction: ledger.DirectionDebit, Amount: 100000},
+		{AccountID: "acc_inside", Direction: ledger.DirectionCredit, Amount: 100000},
+	}); err != nil {
+		t.Fatalf("fund: %v", err)
+	}
+
+	// Transaction A locks the account and spends most of it, without committing.
+	txA, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer txA.Rollback(ctx)
+
+	s := &Server{db: testPool}
+	if err := s.checkBalance(ctx, txA, "acc_inside", 90000); err != nil {
+		t.Fatalf("checkBalance in A: %v", err)
+	}
+	if _, err := ledger.Record(ctx, txA, "spend", []ledger.Entry{
+		{AccountID: "acc_inside", Direction: ledger.DirectionDebit, Amount: 90000},
+		{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: 90000},
+	}); err != nil {
+		t.Fatalf("record in A: %v", err)
+	}
+
+	// Transaction B asks for the rest. It must not be able to answer while A
+	// holds the lock: if checkBalance read outside the transaction it would see
+	// the pre-A balance of 100000 and happily approve, overspending the account.
+	txB, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin B: %v", err)
+	}
+	defer txB.Rollback(ctx)
+
+	answered := make(chan error, 1)
+	go func() {
+		answered <- s.checkBalance(ctx, txB, "acc_inside", 20000)
+	}()
+
+	select {
+	case err := <-answered:
+		t.Fatalf("B answered while A held the lock (err=%v): the balance was read "+
+			"outside the writing transaction", err)
+	case <-time.After(300 * time.Millisecond):
+		// Blocked on A's row lock, which is the whole point.
+	}
+
+	// Let A commit. B should now see the post-A balance of 10000 and refuse.
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatalf("Commit A: %v", err)
+	}
+
+	select {
+	case err := <-answered:
+		if !errors.Is(err, ErrInsufficientFunds) {
+			t.Errorf("B got %v, want ErrInsufficientFunds: after A committed the "+
+				"account holds 10000 and B asked for 20000", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("B never answered after A committed")
 	}
 }
