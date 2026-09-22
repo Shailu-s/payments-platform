@@ -11,10 +11,6 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/transfers"
 )
 
-// SettlementAccountID is where money waits between leaving the source and
-// reaching the destination. Created by migration 000003.
-const SettlementAccountID = "acc_settlement_usd"
-
 // Send submits one transfer to the rail and records what happened.
 //
 // There are three outcomes, not two, and the third is the hard one:
@@ -116,7 +112,7 @@ func (w *Worker) recordAccepted(ctx context.Context, t transfers.Transfer, p pro
 // transactions, which is exactly why transfers and ledger_transactions are
 // separate tables.
 func (w *Worker) recordRejected(ctx context.Context, t transfers.Transfer, cause error) error {
-	if err := Fail(ctx, w.db, t.ID, cause.Error()); err != nil {
+	if err := transfers.Fail(ctx, w.db, t.ID, cause.Error()); err != nil {
 		return err
 	}
 	return nil

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"github.com/Shailu-s/payments-platform/internal/transfers"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,7 +31,7 @@ func seedFunded(t *testing.T, n int, amount int64) []string {
 		t.Fatalf("api key: %v", err)
 	}
 	if _, err := ledger.Record(ctx, testPool, "funding", []ledger.Entry{
-		{AccountID: SettlementAccountID, Direction: ledger.DirectionDebit, Amount: amount * int64(n) * 2},
+		{AccountID: transfers.SettlementAccountID, Direction: ledger.DirectionDebit, Amount: amount * int64(n) * 2},
 		{AccountID: "acc_src", Direction: ledger.DirectionCredit, Amount: amount * int64(n) * 2},
 	}); err != nil {
 		t.Fatalf("fund: %v", err)
@@ -43,7 +44,7 @@ func seedFunded(t *testing.T, n int, amount int64) []string {
 
 		txnID, err := ledger.Record(ctx, testPool, "transfer "+id, []ledger.Entry{
 			{AccountID: "acc_src", Direction: ledger.DirectionDebit, Amount: amount},
-			{AccountID: SettlementAccountID, Direction: ledger.DirectionCredit, Amount: amount},
+			{AccountID: transfers.SettlementAccountID, Direction: ledger.DirectionCredit, Amount: amount},
 		})
 		if err != nil {
 			t.Fatalf("ledger for %s: %v", id, err)
@@ -172,7 +173,7 @@ func TestTwoWorkersSendEachTransferOnce(t *testing.T) {
 
 	// And settling them all credits the destination exactly once each.
 	for _, id := range ids {
-		if err := Settle(ctx, testPool, id); err != nil {
+		if err := transfers.Settle(ctx, testPool, id); err != nil {
 			t.Fatalf("Settle %s: %v", id, err)
 		}
 	}

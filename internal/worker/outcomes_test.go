@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"github.com/Shailu-s/payments-platform/internal/transfers"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func seedOne(t *testing.T, amount int64) string {
 	// Fund the source, then move the money to settlement as creating the
 	// transfer would.
 	if _, err := ledger.Record(ctx, testPool, "funding", []ledger.Entry{
-		{AccountID: SettlementAccountID, Direction: ledger.DirectionDebit, Amount: amount * 10},
+		{AccountID: transfers.SettlementAccountID, Direction: ledger.DirectionDebit, Amount: amount * 10},
 		{AccountID: "acc_src", Direction: ledger.DirectionCredit, Amount: amount * 10},
 	}); err != nil {
 		t.Fatalf("fund: %v", err)
@@ -39,7 +40,7 @@ func seedOne(t *testing.T, amount int64) string {
 	const id = "tr_outcome"
 	txnID, err := ledger.Record(ctx, testPool, "transfer "+id, []ledger.Entry{
 		{AccountID: "acc_src", Direction: ledger.DirectionDebit, Amount: amount},
-		{AccountID: SettlementAccountID, Direction: ledger.DirectionCredit, Amount: amount},
+		{AccountID: transfers.SettlementAccountID, Direction: ledger.DirectionCredit, Amount: amount},
 	})
 	if err != nil {
 		t.Fatalf("transfer ledger: %v", err)
@@ -101,7 +102,7 @@ func TestAcceptedTransferStoresReferenceAndWaits(t *testing.T) {
 	if got := balanceOf(t, "acc_dst"); got != 0 {
 		t.Errorf("destination balance = %d, want 0: the money has not arrived yet", got)
 	}
-	if got := balanceOf(t, SettlementAccountID); got != -450000 {
+	if got := balanceOf(t, transfers.SettlementAccountID); got != -450000 {
 		t.Errorf("settlement balance = %d, want -450000", got)
 	}
 }
@@ -321,7 +322,7 @@ func TestSettlingTwiceCreditsTheDestinationOnce(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
-		if err := Settle(ctx, testPool, id); err != nil {
+		if err := transfers.Settle(ctx, testPool, id); err != nil {
 			t.Fatalf("Settle %d: %v", i, err)
 		}
 	}
@@ -352,7 +353,7 @@ func TestSettlementMovesMoneyTheRestOfTheWay(t *testing.T) {
 	if _, err := w.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	if err := Settle(ctx, testPool, id); err != nil {
+	if err := transfers.Settle(ctx, testPool, id); err != nil {
 		t.Fatalf("Settle: %v", err)
 	}
 
@@ -365,7 +366,7 @@ func TestSettlementMovesMoneyTheRestOfTheWay(t *testing.T) {
 	if got := balanceOf(t, "acc_dst"); got != 50000 {
 		t.Errorf("destination = %d, want 50000", got)
 	}
-	if got := balanceOf(t, SettlementAccountID); got != -500000 {
+	if got := balanceOf(t, transfers.SettlementAccountID); got != -500000 {
 		t.Errorf("settlement = %d, want -500000: it should be holding nothing "+
 			"for this transfer any more", got)
 	}

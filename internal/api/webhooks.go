@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/transfers"
-	"github.com/Shailu-s/payments-platform/internal/worker"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -84,7 +83,7 @@ func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 
 	switch event.Status {
 	case transfers.StatusSettled:
-		if err := worker.Settle(r.Context(), s.db, transferID); err != nil {
+		if err := transfers.Settle(r.Context(), s.db, transferID); err != nil {
 			writeInternalError(w, r, err)
 			return
 		}
@@ -93,7 +92,7 @@ func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 		if event.FailureReason != nil {
 			reason = *event.FailureReason
 		}
-		if err := worker.Fail(r.Context(), s.db, transferID, reason); err != nil {
+		if err := transfers.Fail(r.Context(), s.db, transferID, reason); err != nil {
 			writeInternalError(w, r, err)
 			return
 		}
