@@ -27,6 +27,9 @@ const (
 	StatusProcessing = "processing"
 	StatusSettled    = "settled"
 	StatusFailed     = "failed"
+	// StatusUnresolved means a call to the rail timed out and we genuinely do
+	// not know whether the money moved. Not a failure and not a retry.
+	StatusUnresolved = "unresolved"
 )
 
 var (
@@ -53,8 +56,19 @@ type Transfer struct {
 	// A hash of the request that created this transfer. Same key with a
 	// different fingerprint is a client bug rather than a retry.
 	RequestFingerprint *string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// The rail's own identifier, once it has accepted the instruction. Nil
+	// until then, and nil forever on a transfer the rail never saw.
+	ProviderRef *string
+	// How many times a worker has sent this to the rail. For observability and
+	// for giving up, not for deciding what to do next.
+	AttemptCount int
+	// When this transfer next becomes claimable. Nil means never, which is how
+	// an unresolved transfer stops being retried.
+	NextAttemptAt *time.Time
+	// The last thing the rail said. Kept for an operator to read, not parsed.
+	LastError *string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Querier is satisfied by a pool, a connection and a transaction alike, so
@@ -67,6 +81,7 @@ type Querier interface {
 
 const columns = `id, source_account, destination_account, amount, currency,
 	status, ledger_txn_id, api_key_id, idempotency_key, request_fingerprint,
+	provider_ref, attempt_count, next_attempt_at, last_error,
 	created_at, updated_at`
 
 // Insert writes a transfer row and returns it as stored.
@@ -202,6 +217,7 @@ func scan(row scannable) (Transfer, error) {
 	var t Transfer
 	err := row.Scan(&t.ID, &t.SourceAccount, &t.DestinationAccount, &t.Amount,
 		&t.Currency, &t.Status, &t.LedgerTxnID, &t.APIKeyID, &t.IdempotencyKey,
-		&t.RequestFingerprint, &t.CreatedAt, &t.UpdatedAt)
+		&t.RequestFingerprint, &t.ProviderRef, &t.AttemptCount, &t.NextAttemptAt,
+		&t.LastError, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }
