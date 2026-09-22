@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Status values. Mutable, unlike a ledger entry, and that distinction is
@@ -27,7 +29,13 @@ const (
 	StatusFailed     = "failed"
 )
 
-var ErrNotFound = errors.New("transfer not found")
+var (
+	ErrNotFound = errors.New("transfer not found")
+	// ErrDuplicateKey means the unique index on idempotency_key refused this
+	// insert: another request already owns the key. It is not a failure, it is
+	// the signal that this request is a retry.
+	ErrDuplicateKey = errors.New("idempotency key already used")
+)
 
 type Transfer struct {
 	ID                 string
@@ -38,6 +46,13 @@ type Transfer struct {
 	Status             string
 	LedgerTxnID        *string
 	APIKeyID           string
+	// Supplied by the client so a retry can be recognised as one. Nullable
+	// because transfers created by anything other than the API — a reversal in
+	// phase 4, say — have no client instruction behind them.
+	IdempotencyKey *string
+	// A hash of the request that created this transfer. Same key with a
+	// different fingerprint is a client bug rather than a retry.
+	RequestFingerprint *string
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
@@ -51,24 +66,41 @@ type Querier interface {
 }
 
 const columns = `id, source_account, destination_account, amount, currency,
-	status, ledger_txn_id, api_key_id, created_at, updated_at`
+	status, ledger_txn_id, api_key_id, idempotency_key, request_fingerprint,
+	created_at, updated_at`
 
 // Insert writes a transfer row and returns it as stored.
 func Insert(ctx context.Context, db Querier, t Transfer) (Transfer, error) {
 	const q = `
 		INSERT INTO transfers (id, source_account, destination_account, amount,
-			currency, status, ledger_txn_id, api_key_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			currency, status, ledger_txn_id, api_key_id, idempotency_key,
+			request_fingerprint)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING ` + columns
 
 	row := db.QueryRow(ctx, q, t.ID, t.SourceAccount, t.DestinationAccount, t.Amount,
-		t.Currency, t.Status, t.LedgerTxnID, t.APIKeyID)
+		t.Currency, t.Status, t.LedgerTxnID, t.APIKeyID, t.IdempotencyKey,
+		t.RequestFingerprint)
 
 	stored, err := scan(row)
+	if IsDuplicateKey(err) {
+		// The unique index fired: another request holds this key. Returned
+		// unwrapped so the caller can branch on it without unwrapping first.
+		return Transfer{}, ErrDuplicateKey
+	}
 	if err != nil {
 		return Transfer{}, fmt.Errorf("insert transfer %s: %w", t.ID, err)
 	}
 	return stored, nil
+}
+
+// IsDuplicateKey reports whether an error is Postgres 23505, unique_violation.
+//
+// Branching on the SQLSTATE rather than on a string match of the message: the
+// message is localised and can change between versions, the code cannot.
+func IsDuplicateKey(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation
 }
 
 // SetLedgerTxn links a transfer to the ledger transaction that recorded its
@@ -86,6 +118,26 @@ func SetLedgerTxn(ctx context.Context, db Querier, transferID, ledgerTxnID strin
 		return fmt.Errorf("link transfer %s to ledger txn %s: %w", transferID, ledgerTxnID, err)
 	}
 	return nil
+}
+
+// FindByIdempotencyKey returns the transfer a client's key already created, if
+// there is one.
+//
+// On its own this is NOT enough to make POST /transfers idempotent: a caller
+// that reads here and inserts afterwards has a window between the two in which
+// a concurrent request reads the same nothing. Phase 3.2 adds the unique
+// constraint that closes it.
+func FindByIdempotencyKey(ctx context.Context, db Querier, key string) (Transfer, error) {
+	const q = `SELECT ` + columns + ` FROM transfers WHERE idempotency_key = $1`
+
+	t, err := scan(db.QueryRow(ctx, q, key))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Transfer{}, ErrNotFound
+	}
+	if err != nil {
+		return Transfer{}, fmt.Errorf("find transfer by idempotency key: %w", err)
+	}
+	return t, nil
 }
 
 func Get(ctx context.Context, db Querier, id string) (Transfer, error) {
@@ -149,6 +201,7 @@ type scannable interface {
 func scan(row scannable) (Transfer, error) {
 	var t Transfer
 	err := row.Scan(&t.ID, &t.SourceAccount, &t.DestinationAccount, &t.Amount,
-		&t.Currency, &t.Status, &t.LedgerTxnID, &t.APIKeyID, &t.CreatedAt, &t.UpdatedAt)
+		&t.Currency, &t.Status, &t.LedgerTxnID, &t.APIKeyID, &t.IdempotencyKey,
+		&t.RequestFingerprint, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }

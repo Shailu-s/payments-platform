@@ -3,6 +3,7 @@ module github.com/Shailu-s/payments-platform
 go 1.26.0
 
 require (
+	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
 	github.com/jackc/pgx/v5 v5.11.0
 	golang.org/x/crypto v0.57.0
 )

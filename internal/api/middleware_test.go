@@ -273,7 +273,7 @@ func TestWrongMethodIsRejected(t *testing.T) {
 func TestTransferRoutesRejectAWrongMethod(t *testing.T) {
 	h, key := newTestServer(t)
 
-	rec := do(t, h, "PUT", "/v1/transfers", key, `{}`)
+	rec := doWithKey(h, "PUT", "/v1/transfers", key, newID("idem"), `{}`)
 	if rec.Code == http.StatusOK || rec.Code == http.StatusAccepted {
 		t.Fatalf("PUT /v1/transfers returned %d", rec.Code)
 	}
@@ -346,7 +346,7 @@ func TestRateLimitedTransferWritesNothing(t *testing.T) {
 
 	body := `{"source_account":"` + source.ID + `","destination_account":"` + destination.ID +
 		`","amount":50000,"currency":"USD"}`
-	rec := do(t, h, "POST", "/v1/transfers", plaintext, body)
+	rec := doWithKey(h, "POST", "/v1/transfers", plaintext, newID("idem"), body)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", rec.Code)
 	}
