@@ -114,37 +114,37 @@ func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 	}
 }
 
-// The lesson of the phase, made into an assertion: the ledger invariant does
-// NOT catch an overspend. Every transaction is internally balanced — debits
-// equal credits — so guarantee 1 holds perfectly while the account goes
-// negative. Correctness of each write is not correctness of the system.
+// The lesson of the phase, kept as a permanent assertion.
+//
+// The ledger invariant does NOT catch an overspend. This writes an overdrawn
+// account directly through the ledger, bypassing the API's balance check, and
+// shows that every transaction still balances while the account is negative.
+//
+// Guarantee 1 and guarantee 3 look related and protect against completely
+// different failures: "debits equal credits" is a property of one transaction
+// in isolation, "this account is not overdrawn" is a property of all of that
+// account's transactions together. No amount of per-transaction checking
+// produces the second, which is why the fix is a lock rather than a stricter
+// balance rule.
 func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
 
 	source := createAccount(t, h, apiKey, "asset")
-	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 100000)
+	fund(t, source.ID, 100000) // $1,000
 
-	const amount = 70000
-	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":%d,"currency":"USD"}`,
-		source.ID, destination.ID, amount)
-
-	var start sync.WaitGroup
-	start.Add(1)
-	var done sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		done.Add(1)
-		go func(i int) {
-			defer done.Done()
-			start.Wait()
-			doWithKey(h, "POST", "/v1/transfers", apiKey, fmt.Sprintf("invariant-%d", i), body)
-		}(i)
+	// Two $700 movements recorded straight through the ledger, as the broken
+	// concurrent path did before the fix.
+	for i := 0; i < 2; i++ {
+		if _, err := ledger.Record(ctx, testPool, "overspend", []ledger.Entry{
+			{AccountID: source.ID, Direction: ledger.DirectionDebit, Amount: 70000},
+			{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: 70000},
+		}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
 	}
-	start.Done()
-	done.Wait()
 
-	// Whatever happened above, every ledger transaction still balances.
+	// Every ledger transaction balances.
 	var unbalanced int
 	if err := testPool.QueryRow(ctx, `
 		SELECT count(*) FROM (
@@ -159,17 +159,36 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 		t.Fatalf("%d ledger transactions do not balance", unbalanced)
 	}
 
-	// The invariant holds. Now look at whether the money is right.
+	// Every entry in the database sums to zero: nothing was invented or lost.
+	var total int64
+	if err := testPool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END), 0)
+		FROM ledger_entries`).Scan(&total); err != nil {
+		t.Fatalf("sum entries: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("all entries sum to %d, want 0", total)
+	}
+
+	// And the account is overdrawn.
 	balance, err := ledger.Balance(ctx, testPool, source.ID)
 	if err != nil {
 		t.Fatalf("Balance: %v", err)
 	}
-	t.Logf("every ledger transaction balances, and the source account is at %d", balance)
+	if balance != -40000 {
+		t.Fatalf("source balance is %d, want -40000", balance)
+	}
 
-	if balance < 0 {
-		t.Errorf("the books balance perfectly and the account is %d overdrawn: "+
-			"an invariant true of every transaction individually says nothing "+
-			"about their combination", -balance)
+	t.Logf("every transaction balances, every entry sums to 0, and the account "+
+		"is %d overdrawn: the invariant is blind to this", -balance)
+
+	// The money did not vanish — settlement is holding what the account never had.
+	settlement, err := ledger.Balance(ctx, testPool, settlementAccountID)
+	if err != nil {
+		t.Fatalf("settlement balance: %v", err)
+	}
+	if balance+settlement != 0 {
+		t.Errorf("account %d and settlement %d do not cancel", balance, settlement)
 	}
 }
 

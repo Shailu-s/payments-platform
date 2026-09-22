@@ -205,26 +205,14 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	// connection on every early return below.
 	defer tx.Rollback(ctx)
 
-	// PHASE 3.3 — THE BROKEN BALANCE CHECK. The fix is 3.4.
-	//
-	// Read the balance, decide, then write. The third instance of the same
-	// shape in this project, after the rate limiter and idempotency: two
-	// concurrent transfers both read $1,000, both conclude $700 is affordable,
-	// and both proceed. The account ends at -$400.
-	//
-	// Note what does NOT catch this. Each transfer is internally balanced —
-	// debits equal credits — so guarantee 1 holds perfectly the whole time. An
-	// invariant that is true of every transaction individually says nothing
-	// about their combination.
-	balance, err := ledger.Balance(ctx, tx, req.SourceAccount)
-	if err != nil {
+	// The balance check lives INSIDE this transaction, not in the handler
+	// before it. A check before BEGIN reads a balance that a concurrent
+	// transaction is about to invalidate — that is the phase 3.3 bug wearing a
+	// hat. This is also why ledger.Balance takes a Querier rather than a pool:
+	// phase 1's interface choice, made before it was needed.
+	if err := s.checkBalance(ctx, tx, req.SourceAccount, req.Amount); err != nil {
 		return transfers.Transfer{}, err
 	}
-	if balance-req.Amount < 0 {
-		return transfers.Transfer{}, ErrInsufficientFunds
-	}
-	// ↑ the gap. Everything that has already read this balance is about to
-	// spend against it.
 
 	transfer, err := transfers.Insert(ctx, tx, transfers.Transfer{
 		ID:                 newID("tr"),

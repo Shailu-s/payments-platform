@@ -35,6 +35,7 @@ func TestCreateTransferAccepts202Processing(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 
 	got := createTransfer(t, h, key, source.ID, destination.ID, 50000)
 
@@ -61,6 +62,7 @@ func TestCreateTransferCreditsSettlementNotTheDestination(t *testing.T) {
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 
 	createTransfer(t, h, key, source.ID, destination.ID, 50000)
 
@@ -68,8 +70,9 @@ func TestCreateTransferCreditsSettlementNotTheDestination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Balance(source): %v", err)
 	}
-	if sourceBalance != -50000 {
-		t.Errorf("source balance = %d, want -50000", sourceBalance)
+	const funded = 1000000
+	if sourceBalance != funded-50000 {
+		t.Errorf("source balance = %d, want %d", sourceBalance, funded-50000)
 	}
 
 	destinationBalance, err := ledger.Balance(ctx, testPool, destination.ID)
@@ -84,8 +87,9 @@ func TestCreateTransferCreditsSettlementNotTheDestination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Balance(settlement): %v", err)
 	}
-	if settlementBalance != 50000 {
-		t.Errorf("settlement balance = %d, want 50000", settlementBalance)
+	// Settlement lent the account its funding and received the transfer back.
+	if settlementBalance != -(funded - 50000) {
+		t.Errorf("settlement balance = %d, want %d", settlementBalance, -(funded - 50000))
 	}
 }
 
@@ -95,6 +99,7 @@ func TestCreateTransferKeepsTheBooksBalanced(t *testing.T) {
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 
 	for _, amount := range []int64{50000, 250, 1} {
 		createTransfer(t, h, key, source.ID, destination.ID, amount)
@@ -135,6 +140,7 @@ func TestCreateTransferRejectsBadInput(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 
 	tests := []struct {
 		name   string
@@ -169,6 +175,7 @@ func TestCreateTransferRejectsAFractionalAmount(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":500.75,"currency":"USD"}`,
 		source.ID, destination.ID)
@@ -185,6 +192,7 @@ func TestTransferRecordsTheAuthenticatingKey(t *testing.T) {
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 
 	created := createTransfer(t, h, key, source.ID, destination.ID, 500)
 
@@ -211,6 +219,7 @@ func TestGetTransfer(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 	created := createTransfer(t, h, key, source.ID, destination.ID, 50000)
 
 	rec := do(t, h, "GET", "/v1/transfers/"+created.ID, key, "")
@@ -242,6 +251,7 @@ func TestListTransfersIsNewestFirstAndPages(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
 
 	var created []string
 	for i := 0; i < 5; i++ {
@@ -327,22 +337,40 @@ func TestListTransfersRejectsABadLimitOrCursor(t *testing.T) {
 }
 
 // assertNothingWritten confirms a rejected request left no transfer and no
-// ledger rows. An error response means nothing if half the work was committed.
+// NEW ledger rows. An error response means little if half the work was
+// committed.
+//
+// Counts against a baseline rather than against zero, because tests fund their
+// source account first and that funding is legitimately in the ledger.
 func assertNothingWritten(t *testing.T, ctx context.Context) {
 	t.Helper()
-	var transferCount, txnCount, entryCount int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&transferCount); err != nil {
-		t.Fatalf("count transfers: %v", err)
+	counts := func() (transfers, txns, entries int) {
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&transfers); err != nil {
+			t.Fatalf("count transfers: %v", err)
+		}
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions`).Scan(&txns); err != nil {
+			t.Fatalf("count ledger transactions: %v", err)
+		}
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM ledger_entries`).Scan(&entries); err != nil {
+			t.Fatalf("count ledger entries: %v", err)
+		}
+		return
 	}
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions`).Scan(&txnCount); err != nil {
-		t.Fatalf("count ledger transactions: %v", err)
+
+	transferCount, _, _ := counts()
+	if transferCount != 0 {
+		t.Errorf("a rejected request left %d transfers, want 0", transferCount)
 	}
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM ledger_entries`).Scan(&entryCount); err != nil {
-		t.Fatalf("count ledger entries: %v", err)
+
+	// Whatever is in the ledger must still balance and must contain no entry
+	// belonging to a transfer, since no transfer exists.
+	var orphaned int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM ledger_transactions WHERE reference LIKE 'transfer %'`).Scan(&orphaned); err != nil {
+		t.Fatalf("count orphaned: %v", err)
 	}
-	if transferCount != 0 || txnCount != 0 || entryCount != 0 {
-		t.Errorf("a rejected request left %d transfers, %d ledger transactions, %d entries; want 0, 0, 0",
-			transferCount, txnCount, entryCount)
+	if orphaned != 0 {
+		t.Errorf("a rejected request left %d transfer ledger transactions, want 0", orphaned)
 	}
 }
 
@@ -357,6 +385,16 @@ func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
+
+	// Funded from a second account rather than settlement, because settlement
+	// is about to be removed and a ledger entry against it would block that.
+	funder := createAccount(t, h, key, "asset")
+	if _, err := ledger.Record(ctx, testPool, "funding", []ledger.Entry{
+		{AccountID: funder.ID, Direction: ledger.DirectionDebit, Amount: 1000000},
+		{AccountID: source.ID, Direction: ledger.DirectionCredit, Amount: 1000000},
+	}); err != nil {
+		t.Fatalf("fund: %v", err)
+	}
 
 	if _, err := testPool.Exec(ctx,
 		`DELETE FROM accounts WHERE id = $1`, settlementAccountID); err != nil {
@@ -380,8 +418,10 @@ func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 		t.Errorf("%d transfers survived a failed ledger write, want 0", transferCount)
 	}
 
+	// Only transfer movements: the funding transaction above is legitimate.
 	var txnCount int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions`).Scan(&txnCount); err != nil {
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM ledger_transactions WHERE reference LIKE 'transfer %'`).Scan(&txnCount); err != nil {
 		t.Fatalf("count ledger transactions: %v", err)
 	}
 	if txnCount != 0 {

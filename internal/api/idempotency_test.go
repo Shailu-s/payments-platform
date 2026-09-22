@@ -45,6 +45,7 @@ func TestIdempotentRequestsCreateOneTransfer(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000) // enough for any transfer in this test
 
 	const requests = 100
 	const idempotencyKey = "7da2f1c9-4e1b-4a22-9f3e-1d0c8b7a6e55"
@@ -122,9 +123,10 @@ func TestIdempotentRequestsCreateOneTransfer(t *testing.T) {
 		FROM ledger_entries WHERE account_id = $1`, source.ID).Scan(&balance); err != nil {
 		t.Fatalf("source balance: %v", err)
 	}
-	if balance != -50000 {
-		t.Errorf("source balance is %d, want -50000: the money moved %d times",
-			balance, balance/-50000)
+	const funded = 1000000
+	if balance != funded-50000 {
+		t.Errorf("source balance is %d, want %d: the money moved %d times",
+			balance, funded-50000, (funded-balance)/50000)
 	}
 }
 
@@ -136,6 +138,7 @@ func TestSequentialRetryReturnsTheSameTransfer(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000) // enough for any transfer in this test
 
 	const idempotencyKey = "retry-me-please"
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -178,6 +181,7 @@ func TestTransferRequiresAnIdempotencyKey(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000) // enough for any transfer in this test
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
 		source.ID, destination.ID)
 
@@ -215,6 +219,7 @@ func TestDifferentKeysCreateDifferentTransfers(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000) // enough for any transfer in this test
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
 		source.ID, destination.ID)
 
@@ -244,6 +249,7 @@ func TestSameKeyDifferentBodyIsRejected(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000) // enough for any transfer in this test
 
 	const idempotencyKey = "invoice-4471"
 	original := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -297,6 +303,7 @@ func TestSameKeyDifferentDestinationIsRejected(t *testing.T) {
 	source := createAccount(t, h, apiKey, "asset")
 	first := createAccount(t, h, apiKey, "liability")
 	second := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000)
 
 	const idempotencyKey = "payout-991"
 	toFirst := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -330,6 +337,7 @@ func TestIdempotencyKeysAreScopedToTheCaller(t *testing.T) {
 
 	source := createAccount(t, h, firstKey, "asset")
 	destination := createAccount(t, h, firstKey, "liability")
+	fund(t, source.ID, 1000000)
 
 	const sharedKey = "both-callers-chose-this"
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -361,6 +369,7 @@ func TestReplayDoesNotMoveMoneyAgain(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000) // enough for any transfer in this test
 
 	const idempotencyKey = "only-once"
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -377,9 +386,11 @@ func TestReplayDoesNotMoveMoneyAgain(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM ledger_entries`).Scan(&entries); err != nil {
 		t.Fatalf("count entries: %v", err)
 	}
-	if entries != 2 {
-		t.Errorf("%d ledger entries after 5 identical requests, want 2: "+
-			"a replay must not write new accounting", entries)
+	// Two from funding the account, two from the single transfer.
+	if entries != 4 {
+		t.Errorf("%d ledger entries after 5 identical requests, want 4 "+
+			"(2 funding + 2 for one transfer): a replay must not write new "+
+			"accounting", entries)
 	}
 
 	var balance int64
@@ -388,8 +399,8 @@ func TestReplayDoesNotMoveMoneyAgain(t *testing.T) {
 		FROM ledger_entries WHERE account_id = $1`, source.ID).Scan(&balance); err != nil {
 		t.Fatalf("balance: %v", err)
 	}
-	if balance != -50000 {
-		t.Errorf("source balance is %d, want -50000", balance)
+	if balance != 1000000-50000 {
+		t.Errorf("source balance is %d, want %d", balance, 1000000-50000)
 	}
 }
 
@@ -405,6 +416,7 @@ func TestKeyTakenButNotYetCommittedIsSerialised(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 1000000) // enough for any transfer in this test
 
 	var apiKeyID string
 	if err := testPool.QueryRow(ctx, `SELECT id FROM api_keys LIMIT 1`).Scan(&apiKeyID); err != nil {

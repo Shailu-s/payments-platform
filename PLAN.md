@@ -287,10 +287,60 @@ response.
 **Balance concurrency.** An account holds $1,000. Two $700 transfers arrive at the same
 moment. Exactly one must succeed.
 
-We will implement this **two ways** — row locks (`SELECT ... FOR UPDATE`) and
-`SERIALIZABLE` with retry on serialization failure — measure both, and pick one **with a
-stated reason**. Having actually measured it is the difference between a senior answer and a
-staff answer.
+Implemented **two ways** — row locks (`SELECT ... FOR UPDATE`) and `SERIALIZABLE` with retry
+on serialization failure — measured, and one chosen **with a stated reason**. Having actually
+measured it is the difference between a senior answer and a staff answer.
+
+### The measurement, and the decision
+
+Both are correct: the overspend test passes under either. So the choice is a number.
+
+200 affordable spends against **one hot account**, so anything not carried is a valid payment
+the strategy dropped (`TestLockStrategyComparison`):
+
+```
+  strategy       conc    tps     p50       p99      ok    lost
+  ──────────────────────────────────────────────────────────────
+  for_update        1     346    1.5ms    30.2ms   200       0
+  serializable      1     799      1ms     5.7ms   200       0     ← faster with no contention
+  for_update       10     610   12.1ms    54.1ms   200       0
+  serializable     10     279    4.8ms   103.3ms   157      43
+  for_update       50     778     60ms    70.5ms   200       0
+  serializable     50     122  241.7ms   621.7ms   128      72     ← 36% of payments lost
+```
+
+**Chosen: `SELECT ... FOR UPDATE`.** Not because it is stronger — because on a hot account it
+is the only one that does not lose payments. At 50 concurrent writers `SERIALIZABLE` exhausted
+its retry budget on 72 of 200 valid payments while the row lock carried all 200, at six times
+the throughput and roughly a ninth of the p99.
+
+The shape of the numbers is the explanation:
+
+- **With no contention `SERIALIZABLE` wins** (799 vs 346 tps). There is nothing to lock, so the
+  lock is pure overhead. That is the case it is built for.
+- **Its p50 stays low while its p99 explodes** (4.8ms / 103ms at 10). Most transactions never
+  conflict and are fast; the ones that do get aborted and retried repeatedly, so the average
+  hides a bimodal distribution.
+- **The row lock degrades smoothly.** p50 rises as requests queue, but nothing fails.
+
+**The trade in one line:** blocking makes contention *slow*, aborting makes it *fail*. For
+money, slow is the right failure.
+
+**What would change the answer:** contention spread across many accounts rather than
+concentrated on one. `SERIALIZABLE` never blocks in the common case and its abort rate follows
+real conflicts rather than lock queues. One account with many writers is its worst case and
+the row lock's best — and it is exactly the shape a payments hot path has.
+
+**And the cost is:** `FOR UPDATE` serialises all spending from a single account, so one
+high-volume account is a throughput ceiling that no amount of application concurrency gets
+past. The fix at that point is not a different isolation level but a different data model —
+per-account sharding, or balance snapshots that shorten the locked window.
+
+**Only the row lock ships.** The serializable path was deliberately *not* kept in the handler:
+a second production path that never executes is where bugs hide unnoticed. The comparison
+survives as a self-contained test, so the numbers above can be re-derived rather than
+believed. The production transaction runs at Read Committed, so nothing raises `40001` and no
+retry loop exists — raising the isolation level later would mean reintroducing one.
 
 **Ends with:** two concurrency tests that fail first, then pass.
 
