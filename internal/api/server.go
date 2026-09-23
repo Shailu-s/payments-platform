@@ -79,6 +79,11 @@ func (s *Server) Handler() http.Handler {
 
 	// Auth before the rate limit: the limit is per key, so there is nothing to
 	// count against until the caller is known.
+	// The provider calls this, not a customer, so it is outside the api-key
+	// chain: the rail has no key of ours. Phase 6 authenticates it properly
+	// with a signature.
+	mux.HandleFunc("POST /v1/webhooks/mockbank", s.handleProviderWebhook)
+
 	authenticated := chain(s.routes(), s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)
 

@@ -18,5 +18,21 @@ services:
       retries: 15
       start_period: 3s
 
+  mock-bank:
+    build:
+      context: ..
+      dockerfile: docker/mock-bank.Dockerfile
+    container_name: payments-mock-bank
+    environment:
+      MOCKBANK_ADDR: ":8081"
+      # host.docker.internal reaches the API running on the host. When the API
+      # also runs in Compose this becomes http://api:8080/...
+      WEBHOOK_URL: "http://host.docker.internal:8080/v1/webhooks/mockbank"
+      SETTLE_DELAY: "2s"
+    ports:
+      - "8081:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   payments-pgdata:
