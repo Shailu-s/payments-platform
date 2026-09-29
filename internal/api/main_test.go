@@ -51,6 +51,11 @@ func resetDB(t *testing.T) {
 // newTestServer returns the full handler stack and a live api key.
 func newTestServer(t *testing.T) (http.Handler, string) {
 	t.Helper()
+	return newTestServerWithPublisher(t, nil)
+}
+
+func newTestServerWithPublisher(t *testing.T, p Publisher) (http.Handler, string) {
+	t.Helper()
 	resetDB(t)
 
 	plaintext, key, err := auth.Generate("test")
@@ -61,7 +66,7 @@ func newTestServer(t *testing.T) (http.Handler, string) {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	return (&Server{db: testPool}).Handler(), plaintext
+	return (&Server{db: testPool, publisher: p}).Handler(), plaintext
 }
 
 // do sends a request through the whole middleware chain.

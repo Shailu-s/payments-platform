@@ -145,6 +145,28 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 			"this Idempotency-Key was already used for a different request: "+
 				"use a new key for a new payment")
 	default:
+		// PHASE 5.1 — THE DUAL WRITE. This is the bug, and 5.2 deletes it.
+		//
+		// The transfer is already committed. Publishing is a second write to
+		// a second system, and the gap between the two lines below is
+		// unclosable: if this process dies here, the transfer exists and no
+		// event does. The worker still sends it (it polls the table), but
+		// every event consumer — customer notification, reconciliation —
+		// never hears of it.
+		//
+		// The error is deliberately ignored. That is not sloppiness, it is
+		// the point: there is nothing useful to do with it. Returning 500
+		// would be a lie — the transfer IS created. Retrying assumes the
+		// process is still alive, which is exactly what fails. Rolling back
+		// is impossible; it is committed.
+		if s.publisher != nil {
+			_ = s.publisher.Publish(r.Context(), TransferEvent{
+				TransferID: transfer.ID,
+				Amount:     transfer.Amount,
+				Currency:   transfer.Currency,
+			})
+		}
+
 		// 202 on the first request and on every replay alike: we accepted the
 		// instruction, and the money has not moved.
 		writeJSON(w, http.StatusAccepted, toResponse(transfer))
