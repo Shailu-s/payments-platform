@@ -29,9 +29,8 @@ type DB interface {
 }
 
 type Server struct {
-	db        DB
-	limiter   *ratelimit.Limiter
-	publisher Publisher
+	db      DB
+	limiter *ratelimit.Limiter
 }
 
 // Requests per key per window. Small on purpose: this is a portfolio system,
@@ -48,9 +47,8 @@ const (
 
 func NewServer(pool *pgxpool.Pool) *Server {
 	return &Server{
-		db:        pool,
-		limiter:   ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
-		publisher: nil,
+		db:      pool,
+		limiter: ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
 	}
 }
 

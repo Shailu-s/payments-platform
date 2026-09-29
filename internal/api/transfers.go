@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/ledger"
+	"github.com/Shailu-s/payments-platform/internal/outbox"
 	"github.com/Shailu-s/payments-platform/internal/transfers"
 )
 
@@ -145,28 +147,11 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 			"this Idempotency-Key was already used for a different request: "+
 				"use a new key for a new payment")
 	default:
-		// PHASE 5.1 — THE DUAL WRITE. This is the bug, and 5.2 deletes it.
+		// Nothing is published here. The transfer.created event was written
+		// to the outbox inside the transfer's own transaction, so by the time
+		// this line runs it is exactly as durable as the transfer. A replay
+		// writes no second event: it never reaches insertTransfer.
 		//
-		// The transfer is already committed. Publishing is a second write to
-		// a second system, and the gap between the two lines below is
-		// unclosable: if this process dies here, the transfer exists and no
-		// event does. The worker still sends it (it polls the table), but
-		// every event consumer — customer notification, reconciliation —
-		// never hears of it.
-		//
-		// The error is deliberately ignored. That is not sloppiness, it is
-		// the point: there is nothing useful to do with it. Returning 500
-		// would be a lie — the transfer IS created. Retrying assumes the
-		// process is still alive, which is exactly what fails. Rolling back
-		// is impossible; it is committed.
-		if s.publisher != nil {
-			_ = s.publisher.Publish(r.Context(), TransferEvent{
-				TransferID: transfer.ID,
-				Amount:     transfer.Amount,
-				Currency:   transfer.Currency,
-			})
-		}
-
 		// 202 on the first request and on every replay alike: we accepted the
 		// instruction, and the money has not moved.
 		writeJSON(w, http.StatusAccepted, toResponse(transfer))
@@ -268,6 +253,32 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 		return transfers.Transfer{}, err
 	}
 	transfer.LedgerTxnID = &ledgerTxnID
+
+	// The event is written HERE, on tx, before the commit — not published
+	// after it. A Postgres commit and a Kafka publish cannot commit together,
+	// so publishing after the commit loses the event whenever the process dies
+	// between the two. As an outbox row it commits or rolls back with the
+	// transfer, and a relay publishes it later.
+	payload, err := json.Marshal(TransferEvent{
+		TransferID:         transfer.ID,
+		Amount:             transfer.Amount,
+		Currency:           transfer.Currency,
+		SourceAccount:      transfer.SourceAccount,
+		DestinationAccount: transfer.DestinationAccount,
+	})
+	if err != nil {
+		return transfers.Transfer{}, fmt.Errorf("marshal transfer event %s: %w", transfer.ID, err)
+	}
+
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		ID:          newID("evt"),
+		AggregateID: transfer.ID,
+		EventType:   "transfer.created",
+		Topic:       "transfers",
+		Payload:     payload,
+	}); err != nil {
+		return transfers.Transfer{}, err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return transfers.Transfer{}, fmt.Errorf("commit transfer %s: %w", transfer.ID, err)
