@@ -50,13 +50,14 @@ Postgres is on **5433**, not 5432, so it does not collide with a local install.
 
 ### Running the system end to end
 
-Three terminals:
+Four terminals:
 
 ```sh
 make apikey NAME="local dev"   # once: prints a key, shown only this one time
 make run                       # terminal 1 — the API on :8080
 make worker                    # terminal 2 — sends accepted transfers to MockBank
-make demo                      # terminal 3 — walks through the API
+make relay                     # terminal 3 — publishes outbox events to Kafka
+make demo                      # terminal 4 — walks through the API
 ```
 
 MockBank already runs in Compose. `make mock-bank` runs it from source instead, on the same
@@ -83,12 +84,12 @@ docker exec payments-kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --list
 ```
 
-Read every message on `transfers` from the start, showing key and partition (Ctrl-C to stop):
+Read every message on `transfers` from the start, showing key, partition and headers (Ctrl-C to stop):
 
 ```sh
 docker exec -it payments-kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 --topic transfers --from-beginning \
-  --property print.key=true --property print.partition=true
+  --property print.key=true --property print.partition=true --property print.headers=true
 ```
 
 List consumer groups, then see how far one group has read on each partition:
