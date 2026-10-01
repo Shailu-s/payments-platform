@@ -4,7 +4,8 @@ Payment infrastructure: a backend platform for moving money reliably through ext
 payment providers. It maintains its own double-entry ledger and stays correct under retries,
 concurrency, duplicate events, provider failures, and reconciliation mismatches.
 
-**Status: in design. Phase 1 not started.** See [PLAN.md](PLAN.md).
+**Status: phases 1–4 done (ledger, transfer API, idempotency and concurrency, provider
+simulator). Phase 5 (Kafka and the transactional outbox) in progress.** See [PLAN.md](PLAN.md).
 
 ---
 
@@ -33,6 +34,77 @@ Each of these will be backed by a named automated test.
 ## Stack
 
 Go, PostgreSQL, Kafka, Docker Compose. Modular monolith plus workers.
+
+## Running it locally
+
+Needs Docker, Go 1.26, and the `migrate` CLI
+(`go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@latest`).
+
+```sh
+make up            # Postgres :5433, MockBank :8081, Kafka :9092, and the Kafka topics
+make migrate-up    # apply db/migrations
+make test          # the full suite, against the real Postgres
+```
+
+Postgres is on **5433**, not 5432, so it does not collide with a local install.
+
+### Running the system end to end
+
+Three terminals:
+
+```sh
+make apikey NAME="local dev"   # once: prints a key, shown only this one time
+make run                       # terminal 1 — the API on :8080
+make worker                    # terminal 2 — sends accepted transfers to MockBank
+make demo                      # terminal 3 — walks through the API
+```
+
+MockBank already runs in Compose. `make mock-bank` runs it from source instead, on the same
+port, so stop the container first (`docker stop payments-mock-bank`).
+
+### Kafka
+
+`make up` starts a single Kafka broker, and a one-shot `kafka-init` container creates the
+`transfers` topic with **3 partitions** (it skips the topic if it already exists). Kafka has
+no volume, so `make down` deletes every topic and message, and the next `make up` recreates
+the topic empty.
+
+Check the topic exists with 3 partitions:
+
+```sh
+docker exec payments-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic transfers
+```
+
+List every topic:
+
+```sh
+docker exec payments-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+```
+
+Read every message on `transfers` from the start, showing key and partition (Ctrl-C to stop):
+
+```sh
+docker exec -it payments-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic transfers --from-beginning \
+  --property print.key=true --property print.partition=true
+```
+
+List consumer groups, then see how far one group has read on each partition:
+
+```sh
+docker exec payments-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --list
+docker exec payments-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group <group-name>
+```
+
+If `kafka-init` failed, its output says why:
+
+```sh
+docker logs $(docker ps -aqf name=kafka-init)
+```
 
 ## Scope
 

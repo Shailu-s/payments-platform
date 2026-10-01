@@ -33,6 +33,23 @@ services:
       - "8081:8081"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: payments-kafka
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+      interval: 2s
+  
+  kafka-init:
+    image: apache/kafka:3.8.0
+    network_mode: service:kafka
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic transfers --partitions 3
 
 volumes:
   payments-pgdata:
