@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender chaos-kill-consumer
 
 up:
 	$(COMPOSE) up -d --wait
@@ -25,6 +25,9 @@ migrate-redo: migrate-down migrate-up
 # Per-package schemas isolate parallel tests; no -p 1 workaround needed.
 test:
 	go test ./... -count=1
+
+chaos-kill-consumer:
+	@bash scripts/chaos-kill-consumer.sh
 
 # Requires `make run` in another terminal; resets the local database.
 demo:

@@ -709,3 +709,16 @@ The user deferred comment explain-back and approved commit/push, permitting tool
 attribution metadata while retaining his Git author identity. Rules updated accordingly;
 this rules/log update is separate from the comment-only cleanup. Next implementation:
 scripted sender SIGKILL/redelivery proof (5.5); no new phase-5 feature code written yet.
+
+**2026-10-05 — phase 5 failure proof implemented, tested, approved for commit.**
+`make chaos-kill-consumer` SIGKILLs an isolated child running production consumer/sender
+logic after provider-reference persistence and before offset commit. Negative control:
+6 submissions for 5 transfers without the claim guard. With SendByID: 5 submissions,
+same record redelivered with sent=false, unchanged entries on replay, five settlements.
+Three repeated runs, full build/tests and race detector passed. Kafka-down experiment:
+poller submission after 30.233s, callback settlement verified, unpublished event retained;
+Kafka restored with existing topics intact. This is a controlled-provider test, not a
+production rebalance or MockBank settlement-latency measurement. The earlier provider
+acceptance/reference-persistence crash window and webhook two-commit gap remain documented
+limits. The user explained the two failure scenarios and approved the commit. Next is
+phase 6, starting with atomic webhook deduplication/application before HMAC verification.
