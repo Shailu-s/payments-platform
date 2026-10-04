@@ -1,7 +1,7 @@
 DB_URL ?= postgres://payments:payments@localhost:5433/payments?sslmode=disable
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch
 
 up:
 	$(COMPOSE) up -d --wait
@@ -38,6 +38,10 @@ worker:
 # Publish outbox events to Kafka. Run alongside `make run`.
 relay:
 	@DATABASE_URL="$(DB_URL)" KAFKA_BROKERS="localhost:9092" go run ./cmd/relay
+
+# Print every event from transfers topic
+watch:
+	@KAFKA_BROKERS="localhost:9092" go run ./cmd/watch
 
 # Serve MockBank on :8081. Run it alongside `make run`.
 mock-bank:
