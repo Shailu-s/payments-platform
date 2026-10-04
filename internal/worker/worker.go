@@ -31,6 +31,9 @@ type Config struct {
 	// ResolveInterval is how often to ask the rail about transfers parked as
 	// unresolved. Parking is only correct because something comes back for it.
 	ResolveInterval time.Duration
+	// HeadStart is how long a new transfer is left to the event consumer before
+	// the poller will take it. Zero when the poller is the only sender.
+	HeadStart time.Duration
 }
 
 func DefaultConfig() Config {
@@ -96,7 +99,7 @@ func (w *Worker) Run(ctx context.Context) {
 // from Run so tests can drive a single pass deterministically instead of
 // racing a loop.
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
-	batch, err := Claim(ctx, w.db, w.cfg.BatchSize, w.cfg.RetryBackoff)
+	batch, err := Claim(ctx, w.db, w.cfg.BatchSize, w.cfg.RetryBackoff, w.cfg.HeadStart)
 	if err != nil {
 		return 0, err
 	}

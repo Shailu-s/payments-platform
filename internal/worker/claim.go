@@ -34,7 +34,14 @@ type DB interface {
 // The lock is released by the COMMIT at the end of this function, not held for
 // the length of the provider call. Holding a row lock across a network call to
 // a third party is how one slow vendor stops your whole queue.
-func Claim(ctx context.Context, db DB, limit int, backoff time.Duration) ([]transfers.Transfer, error) {
+//
+// headStart demotes the poller to a safety net. A transfer nobody has tried yet
+// is left alone until it is headStart old, because the transfer-sender consumer
+// sends it within a second of its event. Only one the consumer missed — Kafka
+// or the relay down, an event stuck behind a failing record — is old enough to
+// be picked up here. A retry (next_attempt_at set) is due on its backoff alone.
+// Zero makes the poller the only sender again.
+func Claim(ctx context.Context, db DB, limit int, backoff, headStart time.Duration) ([]transfers.Transfer, error) {
 	const q = `
 		UPDATE transfers
 		SET attempt_count   = attempt_count + 1,
@@ -44,7 +51,8 @@ func Claim(ctx context.Context, db DB, limit int, backoff time.Duration) ([]tran
 			SELECT id FROM transfers
 			WHERE status = 'processing'
 			  AND provider_ref IS NULL
-			  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+			  AND (next_attempt_at <= now()
+			       OR (next_attempt_at IS NULL AND created_at <= now() - $3::interval))
 			ORDER BY next_attempt_at NULLS FIRST, created_at
 			FOR UPDATE SKIP LOCKED
 			LIMIT $1
@@ -58,7 +66,7 @@ func Claim(ctx context.Context, db DB, limit int, backoff time.Duration) ([]tran
 	// dies mid-send does not leave the transfer claimable again immediately —
 	// the row becomes available when the backoff expires, and the crash costs
 	// one delay rather than a tight retry loop against the rail.
-	rows, err := db.Query(ctx, q, limit, backoff.String())
+	rows, err := db.Query(ctx, q, limit, backoff.String(), headStart.String())
 	if err != nil {
 		return nil, fmt.Errorf("claim transfers: %w", err)
 	}

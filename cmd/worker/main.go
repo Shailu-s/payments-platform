@@ -44,7 +44,14 @@ func main() {
 	}
 	defer pool.Close()
 
-	w := worker.New(pool, provider.New(providerURL, provider.DefaultTimeout), worker.DefaultConfig())
+	// The transfer-sender consumer is the main path now: it sends a transfer
+	// within a second of its event. This poller is the safety net, so it leaves
+	// new transfers alone for 30s and only picks up what the consumer missed.
+	// Payments then slow down when Kafka is down, instead of stopping.
+	cfg := worker.DefaultConfig()
+	cfg.HeadStart = 30 * time.Second
+
+	w := worker.New(pool, provider.New(providerURL, provider.DefaultTimeout), cfg)
 
 	// Graceful shutdown from the start. Cancelling stops the worker taking new
 	// work and lets the in-flight batch finish; a worker that cannot stop

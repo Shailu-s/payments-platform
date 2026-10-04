@@ -11,7 +11,7 @@ func TestClaimReturnsDueTransfers(t *testing.T) {
 	seedTransfers(t, 5)
 	ctx := context.Background()
 
-	claimed, err := Claim(ctx, testPool, 10, time.Minute)
+	claimed, err := Claim(ctx, testPool, 10, time.Minute, 0)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -22,7 +22,7 @@ func TestClaimReturnsDueTransfers(t *testing.T) {
 	// Claiming pushes next_attempt_at forward, so an immediate second claim
 	// takes nothing: a worker that dies mid-send costs one backoff rather than
 	// a tight retry loop against the rail.
-	again, err := Claim(ctx, testPool, 10, time.Minute)
+	again, err := Claim(ctx, testPool, 10, time.Minute, 0)
 	if err != nil {
 		t.Fatalf("second Claim: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestClaimReturnsDueTransfers(t *testing.T) {
 func TestClaimRespectsTheLimit(t *testing.T) {
 	seedTransfers(t, 20)
 
-	claimed, err := Claim(context.Background(), testPool, 7, time.Minute)
+	claimed, err := Claim(context.Background(), testPool, 7, time.Minute, 0)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -48,16 +48,16 @@ func TestClaimTakesTransfersWhoseBackoffHasExpired(t *testing.T) {
 	seedTransfers(t, 3)
 	ctx := context.Background()
 
-	if _, err := Claim(ctx, testPool, 10, 50*time.Millisecond); err != nil {
+	if _, err := Claim(ctx, testPool, 10, 50*time.Millisecond, 0); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if again, _ := Claim(ctx, testPool, 10, time.Minute); len(again) != 0 {
+	if again, _ := Claim(ctx, testPool, 10, time.Minute, 0); len(again) != 0 {
 		t.Fatalf("claimed %d before the backoff expired, want 0", len(again))
 	}
 
 	time.Sleep(100 * time.Millisecond)
 
-	due, err := Claim(ctx, testPool, 10, time.Minute)
+	due, err := Claim(ctx, testPool, 10, time.Minute, 0)
 	if err != nil {
 		t.Fatalf("Claim after backoff: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestClaimSkipsTransfersAlreadySentToTheProvider(t *testing.T) {
 		t.Fatalf("set provider_ref: %v", err)
 	}
 
-	claimed, err := Claim(ctx, testPool, 10, time.Minute)
+	claimed, err := Claim(ctx, testPool, 10, time.Minute, 0)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestTwoWorkersNeverClaimTheSameTransfer(t *testing.T) {
 			start.Wait()
 
 			for {
-				batch, err := Claim(ctx, testPool, 5, time.Hour)
+				batch, err := Claim(ctx, testPool, 5, time.Hour, 0)
 				if err != nil {
 					t.Errorf("worker %d: %v", worker, err)
 					return
@@ -163,7 +163,7 @@ func TestManyWorkersNeverClaimTheSameTransfer(t *testing.T) {
 			defer done.Done()
 			start.Wait()
 			for {
-				batch, err := Claim(ctx, testPool, 10, time.Hour)
+				batch, err := Claim(ctx, testPool, 10, time.Hour, 0)
 				if err != nil || len(batch) == 0 {
 					return
 				}
@@ -190,5 +190,33 @@ func TestManyWorkersNeverClaimTheSameTransfer(t *testing.T) {
 	}
 	if len(claims) != total {
 		t.Errorf("%d of %d transfers were claimed", len(claims), total)
+	}
+}
+
+// The poller is the safety net, not the main path. A transfer that has just been
+// created is left to the event consumer for HeadStart; the poller takes it only
+// once that has passed without anyone sending it.
+func TestClaimLeavesFreshTransfersForTheConsumer(t *testing.T) {
+	ctx := context.Background()
+	seedTransfers(t, 1)
+
+	fresh, err := Claim(ctx, testPool, 10, time.Minute, 30*time.Second)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(fresh) != 0 {
+		t.Fatalf("claimed %d fresh transfers, want 0: the consumer has a 30s head start", len(fresh))
+	}
+
+	if _, err := testPool.Exec(ctx,
+		`UPDATE transfers SET created_at = now() - interval '31 seconds'`); err != nil {
+		t.Fatalf("age transfer: %v", err)
+	}
+	stale, err := Claim(ctx, testPool, 10, time.Minute, 30*time.Second)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(stale) != 1 {
+		t.Fatalf("claimed %d transfers after the head start, want 1: nobody sent it, so the safety net must", len(stale))
 	}
 }

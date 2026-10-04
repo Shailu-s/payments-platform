@@ -56,15 +56,21 @@ committed template.
 
 ### Running the system end to end
 
-Four terminals:
+Five terminals:
 
 ```sh
 make apikey NAME="local dev"   # once: prints a key, shown only this one time
 make run                       # terminal 1 — the API on :8080
-make worker                    # terminal 2 — sends accepted transfers to MockBank
-make relay                     # terminal 3 — publishes outbox events to Kafka
-make demo                      # terminal 4 — walks through the API
+make relay                     # terminal 2 — publishes outbox events to Kafka
+make sender                    # terminal 3 — sends each transfer to MockBank as its event arrives
+make worker                    # terminal 4 — the safety net: sends what the sender missed, after 30s
+make demo                      # terminal 5 — walks through the API
 ```
+
+Two paths can send a transfer, on purpose. The **sender** is the main path and reacts to the
+event within a second. The **worker** polls the database and only takes transfers older than
+30 seconds, so if Kafka or the relay is down, payments slow down instead of stopping. Both
+claim a transfer with the same guarded `UPDATE`, so it is sent once either way.
 
 MockBank already runs in Compose. `make mock-bank` runs it from source instead, on the same
 port, so stop the container first (`docker stop payments-mock-bank`).
