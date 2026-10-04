@@ -1,4 +1,8 @@
-DB_URL ?= postgres://payments:payments@localhost:5433/payments?sslmode=disable
+# Settings come from .env (copy .env.example). Every command requires them and
+# stops at startup if one is missing, rather than falling back to a guess.
+# `export` hands them to every command a target runs.
+-include .env
+export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
 .PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch
@@ -13,10 +17,10 @@ psql:
 	$(COMPOSE) exec postgres psql -U payments -d payments
 
 migrate-up:
-	migrate -path db/migrations -database "$(DB_URL)" up
+	migrate -path db/migrations -database "$(DATABASE_URL)" up
 
 migrate-down:
-	migrate -path db/migrations -database "$(DB_URL)" down 1
+	migrate -path db/migrations -database "$(DATABASE_URL)" down 1
 
 migrate-redo: migrate-down migrate-up
 
@@ -33,28 +37,28 @@ demo:
 
 # Send accepted transfers to the provider. Run alongside `make run`.
 worker:
-	@DATABASE_URL="$(DB_URL)" PROVIDER_URL="http://localhost:8081" go run ./cmd/worker
+	@go run ./cmd/worker
 
 # Publish outbox events to Kafka. Run alongside `make run`.
 relay:
-	@DATABASE_URL="$(DB_URL)" KAFKA_BROKERS="localhost:9092" go run ./cmd/relay
+	@go run ./cmd/relay
 
 # Print every event from transfers topic
 watch:
-	@KAFKA_BROKERS="localhost:9092" go run ./cmd/watch
+	@go run ./cmd/watch
 
 # Serve MockBank on :8081. Run it alongside `make run`.
 mock-bank:
-	@WEBHOOK_URL="http://localhost:8080/v1/webhooks/mockbank" go run ./cmd/mock-bank
+	@go run ./cmd/mock-bank
 
 # Serve the API on :8080
 run:
-	@DATABASE_URL="$(DB_URL)" go run ./cmd/api
+	@go run ./cmd/api
 
 # Mint an API key and print it once. NAME is required: `make apikey NAME="local dev"`
 apikey:
-	@DATABASE_URL="$(DB_URL)" go run ./cmd/apikey -name "$(NAME)"
+	@go run ./cmd/apikey -name "$(NAME)"
 
 # List keys. Shows the prefix, never the secret.
 apikeys:
-	@DATABASE_URL="$(DB_URL)" go run ./cmd/apikey -list
+	@go run ./cmd/apikey -list

@@ -12,19 +12,20 @@ import (
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/api"
+	"github.com/Shailu-s/payments-platform/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
-)
-
-const (
-	defaultDSN  = "postgres://payments:payments@localhost:5433/payments?sslmode=disable"
-	defaultAddr = ":8080"
 )
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	dsn := envOr("DATABASE_URL", defaultDSN)
-	addr := envOr("API_ADDR", defaultAddr)
+	var env config.Env
+	dsn := env.Require("DATABASE_URL")
+	addr := env.Require("API_ADDR")
+	if err := env.Err(); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -32,7 +33,7 @@ func main() {
 		err = pool.Ping(ctx)
 	}
 	if err != nil {
-		slog.Error("no database", "dsn", dsn, "error", err)
+		slog.Error("no database", "error", err)
 		slog.Error("run `make up && make migrate-up` first")
 		os.Exit(1)
 	}
@@ -81,11 +82,4 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("stopped cleanly")
-}
-
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
 }

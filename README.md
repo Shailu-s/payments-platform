@@ -41,12 +41,18 @@ Needs Docker, Go 1.26, and the `migrate` CLI
 (`go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@latest`).
 
 ```sh
+cp .env.example .env   # once: every setting lives here; nothing has a fallback
 make up            # Postgres :5433, MockBank :8081, Kafka :9092, and the Kafka topics
 make migrate-up    # apply db/migrations
 make test          # the full suite, against the real Postgres
 ```
 
 Postgres is on **5433**, not 5432, so it does not collide with a local install.
+
+Every command reads its settings from the environment and **stops at startup if one is
+missing** — there are no built-in defaults to silently fall back to. The Makefile loads `.env`
+and passes it on, so run commands through `make`. `.env` is git-ignored; `.env.example` is the
+committed template.
 
 ### Running the system end to end
 

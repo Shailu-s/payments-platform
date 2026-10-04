@@ -6,12 +6,13 @@
 #
 #   make up && make migrate-up      # once
 #   make run                        # in another terminal
-#   ./scripts/demo.sh
+#   make demo                       # loads .env, which this script needs
 #
 set -euo pipefail
 
-API="${API:-http://localhost:8080}"
-DB_URL="${DB_URL:-postgres://payments:payments@localhost:5433/payments?sslmode=disable}"
+: "${API_URL:?is not set — copy .env.example to .env and run this through make demo}"
+: "${DATABASE_URL:?is not set — copy .env.example to .env and run this through make demo}"
+API="$API_URL"
 COMPOSE="docker compose -f docker/docker-compose.yml"
 
 bold=$(tput bold 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -81,7 +82,7 @@ pass "database reset"
 step "1. Authentication — a key is stored as a hash, never as itself"
 why "A stolen database dump must not yield working keys."
 
-KEY_OUTPUT=$(DATABASE_URL="$DB_URL" go run ./cmd/apikey -name "demo key" 2>/dev/null)
+KEY_OUTPUT=$(go run ./cmd/apikey -name "demo key" 2>/dev/null)
 KEY=$(echo "$KEY_OUTPUT" | awk '/^  key /{print $2}')
 KEY_ID=$(echo "$KEY_OUTPUT" | awk '/^  id /{print $2}')
 printf "  minted   %s\n" "$KEY"
@@ -110,14 +111,14 @@ expect "a key that was never issued" "$CODE" "401"
 step "3. Revocation withdraws access but keeps the audit trail"
 why "Transfers reference the key that authorised them, so revocation is a timestamp, not a DELETE."
 
-DOOMED=$(DATABASE_URL="$DB_URL" go run ./cmd/apikey -name "to be revoked" 2>/dev/null)
+DOOMED=$(go run ./cmd/apikey -name "to be revoked" 2>/dev/null)
 DOOMED_KEY=$(echo "$DOOMED" | awk '/^  key /{print $2}')
 DOOMED_ID=$(echo "$DOOMED" | awk '/^  id /{print $2}')
 
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $DOOMED_KEY" "$API/v1/transfers")
 expect "before revocation" "$CODE" "200"
 
-DATABASE_URL="$DB_URL" go run ./cmd/apikey -revoke "$DOOMED_ID" >/dev/null 2>&1
+go run ./cmd/apikey -revoke "$DOOMED_ID" >/dev/null 2>&1
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $DOOMED_KEY" "$API/v1/transfers")
 expect "after revocation" "$CODE" "401"
 expect "the row survives revocation" "$(psql_q "SELECT count(*) FROM api_keys WHERE id = '$DOOMED_ID'")" "1"

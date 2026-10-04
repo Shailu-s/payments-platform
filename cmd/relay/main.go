@@ -13,21 +13,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Shailu-s/payments-platform/internal/config"
 	"github.com/Shailu-s/payments-platform/internal/relay"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-const (
-	defaultDSN     = "postgres://payments:payments@localhost:5433/payments?sslmode=disable"
-	defaultBrokers = "localhost:9092"
-)
-
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	dsn := envOr("DATABASE_URL", defaultDSN)
-	brokers := strings.Split(envOr("KAFKA_BROKERS", defaultBrokers), ",")
+	var env config.Env
+	dsn := env.Require("DATABASE_URL")
+	brokers := strings.Split(env.Require("KAFKA_BROKERS"), ",")
+	if err := env.Err(); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -37,7 +38,7 @@ func main() {
 		err = pool.Ping(ctx)
 	}
 	if err != nil {
-		slog.Error("no database", "dsn", dsn, "error", err)
+		slog.Error("no database", "error", err)
 		slog.Error("run `make up && make migrate-up` first")
 		os.Exit(1)
 	}
@@ -79,11 +80,4 @@ func main() {
 		slog.Error("shutdown timed out with a batch in flight")
 		os.Exit(1)
 	}
-}
-
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
 }

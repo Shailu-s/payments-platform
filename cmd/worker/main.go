@@ -13,21 +13,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Shailu-s/payments-platform/internal/config"
 	"github.com/Shailu-s/payments-platform/internal/provider"
 	"github.com/Shailu-s/payments-platform/internal/worker"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const (
-	defaultDSN         = "postgres://payments:payments@localhost:5433/payments?sslmode=disable"
-	defaultProviderURL = "http://localhost:8081"
-)
-
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	dsn := envOr("DATABASE_URL", defaultDSN)
-	providerURL := envOr("PROVIDER_URL", defaultProviderURL)
+	var env config.Env
+	dsn := env.Require("DATABASE_URL")
+	providerURL := env.Require("PROVIDER_URL")
+	if err := env.Err(); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -37,7 +38,7 @@ func main() {
 		err = pool.Ping(ctx)
 	}
 	if err != nil {
-		slog.Error("no database", "dsn", dsn, "error", err)
+		slog.Error("no database", "error", err)
 		slog.Error("run `make up && make migrate-up` first")
 		os.Exit(1)
 	}
@@ -68,11 +69,4 @@ func main() {
 		slog.Error("shutdown timed out with work still in flight")
 		os.Exit(1)
 	}
-}
-
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
 }

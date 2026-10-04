@@ -9,14 +9,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Shailu-s/payments-platform/internal/config"
 	"github.com/Shailu-s/payments-platform/internal/consumer"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 const (
-	defaultBrokers = "localhost:9092"
-	group          = "watch"
-	topic          = "transfers"
+	group = "watch"
+	topic = "transfers"
 )
 
 func main() {
@@ -24,7 +24,12 @@ func main() {
 		Level: slog.LevelDebug,
 	})))
 
-	brokers := strings.Split(envOr("KAFKA_BROKERS", defaultBrokers), ",")
+	var env config.Env
+	brokers := strings.Split(env.Require("KAFKA_BROKERS"), ",")
+	if err := env.Err(); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
@@ -82,11 +87,4 @@ func header(r *kgo.Record, key string) string {
 		}
 	}
 	return ""
-}
-
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
 }
