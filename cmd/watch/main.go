@@ -64,7 +64,7 @@ func main() {
 	})
 
 	client.Close()
-	slog.Info("Stopeed cleanly")
+	slog.Info("Stopped cleanly")
 }
 
 func logPartitions(msg string) func(context.Context, *kgo.Client, map[string][]int32) {
