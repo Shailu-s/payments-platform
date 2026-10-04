@@ -634,8 +634,10 @@ than the identity of the project.
   start.
 - **The scope fence is closed until phase 4 runs.** It was opened once on day zero; that was
   the allowance, not a precedent.
-- **Small, reviewable commits** following the build order. No AI attribution trailers, ever.
-  After the first commit, stop and let him review before continuing.
+- **Small, reviewable commits** following the build order. Avoid voluntary AI attribution;
+  tool-required metadata is permitted (approved 2026-10-05), with `Shailu-s` /
+  `srajawat024@gmail.com` retained as the commit author. After the first commit, stop and let
+  him review before continuing unless he explicitly approves the batch.
 - **Never commit secrets or generated files.** `git status --porcelain -uall` before staging.
 - If a phase is dragging past its weekend, **cut scope within the phase** rather than
   skipping ahead.
@@ -695,3 +697,15 @@ the claim guard (watched double-paying 29 of 50 transfers in its naive form firs
 `transfer-sender`, and every setting moved to required environment variables.
 **Decided 2026-10-05:** the working method changes to "Claude writes, he reviews and explains",
 and V1 is fast-tracked — see the working method section and the scope cut above.
+
+**2026-10-05 — poller demoted; comment cleanup committed.** `8151e4b` gives the event
+consumer a 30s head start. Comment-only cleanup `f914551`: 61 Go files passed comment-free
+parser/formatter and token comparisons against the preceding HEAD; 15 non-Go files retained
+identical non-comment content. Comment lines 1,673 -> 579. Build and full tests passed
+against healthy Compose services. Three pre-existing gofmt issues were left outside scope.
+The webhook event record and financial transition commit separately: failed application
+can be skipped on redelivery; logged as an unfixed gap in PROGRESS.md.
+The user deferred comment explain-back and approved commit/push, permitting tool-required
+attribution metadata while retaining his Git author identity. Rules updated accordingly;
+this rules/log update is separate from the comment-only cleanup. Next implementation:
+scripted sender SIGKILL/redelivery proof (5.5); no new phase-5 feature code written yet.
