@@ -10,12 +10,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 )
 
-// ⭐ The fix for the dual write: a transfer and its event exist together.
-//
-// The event is written to outbox_events inside the transfer's own transaction,
-// so there is no moment at which one is durable and the other is not. This
-// test checks the success half: one transfer, exactly one event, carrying the
-// public contract and nothing private — and a replay adds no second event.
+// A transfer commits with one public event; retries must not add another.
 func TestTransferAndItsEventCommitTogether(t *testing.T) {
 	ctx := context.Background()
 	h, apiKey := newTestServer(t)
@@ -71,9 +66,7 @@ func TestTransferAndItsEventCommitTogether(t *testing.T) {
 		t.Errorf("payload = %+v, want %+v", event, want)
 	}
 
-	// The event is broadcast to every consumer, so it must carry the contract
-	// and nothing else. Marshalling the transfers row instead would leak the
-	// api key, the idempotency key and retry state into Kafka.
+	// Serialising the database row would leak private key and retry metadata.
 	var fields map[string]any
 	if err := json.Unmarshal(payload, &fields); err != nil {
 		t.Fatalf("decode payload: %v", err)
@@ -93,17 +86,8 @@ func TestTransferAndItsEventCommitTogether(t *testing.T) {
 	}
 }
 
-// ⭐ The other half: if the transfer does not commit, neither does its event.
-//
-// The failure is injected at COMMIT, after the outbox insert has already
-// succeeded. That placement is the point. A failure before the insert proves
-// nothing — the insert never runs. Only a commit that fails after it can tell
-// "written on the transaction" apart from "written on the pool": handed the
-// pool, outbox.Insert commits its row on its own connection at once, and that
-// row survives the rollback as an event for a transfer that does not exist.
-//
-// A deferred constraint trigger is the injection. It runs at COMMIT rather
-// than at INSERT, raises, and Postgres rolls the whole transaction back.
+// Fail COMMIT with a deferred trigger after the outbox insert. Earlier failure
+// cannot distinguish an insert on the caller's transaction from one on the pool.
 func TestFailedCommitWritesNoEvent(t *testing.T) {
 	ctx := context.Background()
 	h, apiKey := newTestServer(t)

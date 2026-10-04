@@ -1,8 +1,4 @@
 // Package worker sends accepted transfers to the payment rail.
-//
-// It is a separate process from the API, which is what makes it the first part
-// of this system where two things can crash independently. Everything awkward
-// here comes from that.
 package worker
 
 import (
@@ -22,25 +18,10 @@ type DB interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// Claim takes up to limit transfers that are due to be sent, marking them as
-// attempted so no other worker picks them up.
-//
-// FOR UPDATE SKIP LOCKED is the whole trick, and it is worth being able to
-// draw. Without SKIP LOCKED a second worker BLOCKS on the rows the first has
-// locked: it waits, takes the same work, and you have one worker with extra
-// steps and extra latency. With it, the second worker steps over the locked
-// rows and claims different ones, so adding workers adds throughput.
-//
-// The lock is released by the COMMIT at the end of this function, not held for
-// the length of the provider call. Holding a row lock across a network call to
-// a third party is how one slow vendor stops your whole queue.
-//
-// headStart demotes the poller to a safety net. A transfer nobody has tried yet
-// is left alone until it is headStart old, because the transfer-sender consumer
-// sends it within a second of its event. Only one the consumer missed — Kafka
-// or the relay down, an event stuck behind a failing record — is old enough to
-// be picked up here. A retry (next_attempt_at set) is due on its backoff alone.
-// Zero makes the poller the only sender again.
+// Claim reserves due transfers until their backoff expires. Row locks prevent
+// concurrent claims; SKIP LOCKED lets other workers claim different rows.
+// On a pool, locks end with the statement, before provider calls.
+// headStart delays only first attempts so the event consumer gets priority.
 func Claim(ctx context.Context, db DB, limit int, backoff, headStart time.Duration) ([]transfers.Transfer, error) {
 	const q = `
 		UPDATE transfers
@@ -62,10 +43,7 @@ func Claim(ctx context.Context, db DB, limit int, backoff, headStart time.Durati
 		          request_fingerprint, provider_ref, attempt_count,
 		          next_attempt_at, last_error, created_at, updated_at`
 
-	// next_attempt_at is pushed forward as part of claiming, so a worker that
-	// dies mid-send does not leave the transfer claimable again immediately —
-	// the row becomes available when the backoff expires, and the crash costs
-	// one delay rather than a tight retry loop against the rail.
+	// Persist backoff in the claim so a crash cannot cause an immediate retry loop.
 	rows, err := db.Query(ctx, q, limit, backoff.String(), headStart.String())
 	if err != nil {
 		return nil, fmt.Errorf("claim transfers: %w", err)

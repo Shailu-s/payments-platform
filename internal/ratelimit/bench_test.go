@@ -6,11 +6,7 @@ import (
 	"time"
 )
 
-// The measured cost of putting the limiter in Postgres, which is the real
-// objection to this design: a database write on every single request, on the
-// hot path. Redis exists precisely to avoid it.
-//
-//	go test ./internal/ratelimit/ -bench=. -benchtime=2000x -run=XXX
+// Measure the hot-path write cost against a bare database round trip.
 func BenchmarkAllow(b *testing.B) {
 	keyID := benchKey(b)
 	ctx := context.Background()
@@ -25,9 +21,7 @@ func BenchmarkAllow(b *testing.B) {
 	}
 }
 
-// The baseline to compare against: the cheapest possible round trip to the same
-// database. The difference between the two is what the limiter itself costs, as
-// opposed to the cost of talking to Postgres at all.
+// Isolate database round-trip overhead from the limiter's increment cost.
 func BenchmarkBaselineRoundTrip(b *testing.B) {
 	ctx := context.Background()
 

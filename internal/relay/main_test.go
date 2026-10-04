@@ -35,9 +35,7 @@ func TestMain(m *testing.M) {
       }
       testPool = pool
 
-      // NewClient does not connect. It only checks the options, so with the
-      // broker stopped it succeeds here andil its
-      // timeout. Ping makes a missing broker fail at once, with the fix.
+      // NewClient is lazy; Ping detects a missing broker before running tests.
       kafka, err = kgo.NewClient(kgo.SeedBrokers(brokers))
       if err != nil {
               fmt.Fprintf(os.Stderr, "kafka client: %v\n", err)

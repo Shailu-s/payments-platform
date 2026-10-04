@@ -1,15 +1,5 @@
-// Command mock-bank simulates a bank rail: it accepts payment instructions,
-// answers immediately, and confirms the outcome later by webhook.
-//
-// It is a separate process on its own port with its own in-memory storage, and
-// it has no access to the payments database. That separation is the point: a
-// provider that can read our ledger is a function call wearing an HTTP costume,
-// and none of the failures worth rehearsing — timeouts, duplicate events,
-// settlement arriving before acknowledgement — are real unless the two sides
-// genuinely do not share state.
-//
-// Its behaviour is specified in docs/mockbank-api.md, which was written before
-// either side's code.
+// Command mock-bank simulates the rail contract in docs/mockbank-api.md.
+// It uses independent in-memory state, not the platform database.
 package main
 
 import (

@@ -8,22 +8,17 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Directions. Stored as text and constrained by a CHECK in the schema, so an
-// invalid direction cannot reach the table even if this package is bypassed.
+// Ledger directions are also constrained by the database.
 const (
 	DirectionDebit  = "debit"
 	DirectionCredit = "credit"
 )
 
-// Beginner is anything that can start a transaction: a pool or a connection.
-// Record needs this rather than a Querier because the whole point of the
-// function is that its writes are atomic.
+// Beginner supports atomic ledger writes, including a savepoint on a pgx.Tx.
 type Beginner interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// Errors callers are expected to branch on. Wrapped with %w at the return
-// site, so errors.Is works through the context added by each message.
 var (
 	ErrTooFewEntries     = errors.New("a transaction needs at least two entries")
 	ErrNonPositiveAmount = errors.New("entry amounts must be greater than zero")
@@ -39,18 +34,10 @@ type Entry struct {
 	Amount    int64
 }
 
-// Record writes one balanced ledger transaction and its entries atomically.
-//
-// The constraint that forces the database transaction: a movement with its
-// debit written and its credit not written is money destroyed. There is no
-// valid intermediate state, so either all of it lands or none of it does.
-//
-// Deliberately absent: any check that the source account has enough money.
-// That is a read-then-write race, and it is solved properly in phase 3.
+// Record writes a balanced transaction and its entries atomically.
+// It does not enforce available funds; the transfer API checks under an account lock.
 func Record(ctx context.Context, db Beginner, reference string, entries []Entry) (string, error) {
-	// Validate before opening a transaction. An unbalanced set is a caller bug,
-	// not a database concern, and there is no reason to hold a connection to
-	// discover it.
+	// Reject invalid entries before reserving a database connection.
 	if len(entries) < 2 {
 		return "", fmt.Errorf("record %q: got %d: %w", reference, len(entries), ErrTooFewEntries)
 	}
@@ -77,8 +64,7 @@ func Record(ctx context.Context, db Beginner, reference string, entries []Entry)
 	if err != nil {
 		return "", fmt.Errorf("record %q: begin: %w", reference, err)
 	}
-	// Harmless after a successful commit, and it is what releases the
-	// connection on every early return below.
+	// Release the transaction on every error path; harmless after commit.
 	defer tx.Rollback(ctx)
 
 	txnID := newID("ltx")

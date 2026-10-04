@@ -9,9 +9,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/transfers"
 )
 
-// Provider is what the worker needs from the rail. An interface rather than the
-// concrete client so tests can make it time out, reject, or vanish on demand —
-// which is the only way to rehearse the outcomes that matter.
+// Provider supports submission and lookup, including lookup after an unknown outcome.
 type Provider interface {
 	Submit(ctx context.Context, req provider.SubmitRequest) (provider.Payment, error)
 	Get(ctx context.Context, providerRef string) (provider.Payment, error)
@@ -19,17 +17,13 @@ type Provider interface {
 }
 
 type Config struct {
-	// BatchSize is how many transfers one claim takes. Larger batches mean
-	// fewer round trips and a longer tail if the process dies mid-batch.
+	// BatchSize trades fewer claim queries for more reserved work on a crash.
 	BatchSize int
-	// PollInterval is how long to wait after finding nothing. Work arrives
-	// continuously in production, so this only governs an idle queue.
+	// PollInterval applies only when no transfers were claimed.
 	PollInterval time.Duration
-	// RetryBackoff is how far forward a claim pushes next_attempt_at, and so
-	// how long a crashed worker's transfers wait before anyone retries them.
+	// RetryBackoff is the reservation duration, including after a worker crash.
 	RetryBackoff time.Duration
-	// ResolveInterval is how often to ask the rail about transfers parked as
-	// unresolved. Parking is only correct because something comes back for it.
+	// ResolveInterval controls lookups for unresolved transfers.
 	ResolveInterval time.Duration
 	// HeadStart is how long a new transfer is left to the event consumer before
 	// the poller will take it. Zero when the poller is the only sender.
@@ -55,11 +49,8 @@ func New(db DB, p Provider, cfg Config) *Worker {
 	return &Worker{db: db, provider: p, cfg: cfg}
 }
 
-// Run claims and sends until ctx is cancelled.
-//
-// Shutdown is graceful from the start: cancelling stops the worker taking new
-// work, and the in-flight batch finishes. A worker that cannot stop cleanly
-// makes every later test noisier, and phase 5 kills one deliberately.
+// Run claims and sends until ctx is cancelled. Accepted references are recorded
+// independently of cancellation; other in-flight operations use ctx.
 func (w *Worker) Run(ctx context.Context) {
 	slog.InfoContext(ctx, "worker started",
 		"batch_size", w.cfg.BatchSize, "poll_interval", w.cfg.PollInterval.String())
@@ -95,9 +86,7 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// RunOnce claims a batch and sends it, returning how many were sent. Separated
-// from Run so tests can drive a single pass deterministically instead of
-// racing a loop.
+// RunOnce attempts one batch and returns the number claimed, not accepted.
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	batch, err := Claim(ctx, w.db, w.cfg.BatchSize, w.cfg.RetryBackoff, w.cfg.HeadStart)
 	if err != nil {
@@ -105,8 +94,7 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	}
 
 	for _, t := range batch {
-		// Each send is independent: one transfer failing must not abandon the
-		// rest of the batch.
+		// One failed transfer must not abandon the rest of the reserved batch.
 		if err := w.Send(ctx, t); err != nil {
 			slog.ErrorContext(ctx, "sending transfer", "transfer_id", t.ID, "error", err)
 		}
@@ -114,7 +102,6 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	return len(batch), nil
 }
 
-// resolveParked asks the rail about transfers whose outcome we never learned.
 func (w *Worker) resolveParked(ctx context.Context) {
 	parked, err := w.claimUnresolved(ctx, w.cfg.BatchSize)
 	if err != nil {
@@ -128,9 +115,7 @@ func (w *Worker) resolveParked(ctx context.Context) {
 	}
 }
 
-// claimUnresolved reads transfers parked as unresolved. It does not lock them:
-// resolving is a read against the rail followed by a guarded update, so two
-// workers doing it at once is wasteful rather than wrong.
+// No exclusive claim: duplicate lookups are harmless because transitions are guarded.
 func (w *Worker) claimUnresolved(ctx context.Context, limit int) ([]transfers.Transfer, error) {
 	const q = `
 		SELECT id, source_account, destination_account, amount, currency,

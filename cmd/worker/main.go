@@ -1,8 +1,4 @@
-// Command worker sends accepted transfers to the payment rail.
-//
-// A separate process from the API, deliberately. The API's job ends when the
-// instruction is durably recorded; actually moving money through a slow,
-// unreliable third party is work nobody's HTTP request should wait for.
+// Command worker polls for missed transfers and resolves unknown provider outcomes.
 package main
 
 import (
@@ -44,18 +40,13 @@ func main() {
 	}
 	defer pool.Close()
 
-	// The transfer-sender consumer is the main path now: it sends a transfer
-	// within a second of its event. This poller is the safety net, so it leaves
-	// new transfers alone for 30s and only picks up what the consumer missed.
-	// Payments then slow down when Kafka is down, instead of stopping.
+	// Give the event consumer priority; polling still sends when Kafka is unavailable.
 	cfg := worker.DefaultConfig()
 	cfg.HeadStart = 30 * time.Second
 
 	w := worker.New(pool, provider.New(providerURL, provider.DefaultTimeout), cfg)
 
-	// Graceful shutdown from the start. Cancelling stops the worker taking new
-	// work and lets the in-flight batch finish; a worker that cannot stop
-	// cleanly makes every later test noisier, and phase 5 kills one on purpose.
+	// Wait for the worker to exit so accepted-reference writes can finish.
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
 

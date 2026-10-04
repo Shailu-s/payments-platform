@@ -1,10 +1,4 @@
-// Package ratelimit caps how many requests one API key may make per window.
-//
-// The constraint that forces the design: an in-memory counter is wrong the
-// instant there are two API instances. Each process allows the full quota, so
-// the real limit is silently double what was configured — and nothing fails
-// loudly to tell you. The limit must live in shared state, and the only shared
-// state in V1 is Postgres.
+// Package ratelimit enforces per-key quotas in PostgreSQL across API instances.
 package ratelimit
 
 import (
@@ -43,17 +37,8 @@ type Decision struct {
 	ResetAt    time.Time
 }
 
-// Allow counts this request and reports whether it is within the limit.
-//
-// One statement. The increment and the read are the same operation, because
-// they have to be: SELECT the count, decide, then UPDATE is a read-then-write
-// race, and under concurrency every request reads the same value and the limit
-// silently allows far more than it should.
-//
-// ON CONFLICT on the primary key is what serialises it. The database holds a
-// row lock for the duration of the upsert, so concurrent requests queue rather
-// than interleave. This is exactly the mechanism phase 3 uses for idempotency,
-// and recognising it as the same race in different clothing is the point.
+// Allow counts every request, including refusals, and reports quota remaining.
+// An atomic upsert serialises increments; a separate read-then-write would race.
 func (l *Limiter) Allow(ctx context.Context, apiKeyID string) (Decision, error) {
 	windowStart := l.windowStart(nowUTC())
 	resetAt := windowStart.Add(l.window)
@@ -91,12 +76,9 @@ func (l *Limiter) windowStart(now time.Time) time.Time {
 	return now.UTC().Truncate(l.window)
 }
 
-// nowUTC exists so tests can share one notion of the clock with Allow.
 func nowUTC() time.Time { return time.Now().UTC() }
 
-// Sweep deletes windows that have rolled over. Without it the table grows by
-// one row per key per window forever, which is the obvious follow-up question
-// to any counter kept in a database.
+// Sweep removes windows older than the configured retention cutoff.
 func (l *Limiter) Sweep(ctx context.Context, olderThan time.Duration) (int64, error) {
 	const q = `DELETE FROM rate_limits WHERE window_start < $1`
 
@@ -107,13 +89,8 @@ func (l *Limiter) Sweep(ctx context.Context, olderThan time.Duration) (int64, er
 	return tag.RowsAffected(), nil
 }
 
-// RunSweeper deletes rolled-over windows on a ticker until ctx is cancelled.
-//
-// Without it the table grows by one row per key per window forever. Running it
-// in the API process rather than as a scheduled job is a V1 shortcut: with
-// several instances every one of them sweeps, which is wasteful but harmless
-// because DELETE of an already-deleted row is a no-op. Phase 5 brings workers,
-// and this moves there.
+// RunSweeper bounds retained windows until ctx is cancelled.
+// Every API instance sweeps; duplicate DELETEs are harmless but redundant.
 func (l *Limiter) RunSweeper(ctx context.Context, every, retain time.Duration) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()

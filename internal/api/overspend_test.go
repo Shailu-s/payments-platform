@@ -13,9 +13,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 )
 
-// fund puts money into an account by recording a ledger transaction directly.
-// There is no deposit endpoint in V1, and the source of the money is not what
-// these tests are about.
+// There is no deposit endpoint; tests fund accounts directly through the ledger.
 func fund(t *testing.T, accountID string, amount int64) {
 	t.Helper()
 	if _, err := ledger.Record(context.Background(), testPool, "funding", []ledger.Entry{
@@ -26,21 +24,7 @@ func fund(t *testing.T, accountID string, amount int64) {
 	}
 }
 
-// ⭐ Guarantee 3: money cannot be overspent by concurrent requests.
-//
-// The scenario is the classic one: an account holds $1,000 and two $700
-// transfers arrive together, so exactly one must succeed. It is driven with
-// more than two requests deliberately.
-//
-// Two goroutines is the right STORY and an unreliable TEST. Measured on this
-// machine: at two requests the race fired in roughly one run out of three, and
-// at eight in four out of five — the rest of the time they serialised on the
-// connection pool and the test passed while the bug was still there. Sixteen
-// fires every time. A test that only sometimes detects the bug is not evidence,
-// and a green run from it means nothing.
-//
-// PHASE 3.3: expected to FAIL. The balance check reads, decides, then writes,
-// and every request reads the full balance before any has spent against it.
+// Guarantee 3: money cannot be overspent by concurrent requests.
 func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -93,7 +77,6 @@ func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 		t.Errorf("%d transfers were rejected, want %d", got, attempts-1)
 	}
 
-	// The assertion that matters: the account may not go negative.
 	balance, err := ledger.Balance(ctx, testPool, source.ID)
 	if err != nil {
 		t.Fatalf("Balance: %v", err)
@@ -105,9 +88,7 @@ func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 		t.Errorf("source balance is %d, want 30000: exactly one transfer should have happened", balance)
 	}
 
-	// And the losers must have written NOTHING — not a transfer row, and not
-	// ledger entries either. An error response means little if half a transfer
-	// was committed.
+	// Rejected requests must leave no partial accounting.
 	var created int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&created); err != nil {
 		t.Fatalf("count transfers: %v", err)
@@ -116,7 +97,7 @@ func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 		t.Errorf("%d transfers exist, want 1", created)
 	}
 
-	// One funding transaction plus exactly one transfer movement.
+	// Count transfer movements separately from legitimate funding.
 	var movements int
 	if err := testPool.QueryRow(ctx,
 		`SELECT count(*) FROM ledger_transactions WHERE reference LIKE 'transfer %'`).Scan(&movements); err != nil {
@@ -139,18 +120,8 @@ func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 	}
 }
 
-// The lesson of the phase, kept as a permanent assertion.
-//
-// The ledger invariant does NOT catch an overspend. This writes an overdrawn
-// account directly through the ledger, bypassing the API's balance check, and
-// shows that every transaction still balances while the account is negative.
-//
-// Guarantee 1 and guarantee 3 look related and protect against completely
-// different failures: "debits equal credits" is a property of one transaction
-// in isolation, "this account is not overdrawn" is a property of all of that
-// account's transactions together. No amount of per-transaction checking
-// produces the second, which is why the fix is a lock rather than a stricter
-// balance rule.
+// Balanced transactions can still overdraw an account; the API's locked
+// balance check protects a different invariant from double-entry bookkeeping.
 func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -158,8 +129,7 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 	source := createAccount(t, h, apiKey, "asset")
 	fund(t, source.ID, 100000) // $1,000
 
-	// Two $700 movements recorded straight through the ledger, as the broken
-	// concurrent path did before the fix.
+	// Bypass the API balance check.
 	for i := 0; i < 2; i++ {
 		if _, err := ledger.Record(ctx, testPool, "overspend", []ledger.Entry{
 			{AccountID: source.ID, Direction: ledger.DirectionDebit, Amount: 70000},
@@ -169,7 +139,6 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 		}
 	}
 
-	// Every ledger transaction balances.
 	var unbalanced int
 	if err := testPool.QueryRow(ctx, `
 		SELECT count(*) FROM (
@@ -184,7 +153,6 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 		t.Fatalf("%d ledger transactions do not balance", unbalanced)
 	}
 
-	// Every entry in the database sums to zero: nothing was invented or lost.
 	var total int64
 	if err := testPool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END), 0)
@@ -195,7 +163,6 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 		t.Fatalf("all entries sum to %d, want 0", total)
 	}
 
-	// And the account is overdrawn.
 	balance, err := ledger.Balance(ctx, testPool, source.ID)
 	if err != nil {
 		t.Fatalf("Balance: %v", err)
@@ -217,9 +184,6 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 	}
 }
 
-// A single transfer larger than the balance is refused. This is the sequential
-// case, which the naive check does handle — and it is why the broken version
-// survives review.
 func TestSingleTransferCannotExceedTheBalance(t *testing.T) {
 	h, apiKey := newTestServer(t)
 
@@ -247,8 +211,6 @@ func TestSingleTransferCannotExceedTheBalance(t *testing.T) {
 	}
 }
 
-// Spending exactly the balance is allowed. An off-by-one here refuses valid
-// payments, which is a bug in the other direction.
 func TestSpendingTheEntireBalanceIsAllowed(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -275,9 +237,6 @@ func TestSpendingTheEntireBalanceIsAllowed(t *testing.T) {
 	}
 }
 
-// An over-eager lock that refuses valid transfers is also a bug, and it is the
-// failure mode of a lock taken too broadly. N transfers against a balance for
-// exactly N must ALL succeed.
 func TestExactlyAffordableConcurrentTransfersAllSucceed(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -326,13 +285,7 @@ func TestExactlyAffordableConcurrentTransfersAllSucceed(t *testing.T) {
 	}
 }
 
-// Where the check lives is the decision, not merely where it happens to sit.
-//
-// The balance must be read inside the transaction that writes the transfer. A
-// read taken before BEGIN — or on any other connection — sees a snapshot a
-// concurrent transaction is about to invalidate, which is the bug the row lock
-// exists to prevent. This asserts the property directly rather than trusting
-// that the code still looks right.
+// A balance read on another connection would ignore the writing transaction's lock.
 func TestBalanceIsReadInsideTheWritingTransaction(t *testing.T) {
 	ctx := context.Background()
 	resetDB(t)
@@ -366,9 +319,7 @@ func TestBalanceIsReadInsideTheWritingTransaction(t *testing.T) {
 		t.Fatalf("record in A: %v", err)
 	}
 
-	// Transaction B asks for the rest. It must not be able to answer while A
-	// holds the lock: if checkBalance read outside the transaction it would see
-	// the pre-A balance of 100000 and happily approve, overspending the account.
+	// B must wait for A, then see its debit rather than the pre-A balance.
 	txB, err := testPool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin B: %v", err)
@@ -385,7 +336,7 @@ func TestBalanceIsReadInsideTheWritingTransaction(t *testing.T) {
 		t.Fatalf("B answered while A held the lock (err=%v): the balance was read "+
 			"outside the writing transaction", err)
 	case <-time.After(300 * time.Millisecond):
-		// Blocked on A's row lock, which is the whole point.
+		// B must remain blocked until A commits.
 	}
 
 	// Let A commit. B should now see the post-A balance of 10000 and refuse.

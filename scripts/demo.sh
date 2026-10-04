@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-#
-# A guided walk through the transfer API, against a running API: auth, the
-# ledger, idempotency, overspend, the outbox, listing and rate limiting.
-# Every step prints what it is proving before it runs.
-#
-#   make up && make migrate-up      # once
-#   make run                        # in another terminal
-#   make demo                       # loads .env, which this script needs
-#
+# Run with make demo against a running API. Resets all local application tables.
 set -euo pipefail
 
 : "${API_URL:?is not set — copy .env.example to .env and run this through make demo}"
@@ -35,11 +27,7 @@ psql_q() { $COMPOSE exec -T postgres psql -U payments -d payments -tAc "$1" | tr
 json()   { python3 -c "import sys,json;print(json.load(sys.stdin)$1)"; }
 newkey() { python3 -c "import uuid;print(uuid.uuid4())"; }
 
-# Every POST /v1/transfers needs an Idempotency-Key (phase 3). Without one the
-# API answers 400 before looking at the body, so a check that expects a 400 for
-# some other reason would pass for the wrong one.
-#   post_transfer <idempotency-key> <body>       prints the response body
-#   post_transfer_code <idempotency-key> <body>  prints only the status code
+# Always supply a key so invalid-body checks cannot pass on a missing-key 400.
 post_transfer() {
   curl -s -H "Authorization: Bearer $KEY" -H "Idempotency-Key: $1" -X POST "$API/v1/transfers" -d "$2"
 }
@@ -59,13 +47,10 @@ curl -sf "$API/healthz" >/dev/null 2>&1 || {
 printf "${bold}Payments platform — walkthrough${reset}\n"
 printf "${dim}API %s${reset}\n" "$API"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "0. A clean slate"
 why "Wiping every table, then restoring the settlement account that migration 000003 creates."
-# The table list comes from the catalogue, not by hand. A hand-written list went
-# stale when the outbox arrived: it wiped transfers but kept their outbox
-# events, and the relay then published an event for a transfer that no longer
-# existed. schema_migrations is kept, or migrate would think nothing is applied.
+# Discover tables so new outbox or ledger tables cannot survive the reset.
+# Keep schema_migrations so migration versions remain accurate.
 $COMPOSE exec -T postgres psql -U payments -d payments >/dev/null <<'SQL'
 DO $$
 BEGIN
@@ -78,7 +63,6 @@ INSERT INTO accounts (id, currency, type) VALUES ('acc_settlement_usd', 'USD', '
 SQL
 pass "database reset"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "1. Authentication — a key is stored as a hash, never as itself"
 why "A stolen database dump must not yield working keys."
 
@@ -97,7 +81,6 @@ expect "no row contains the secret itself" \
   "$(psql_q "SELECT count(*) FROM api_keys WHERE key_hash LIKE '%$SECRET%'")" "0"
 pass "the prefix identifies the key without being usable as one: $(psql_q "SELECT prefix FROM api_keys WHERE id='$KEY_ID'")"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "2. No key, no money"
 why "An unauthenticated POST /transfers moves money for anyone who can reach the port."
 
@@ -107,7 +90,6 @@ expect "POST /v1/accounts with no key" "$CODE" "401"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer pk_live_notarealkeyatallnotarealkeyatallnotareal" "$API/v1/transfers")
 expect "a key that was never issued" "$CODE" "401"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "3. Revocation withdraws access but keeps the audit trail"
 why "Transfers reference the key that authorised them, so revocation is a timestamp, not a DELETE."
 
@@ -123,7 +105,6 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $DOOMED_
 expect "after revocation" "$CODE" "401"
 expect "the row survives revocation" "$(psql_q "SELECT count(*) FROM api_keys WHERE id = '$DOOMED_ID'")" "1"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "4. Accounts, and a balance that is derived rather than stored"
 why "There is no balance column. A stored number can disagree with the entries; a derived one cannot."
 
@@ -151,7 +132,6 @@ INSERT INTO ledger_entries (id, txn_id, account_id, direction, amount) VALUES
 SQL
 expect "source funded" "$(balance "$SRC")" "1000000"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "5. A transfer — 202 processing, and the money is NOT at the destination"
 why "We accepted the instruction. The money has not moved. Saying otherwise would be a lie the ledger makes permanent."
 
@@ -175,7 +155,6 @@ expect "source debited" "$(balance "$SRC")" "950000"
 expect "destination untouched" "$(balance "$DST")" "0"
 expect "settlement credited" "$(balance acc_settlement_usd)" "50000"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "6. Guarantee 2 — a retried request is answered, not repeated"
 why "A client that timed out cannot tell whether the payment happened, so it retries. The retry must not pay twice."
 
@@ -186,7 +165,6 @@ expect "one transfer exists for that key" \
 expect "the same key with a different body is refused" \
   "$(post_transfer_code "$IDEM" "$(body "$SRC" "$DST" 99)")" "422"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "7. Guarantee 3 — money cannot be overspent"
 why "The balance is read under a row lock in the transaction that spends it, so two requests cannot both spend the same money."
 
@@ -195,7 +173,6 @@ expect "a transfer larger than the balance" \
   "$(post_transfer_code "$(newkey)" "$(body "$SRC" "$DST" 99999999)")" "422"
 expect "and it wrote nothing" "$(psql_q "SELECT count(*) FROM transfers")" "$BEFORE"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "8. The transfer and its event commit together — the transactional outbox"
 why "Publishing to Kafka from the handler loses the event if the process dies after the commit. The event is a row in the same transaction instead."
 
@@ -207,21 +184,18 @@ expect "the retry in step 6 wrote no second event" \
   "$(psql_q "SELECT count(*) FROM outbox_events")" "1"
 why "With \`make relay\` running, published_at is already set and the event is in the transfers topic."
 
-# ─────────────────────────────────────────────────────────────────────────
 step "9. Guarantee 1 — the ledger always balances"
 why "Every debit has a matching credit, so every entry in the database sums to zero."
 
 expect "sum of every ledger entry" \
   "$(psql_q "SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0) FROM ledger_entries")" "0"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "10. Guarantee 5 — every financial change records who asked for it"
 why "The transfer carries the api key that authorised it."
 
 expect "the transfer is attributed to the calling key" \
   "$(psql_q "SELECT api_key_id FROM transfers WHERE id = '$TRANSFER'")" "$KEY_ID"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "11. Atomicity — a rejected transfer writes nothing at all"
 why "A transfer row with no accounting behind it is an instruction nobody recorded."
 
@@ -229,7 +203,6 @@ BEFORE=$(psql_q "SELECT count(*) FROM transfers")
 post_transfer "$(newkey)" "$(body acc_does_not_exist "$DST" 999)" >/dev/null
 expect "no transfer row was created" "$(psql_q "SELECT count(*) FROM transfers")" "$BEFORE"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "12. Money is an integer — a fractional amount is refused, not truncated"
 why "\$10.50 is 1050. A float cannot represent most decimal fractions, and the error accumulates into real missing money."
 
@@ -239,7 +212,6 @@ expect "amount 500.75" "$CODE" "400"
 CODE=$(post_transfer_code "$(newkey)" "$(body "$SRC" "$SRC" 100)")
 expect "an account paying itself" "$CODE" "400"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "13. Listing pages without skipping or repeating"
 why "Cursors are keyset, not OFFSET: an offset page skips or repeats rows as new transfers arrive."
 
@@ -265,7 +237,6 @@ UNIQUE=$(echo $SEEN | tr ' ' '\n' | sort -u | wc -l | tr -d ' ')
 expect "every transfer appeared exactly once across $PAGES pages" "$TOTAL" "$UNIQUE"
 expect "all 5 transfers were listed" "$UNIQUE" "5"
 
-# ─────────────────────────────────────────────────────────────────────────
 step "14. Rate limiting — the limit holds under real concurrency"
 why "A read-then-write counter lets every concurrent request read the same stale value. Only the database can serialise it."
 
@@ -303,7 +274,6 @@ printf "\n  ${bold}the refusal${reset}\n"
 curl -s -D - -H "Authorization: Bearer $KEY" "$API/v1/transfers" \
   | grep -iE "^HTTP|^retry-after|^x-ratelimit|rate_limited" | sed 's/^/    /'
 
-# ─────────────────────────────────────────────────────────────────────────
 step "15. Guarantee 6 — ledger entries are never modified"
 why "If something is wrong, a NEW correcting transaction is written. The past is never rewritten."
 
@@ -317,7 +287,6 @@ fi
 expect "no UPDATE of ledger_entries exists anywhere in the source" \
   "$(grep -rn 'UPDATE ledger_entries' --include='*.go' --include='*.sql' . | wc -l | tr -d ' ')" "0"
 
-# ─────────────────────────────────────────────────────────────────────────
 printf "\n${bold}────────────────────────────────────────${reset}\n"
 if [ "$FAILURES" -eq 0 ]; then
   printf "${green}${bold}Everything passed.${reset}\n\n"

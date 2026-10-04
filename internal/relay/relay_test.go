@@ -12,11 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// ⭐ The relay moves outbox rows into Kafka, keeps one transfer's events in
-// order, and marks a row published only after Kafka has it.
-//
-// Two events for the same transfer are the point. With one event, "in order"
-// and "same partition" would be true by accident.
+// Use two events for one transfer; a single event cannot prove ordering or partition affinity.
 func TestRelayPublishesInOrderAndMarksDelivered(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -94,9 +90,7 @@ func TestRelayPublishesInOrderAndMarksDelivered(t *testing.T) {
 	}
 }
 
-// readRecords reads topic from the start until it has n records, or fails when
-// ctx expires. It is a consumer with no group: it reads every partition and
-// remembers nothing, which is all a test needs. The real consumer is 5.4.
+// Read from the start without a consumer group so committed offsets cannot hide test records.
 func readRecords(t *testing.T, ctx context.Context, topic string, n int) []*kgo.Record {
 	t.Helper()
 	c, err := kgo.NewClient(

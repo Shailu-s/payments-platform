@@ -14,13 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// The provider tells us the outcome here. Per docs/mockbank-api.md this
-// delivery is at least once and unordered, and an event can arrive before the
-// worker has finished storing the provider reference it refers to.
-//
-// Phase 6 does the hard version: signatures, replay windows, out-of-order
-// events, and references we have never heard of. This is the minimum that is
-// correct.
+// Delivery is at least once and unordered; events may precede stored provider references.
+// This endpoint does not yet verify signatures or enforce a replay window.
 type providerEvent struct {
 	EventID         string    `json:"event_id"`
 	ProviderRef     string    `json:"provider_ref"`
@@ -35,8 +30,7 @@ type providerEvent struct {
 func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 	var event providerEvent
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&event); err != nil {
-		// Malformed: no amount of redelivery will fix it, so say so rather
-		// than asking for it again forever.
+		// Malformed events cannot be fixed by redelivery.
 		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "event body is not valid json")
 		return
 	}
@@ -48,13 +42,7 @@ func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 
 	transferID, err := s.transferForEvent(r.Context(), event)
 	if errors.Is(err, transfers.ErrNotFound) {
-		// We do not recognise this reference yet. Almost always the race the
-		// contract warns about: the provider sent the outcome before our
-		// worker finished storing the reference.
-		//
-		// 503 rather than 404, because 4xx tells the provider to stop retrying
-		// a delivery we will want in a moment. Asking for it again is the
-		// difference between a transfer that settles and one that is stuck.
+		// The transfer may become visible later; 4xx would stop provider retries.
 		writeError(w, http.StatusServiceUnavailable, CodeNotFound,
 			"no transfer for that provider_ref yet, retry shortly")
 		return
@@ -64,17 +52,14 @@ func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record the event before acting on it. The UNIQUE constraint on event_id
-	// is what makes a redelivery harmless: the second insert fails, we skip the
-	// financial effect, and answer 2xx anyway.
+	// The unique event ID prevents concurrent duplicate deliveries acting twice.
+	// These are separate commits: a failed transition leaves the event recorded.
 	firstTime, err := s.recordEvent(r.Context(), event)
 	if err != nil {
 		writeInternalError(w, r, err)
 		return
 	}
 	if !firstTime {
-		// Already processed. 2xx, not an error: a duplicate is expected, and
-		// answering 4xx would stop redelivery of an event we may still need.
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "already_processed", "event_id": event.EventID,
 		})
@@ -97,8 +82,7 @@ func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	default:
-		// A status we do not act on. Recorded and acknowledged: asking for
-		// redelivery would not change what it says.
+		// Redelivery cannot make an unsupported status actionable.
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "ignored", "event_id": event.EventID,
 		})
@@ -110,8 +94,6 @@ func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// transferForEvent finds the transfer an event is about, by the provider's
-// reference or, failing that, by ours.
 func (s *Server) transferForEvent(ctx context.Context, event providerEvent) (string, error) {
 	const byProviderRef = `SELECT id FROM transfers WHERE provider_ref = $1`
 
@@ -139,9 +121,7 @@ func (s *Server) transferForEvent(ctx context.Context, event providerEvent) (str
 	return id, nil
 }
 
-// recordEvent stores the event, reporting whether this is the first time we
-// have seen it. Insert first and handle the rejection — the same shape as
-// phase 3's idempotency, for the same reason.
+// Insert first: checking for an event before inserting would race concurrent deliveries.
 func (s *Server) recordEvent(ctx context.Context, event providerEvent) (bool, error) {
 	payload, err := json.Marshal(event)
 	if err != nil {

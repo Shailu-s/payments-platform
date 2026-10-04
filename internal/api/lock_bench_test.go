@@ -16,16 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// The measurement behind the locking choice, PLAN.md §7.
-//
-// The production path uses SELECT ... FOR UPDATE. SERIALIZABLE was the
-// alternative: both are correct, so the choice was a number rather than a
-// preference. The serializable implementation is NOT kept in the handler — a
-// second production path that never runs is somewhere bugs hide — but the
-// comparison stays runnable here, so the recorded numbers can be re-derived
-// rather than believed.
-//
-//	go test ./internal/api/ -run TestLockStrategyComparison -v
+// Keep SERIALIZABLE in the comparison, not as an unused production path.
+// Compare throughput, latency and retry exhaustion on the same hot-account workload.
 func TestLockStrategyComparison(t *testing.T) {
 	if testing.Short() {
 		t.Skip("comparison is slow")
@@ -135,10 +127,7 @@ func TestLockStrategyComparison(t *testing.T) {
 	t.Log("")
 }
 
-// spendOnce performs one balance-checked debit using the named strategy. It
-// mirrors what the handler does — read the balance inside the transaction, then
-// write — without depending on the handler, so removing the serializable path
-// from production did not remove the ability to measure it.
+// Mirror the balance-checked debit without coupling the comparison to the handler.
 func spendOnce(ctx context.Context, strategy, accountID string, amount int64, seq int) error {
 	const maxAttempts = 10
 
@@ -194,10 +183,7 @@ func spendAttempt(ctx context.Context, strategy, accountID string, amount int64,
 	return tx.Commit(ctx)
 }
 
-// isSerializationFailure reports SQLSTATE 40001, which Postgres raises when it
-// cannot order this transaction against a concurrent one. Only the serializable
-// arm of the comparison can produce it: the production path runs at Read
-// Committed, where the row lock blocks instead of aborting.
+// SQLSTATE 40001 needs retry in the SERIALIZABLE arm; production uses Read Committed.
 func isSerializationFailure(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.SerializationFailure

@@ -25,8 +25,7 @@ services:
     container_name: payments-mock-bank
     environment:
       MOCKBANK_ADDR: ":8081"
-      # host.docker.internal reaches the API running on the host. When the API
-      # also runs in Compose this becomes http://api:8080/...
+      # The API runs on the host, outside this Compose network.
       WEBHOOK_URL: "http://host.docker.internal:8080/v1/webhooks/mockbank"
       SETTLE_DELAY: "2s"
     ports:

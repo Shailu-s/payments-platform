@@ -1,8 +1,4 @@
-// Package api is the HTTP layer: routing, middleware and handlers.
-//
-// net/http with Go 1.22 routing patterns rather than chi or gin. A framework
-// would be defensible, but stdlib means every line of routing is ours and there
-// is nothing to explain away.
+// Package api provides HTTP routing, middleware and handlers.
 package api
 
 import (
@@ -17,10 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// DB is what the api layer needs from a database: queries, and the ability to
-// start a transaction. Narrow on purpose — POST /transfers writes a transfer
-// and its ledger entries in one transaction, and phase 5 adds an outbox row to
-// that same one.
+// DB supports queries and atomic transfer, ledger and outbox writes.
 type DB interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -33,8 +26,6 @@ type Server struct {
 	limiter *ratelimit.Limiter
 }
 
-// Requests per key per window. Small on purpose: this is a portfolio system,
-// and a limit nobody can reach proves nothing.
 const (
 	DefaultRateLimit  = 100
 	DefaultRateWindow = time.Minute
@@ -52,9 +43,7 @@ func NewServer(pool *pgxpool.Pool) *Server {
 	}
 }
 
-// StartRateLimitSweeper removes rolled-over rate limit windows in the
-// background until ctx is cancelled. Without it the table grows by one row per
-// key per window forever.
+// StartRateLimitSweeper bounds retained rate-limit windows until ctx is cancelled.
 func (s *Server) StartRateLimitSweeper(ctx context.Context) {
 	if s.limiter == nil {
 		return
@@ -62,38 +51,26 @@ func (s *Server) StartRateLimitSweeper(ctx context.Context) {
 	go s.limiter.RunSweeper(ctx, sweepInterval, sweepRetention)
 }
 
-// Handler builds the router. Routes are declared with their method, so a GET to
-// a POST-only path is a 405 from the mux rather than a handler that has to
-// check.
+// Handler builds the router and middleware stack.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Liveness is deliberately unauthenticated and does not touch the database:
-	// a health check that fails when Postgres is down tells an orchestrator to
-	// restart a process that is working fine.
+	// Database failure must not make liveness restart a healthy process.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
-	// Readiness does check the database, because "ready to serve traffic" and
-	// "alive" are different questions with different remedies.
+	// Readiness removes an instance from traffic when the database is unavailable.
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	// Auth before the rate limit: the limit is per key, so there is nothing to
-	// count against until the caller is known.
-	// The provider calls this, not a customer, so it is outside the api-key
-	// chain: the rail has no key of ours. Phase 6 authenticates it properly
-	// with a signature.
+	// Provider callbacks bypass customer API keys; signature verification is not yet implemented.
 	mux.HandleFunc("POST /v1/webhooks/mockbank", s.handleProviderWebhook)
 
 	authenticated := chain(s.routes(), s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)
 
-	// Applied outermost first. Recovery wraps everything so a panic anywhere
-	// still produces a response; request id is outside logging so every line
-	// carries it.
+	// Recovery wraps all routes; request IDs must be assigned before logging.
 	return chain(mux, withRequestID, withRecovery, withLogging)
 }
 
-// routes holds everything under /v1, all of which requires a key.
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -104,9 +81,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/transfers/{id}", s.handleGetTransfer)
 	mux.HandleFunc("GET /v1/transfers", s.handleListTransfers)
 
-	// Anything else under /v1 is a 404 in the house error shape rather than
-	// net/http's plain-text default, so a caller parsing JSON does not get a
-	// surprise content type on a typo.
+	// Keep unknown-route errors JSON, unlike the mux's plain-text default.
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, CodeNotFound, "no such endpoint: "+r.Method+" "+r.URL.Path)
 	})

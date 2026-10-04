@@ -19,9 +19,7 @@ func TestClaimReturnsDueTransfers(t *testing.T) {
 		t.Errorf("claimed %d transfers, want 5", len(claimed))
 	}
 
-	// Claiming pushes next_attempt_at forward, so an immediate second claim
-	// takes nothing: a worker that dies mid-send costs one backoff rather than
-	// a tight retry loop against the rail.
+	// A claim's persisted backoff excludes immediate reclaim, including after a crash.
 	again, err := Claim(ctx, testPool, 10, time.Minute, 0)
 	if err != nil {
 		t.Fatalf("second Claim: %v", err)
@@ -91,8 +89,6 @@ func TestClaimSkipsTransfersAlreadySentToTheProvider(t *testing.T) {
 	}
 }
 
-// ⭐ Two workers, 50 transfers, each claimed exactly once. One worker proves
-// nothing about a queue.
 func TestTwoWorkersNeverClaimTheSameTransfer(t *testing.T) {
 	const total = 50
 	seedTransfers(t, total)
@@ -143,7 +139,6 @@ func TestTwoWorkersNeverClaimTheSameTransfer(t *testing.T) {
 	}
 }
 
-// Ten workers, to make the point harder to reach by luck.
 func TestManyWorkersNeverClaimTheSameTransfer(t *testing.T) {
 	const total = 200
 	const workers = 10
@@ -193,9 +188,7 @@ func TestManyWorkersNeverClaimTheSameTransfer(t *testing.T) {
 	}
 }
 
-// The poller is the safety net, not the main path. A transfer that has just been
-// created is left to the event consumer for HeadStart; the poller takes it only
-// once that has passed without anyone sending it.
+// HeadStart must delay first attempts without delaying retries past their backoff.
 func TestClaimLeavesFreshTransfersForTheConsumer(t *testing.T) {
 	ctx := context.Background()
 	seedTransfers(t, 1)

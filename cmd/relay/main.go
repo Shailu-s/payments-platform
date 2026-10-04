@@ -1,7 +1,4 @@
-// Command relay publishes outbox events to Kafka.
-// A separate process from the API and the worker, so it can be stopped,
-// restarted or killed on its own. While it is down nothing is lost: events wait
-// in outbox_events and go out when it comes back.
+// Command relay publishes durable outbox events to Kafka.
 package main
 
 import (
@@ -44,9 +41,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	// NewClient does not connect, so Ping checks the broker is really there.
-	// Failing at startup is for a developer who forgot `make up`. Once
-	// running, a broker that goes away is retried, not fatal.
+	// NewClient is lazy; fail startup on an unreachable broker. Runtime failures retry.
 	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err == nil {
 		pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)

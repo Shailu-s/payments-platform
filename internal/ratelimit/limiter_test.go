@@ -95,9 +95,6 @@ func TestAllowPermitsUpToTheLimitThenRefuses(t *testing.T) {
 	}
 }
 
-// ⭐ The evidence the phase requires: N+20 concurrent requests against a limit
-// of N must let exactly N through. This is what the naive read-then-write
-// implementation fails, and it fails by allowing far more than it should.
 func TestConcurrentRequestsHoldAtExactlyTheLimit(t *testing.T) {
 	keyID := newKey(t)
 	ctx := context.Background()
@@ -156,10 +153,7 @@ func TestConcurrentRequestsHoldAtExactlyTheLimit(t *testing.T) {
 	}
 }
 
-// The same concurrency against the naive implementation, to show the race is
-// real rather than theoretical. This test asserts the WRONG behaviour on
-// purpose: if it ever starts passing at exactly the limit, the naive version
-// has been accidentally fixed and the evidence is no longer evidence.
+// Demonstrate the naive race; skip when scheduling happens to hide it.
 func TestNaiveImplementationOvershootsUnderConcurrency(t *testing.T) {
 	keyID := newKey(t)
 	ctx := context.Background()
@@ -199,7 +193,6 @@ func TestNaiveImplementationOvershootsUnderConcurrency(t *testing.T) {
 	}
 }
 
-// Windows are independent: a new window starts the count again.
 func TestANewWindowResetsTheCount(t *testing.T) {
 	keyID := newKey(t)
 	ctx := context.Background()
@@ -227,7 +220,6 @@ func TestANewWindowResetsTheCount(t *testing.T) {
 	}
 }
 
-// One key's traffic must not consume another's quota.
 func TestLimitsAreIndependentPerKey(t *testing.T) {
 	first := newKey(t)
 	ctx := context.Background()
@@ -260,8 +252,6 @@ func TestLimitsAreIndependentPerKey(t *testing.T) {
 	}
 }
 
-// Unbounded growth is the obvious follow-up question to any counter kept in a
-// database, so the sweep exists and is tested.
 func TestSweepRemovesOldWindowsOnly(t *testing.T) {
 	keyID := newKey(t)
 	ctx := context.Background()
@@ -295,15 +285,11 @@ func TestSweepRemovesOldWindowsOnly(t *testing.T) {
 	}
 }
 
-// The sweeper must actually run on its ticker and stop when cancelled. A
-// background goroutine that silently does nothing is worse than no sweeper,
-// because the table grows while the code claims otherwise.
 func TestRunSweeperDeletesOnItsTickerAndStops(t *testing.T) {
 	keyID := newKey(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	limiter := New(testPool, 10, time.Minute)
 
-	// Two stale windows, written directly.
 	for _, age := range []time.Duration{2 * time.Hour, 3 * time.Hour} {
 		if _, err := testPool.Exec(ctx,
 			`INSERT INTO rate_limits (api_key_id, window_start, count) VALUES ($1, $2, 5)`,

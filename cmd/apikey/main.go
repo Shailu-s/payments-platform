@@ -1,8 +1,4 @@
-// Command apikey mints an API key and prints it once.
-//
-// There is no POST /api_keys endpoint in V1: an unauthenticated endpoint that
-// mints credentials is worse than no endpoint at all, and an authenticated one
-// needs a first key that has to come from somewhere anyway.
+// Command apikey manages API keys outside the public HTTP API.
 package main
 
 import (

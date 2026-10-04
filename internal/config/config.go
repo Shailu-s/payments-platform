@@ -1,13 +1,5 @@
-// Package config reads a command's settings from the environment.
-//
-// Every setting is required. A command that falls back to a default when a
-// variable is missing does not fail: it quietly talks to localhost, or to the
-// wrong database, and the mistake surfaces somewhere else, later. So a missing
-// variable stops the command at startup, and every missing one is named at
-// once rather than one per attempt.
-//
-// Locally the values come from .env, which the Makefile loads. Copy
-// .env.example to start.
+// Package config reads required environment settings, reporting all missing
+// values together rather than silently selecting the wrong endpoint.
 package config
 
 import (

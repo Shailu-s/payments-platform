@@ -1,6 +1,4 @@
-# Settings come from .env (copy .env.example). Every command requires them and
-# stops at startup if one is missing, rather than falling back to a guess.
-# `export` hands them to every command a target runs.
+# Load .env and export settings to target commands.
 -include .env
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
@@ -24,14 +22,11 @@ migrate-down:
 
 migrate-redo: migrate-down migrate-up
 
-# No -p 1: each package migrates into its own schema (internal/testdb), so
-# parallel packages cannot see each other's tables. `go test ./...` on its own
-# works too, which matters because that is what anyone cloning this runs.
+# Per-package schemas isolate parallel tests; no -p 1 workaround needed.
 test:
 	go test ./... -count=1
 
-# Walk through everything phase 2 built, against a running API.
-# Needs `make run` in another terminal.
+# Requires `make run` in another terminal; resets the local database.
 demo:
 	@./scripts/demo.sh
 
@@ -51,11 +46,11 @@ watch:
 sender:
 	@go run ./cmd/sender
 
-# Serve MockBank on :8081. Run it alongside `make run`.
+# Run alongside `make run`; address comes from MOCKBANK_ADDR.
 mock-bank:
 	@go run ./cmd/mock-bank
 
-# Serve the API on :8080
+# Address comes from API_ADDR.
 run:
 	@go run ./cmd/api
 

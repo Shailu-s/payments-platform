@@ -72,16 +72,13 @@ func main() {
 
 	slog.Info("sending", "group", group, "topic", topic)
 	consumer.Run(ctx, client, func(ctx context.Context, r *kgo.Record) error {
-		// Other event types will share this topic. They are not ours to act
-		// on, and returning nil lets the loop commit past them.
+		// Ignore other event types without blocking this group's offset.
 		if header(r, "event_type") != "transfer.created" {
 			return nil
 		}
 		id := string(r.Key)
 
-		// sent=false is the normal answer to a redelivered event, or to the
-		// poller having got there first. An error is a database failure: it
-		// is returned, and the loop retries this record.
+		// No claim is normal on redelivery or a poller race; errors retry the record.
 		sent, err := w.SendByID(ctx, id)
 		if err != nil {
 			return err

@@ -7,8 +7,7 @@ import (
 	"testing"
 )
 
-// The constraint the whole package exists to satisfy: a stolen database dump
-// must not yield working keys. Nothing stored may resemble the plaintext.
+// A stolen database dump must not yield working API keys.
 func TestStoredKeyDoesNotContainThePlaintext(t *testing.T) {
 	plaintext, key, err := Generate("dump test")
 	if err != nil {
@@ -22,9 +21,7 @@ func TestStoredKeyDoesNotContainThePlaintext(t *testing.T) {
 	if key.Hash == plaintext {
 		t.Error("the stored hash is the plaintext")
 	}
-	// The prefix must identify a key without being usable as one. It carries 8
-	// characters of the secret, leaving 35 unknown — brute forcing those is not
-	// a threat model, and a prefix of only "pk_live_" would identify nothing.
+	// The prefix must include random material without revealing the full key.
 	if !strings.HasPrefix(plaintext, key.Prefix) {
 		t.Errorf("Prefix %q is not a prefix of the key", key.Prefix)
 	}

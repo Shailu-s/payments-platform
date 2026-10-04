@@ -10,15 +10,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 )
 
-// ⭐ At-least-once: a relay that dies after Kafka has the event, but before
-// its COMMIT, publishes the event again. Nothing is lost; something is
-// duplicated, and that duplicate is why the consumer must dedupe on event_id.
-//
-// The failure is injected at COMMIT, the latest point it can happen: the
-// produce has succeeded and the UPDATE has run, so this is the widest version
-// of the gap. A deferred constraint trigger runs at COMMIT rather than at the
-// UPDATE, raises, and Postgres rolls the transaction back — the same trick as
-// TestFailedCommitWritesNoEvent in internal/api.
+// Fail COMMIT after Kafka accepts the event: rollback must leave it available
+// to republish with the same event ID. This injects a failure, not a process kill.
 func TestRelayRepublishesAfterFailedCommit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

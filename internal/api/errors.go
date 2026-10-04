@@ -6,11 +6,6 @@ import (
 	"net/http"
 )
 
-// Every error the API returns has this shape. A machine-readable code is what
-// makes an API integrable: a bare message forces callers to regex your prose,
-// and then your prose can never change.
-//
-//	{ "error": { "code": "insufficient_funds", "message": "..." } }
 type errorBody struct {
 	Error errorDetail `json:"error"`
 }
@@ -20,29 +15,24 @@ type errorDetail struct {
 	Message string `json:"message"`
 }
 
-// Error codes. Stable strings: callers branch on these, so renaming one is a
-// breaking change to the API.
+// Stable error codes are an API contract; messages may change.
 const (
 	CodeUnauthorized   = "unauthorized"
 	CodeRevokedKey     = "revoked_api_key"
 	CodeNotFound       = "not_found"
 	CodeInvalidRequest = "invalid_request"
 	CodeRateLimited    = "rate_limited"
-	// The key is taken but the first request has not committed yet, so nothing
-	// true can be said about the outcome.
+	// CodeIdempotencyInFlight means the owning transfer is not visible yet.
 	CodeIdempotencyInFlight = "idempotency_key_in_flight"
 	// The key was used for a different request. A client bug, not a retry.
 	CodeIdempotencyKeyReused = "idempotency_key_reused"
-	// The source account cannot cover the transfer. A client error: they asked
-	// to spend money that is not there.
+
 	CodeInsufficientFunds = "insufficient_funds"
 	CodeNotImplemented    = "not_implemented"
 	CodeInternal          = "internal_error"
 )
 
-// writeJSON sends a value as JSON. An encoding failure here is already too late
-// to report — the status line has been written — so it is logged rather than
-// turned into a second, contradictory response.
+// Once headers are written, encoding errors can only be logged, not answered again.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

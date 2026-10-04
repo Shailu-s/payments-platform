@@ -57,9 +57,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// Shut down gracefully: a payments API killed mid-request leaves the caller
-	// unable to tell a failure from a success, which is the one ambiguity this
-	// whole system exists to avoid.
+	// Drain requests on shutdown to reduce ambiguous outcomes for callers.
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
 

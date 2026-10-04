@@ -14,7 +14,6 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/ratelimit"
 )
 
-// The precondition for the API existing at all: no key, no money moved.
 func TestEveryV1RouteRequiresAKey(t *testing.T) {
 	h, _ := newTestServer(t)
 
@@ -76,7 +75,7 @@ func TestAuthAcceptsAnyCaseScheme(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 
-			// 501 because the handler is 2.4 — but auth passed, which is the point.
+			// No idempotency key: handler validation returns 400 after auth passes.
 			if rec.Code == http.StatusUnauthorized {
 				t.Fatalf("scheme %q was rejected", scheme)
 			}
@@ -84,8 +83,7 @@ func TestAuthAcceptsAnyCaseScheme(t *testing.T) {
 	}
 }
 
-// A revoked key is 401 like any other, but with its own code: "your key was
-// revoked" and "that key never existed" are different problems for the caller.
+// Revocation shares HTTP 401 with invalid keys but has a distinct machine-readable code.
 func TestRevokedKeyIsDistinguishedFromInvalid(t *testing.T) {
 	h, _ := newTestServer(t)
 	ctx := context.Background()
@@ -110,8 +108,7 @@ func TestRevokedKeyIsDistinguishedFromInvalid(t *testing.T) {
 	}
 }
 
-// The authenticated caller must reach the handler: every transfer records who
-// asked for it, so a handler that cannot see the key cannot attribute one.
+// Caller identity must survive the middleware chain for transfer attribution.
 func TestAuthenticatedKeyReachesTheHandler(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -144,8 +141,7 @@ func TestAuthenticatedKeyReachesTheHandler(t *testing.T) {
 	}
 }
 
-// Without a key in context a handler must be able to tell, rather than
-// receiving a zero value it might attribute a transfer to.
+// Absence must be distinguishable from a zero-valued key.
 func TestAPIKeyFromReportsAbsence(t *testing.T) {
 	if _, ok := APIKeyFrom(context.Background()); ok {
 		t.Error("APIKeyFrom reported a key on a context that has none")
@@ -204,9 +200,7 @@ func TestRequestIDIsHonouredOnlyWhenSafe(t *testing.T) {
 	}
 }
 
-// A panic must become a 500, not a dropped connection. A caller who gets a
-// closed socket cannot tell a failure from a success, which is the one
-// ambiguity this system exists to avoid.
+// A panic before a response must produce 500 instead of a dropped connection.
 func TestPanicBecomesA500(t *testing.T) {
 	h := chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("handler exploded")
@@ -259,7 +253,6 @@ func TestUnknownV1RouteIsJSONNotFound(t *testing.T) {
 	}
 }
 
-// Declaring routes by method means the mux answers a wrong verb, not a handler.
 func TestWrongMethodIsRejected(t *testing.T) {
 	h, key := newTestServer(t)
 
@@ -269,7 +262,6 @@ func TestWrongMethodIsRejected(t *testing.T) {
 	}
 }
 
-// The transfer endpoints now exist; a wrong verb is still rejected by the mux.
 func TestTransferRoutesRejectAWrongMethod(t *testing.T) {
 	h, key := newTestServer(t)
 
@@ -279,8 +271,7 @@ func TestTransferRoutesRejectAWrongMethod(t *testing.T) {
 	}
 }
 
-// The limit is enforced through the real middleware chain, not just in the
-// limiter package.
+// Exercise the middleware chain, not just Limiter.Allow.
 func TestRateLimitReturns429ThroughTheChain(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -323,8 +314,6 @@ func TestRateLimitReturns429ThroughTheChain(t *testing.T) {
 	}
 }
 
-// A refused request must not have moved money. The limiter runs before the
-// handler, so nothing is written.
 func TestRateLimitedTransferWritesNothing(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()

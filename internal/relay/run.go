@@ -25,10 +25,7 @@ func Run(ctx context.Context, db Beginner, client *kgo.Client) {
                       return
               }
 
-              // The batch runs on a context that shutdown does not cancel, so
-              // Ctrl-C lets the batch in flight finish. Cancelling it mid-produce
-              // would roll back rows Kafka may already hold, and they would be
-              // published again on restart: safe, but a duplicate for nothing.
+              // Finish the batch on shutdown to avoid republishing accepted records.
               batchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), BatchTimeout)
               n, err := PublishBatch(batchCtx, db, client, BatchSize)
               cancel()

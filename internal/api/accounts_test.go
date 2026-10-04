@@ -67,8 +67,7 @@ func TestCreateAccountRejectsBadInput(t *testing.T) {
 	}
 }
 
-// An unknown field is rejected rather than ignored: a caller who sends
-// "ammount" should be told, not silently charged zero.
+// Misspelled fields must not silently fall back to zero values.
 func TestCreateAccountRejectsUnknownFieldsRatherThanIgnoringThem(t *testing.T) {
 	h, key := newTestServer(t)
 
@@ -124,9 +123,7 @@ func TestGetAccountReturnsADerivedBalance(t *testing.T) {
 	}
 }
 
-// ledger.Balance returns 0 for an id that was never created, so the handler
-// must look the account up separately. Using Balance as an existence check
-// would return a cheerful 200 with a zero balance for a typo.
+// Balance alone cannot distinguish an unknown account from an unused one.
 func TestGetUnknownAccountIs404NotAZeroBalance(t *testing.T) {
 	h, key := newTestServer(t)
 

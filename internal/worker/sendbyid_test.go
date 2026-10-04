@@ -7,12 +7,7 @@ import (
 	"time"
 )
 
-// ⭐ Guarantee 7: an event delivered twice sends the payment once.
-//
-// Kafka delivers at least once, so the consumer will see the same
-// transfer.created again — after a crash, a rebalance, or a relay that
-// republished. The second delivery must find the transfer already claimed and
-// do nothing.
+// Guarantee 7: an event delivered twice sends the payment once.
 func TestSendByIDTwiceSubmitsOnce(t *testing.T) {
 	ctx := context.Background()
 	id := seedOne(t, 5000)
@@ -53,12 +48,7 @@ func TestSendByIDUnknownTransferIsSkipped(t *testing.T) {
 	}
 }
 
-// ⭐ The cost of two paths: the consumer and the poller race for the same
-// transfers, and each must still be sent exactly once.
-//
-// The poller claims in batches, the consumer one id at a time, both at once.
-// They share the claim guard — no provider_ref yet, row lock, SKIP LOCKED —
-// and that guard is the only thing standing between this and a double payment.
+// Both entry points must share the claim guard when consumer and poller race.
 func TestConsumerAndPollerSendEachTransferOnce(t *testing.T) {
 	const total = 50
 	ids := seedFunded(t, total, 1000)
