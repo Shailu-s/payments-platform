@@ -5,7 +5,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender
 
 up:
 	$(COMPOSE) up -d --wait
@@ -46,6 +46,10 @@ relay:
 # Print every event from transfers topic
 watch:
 	@go run ./cmd/watch
+
+# Send transfers to MockBank as their events arrive. Run alongside `make run` and `make relay`.
+sender:
+	@go run ./cmd/sender
 
 # Serve MockBank on :8081. Run it alongside `make run`.
 mock-bank:
