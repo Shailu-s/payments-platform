@@ -5,9 +5,7 @@ import (
 	"testing"
 )
 
-// An account that exists but has never been used is a normal state. SUM over
-// zero rows is NULL, not 0, so this is the COALESCE path — the most likely bug
-// in the query.
+// SUM over no entries is NULL; COALESCE must return zero.
 func TestBalanceOfUnusedAccountIsZero(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -22,9 +20,7 @@ func TestBalanceOfUnusedAccountIsZero(t *testing.T) {
 	}
 }
 
-// Balance sums entries; it does not check that the account exists. Worth
-// pinning down, because it means the API layer cannot use Balance to decide
-// whether an account id is real.
+// A zero balance cannot establish that an account exists.
 func TestBalanceOfUnknownAccountIsZero(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -38,9 +34,7 @@ func TestBalanceOfUnknownAccountIsZero(t *testing.T) {
 	}
 }
 
-// Balance must be callable inside a transaction: phase 3 reads a balance while
-// holding a row lock, and a read on a different connection sees a different
-// snapshot and defeats the lock.
+// Read uncommitted entries on the caller's transaction, not another pool connection.
 func TestBalanceRunsInsideATransaction(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -69,7 +63,6 @@ func TestBalanceRunsInsideATransaction(t *testing.T) {
 	}
 }
 
-// Many movements across several transactions accumulate correctly.
 func TestBalanceAccumulatesAcrossTransactions(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()

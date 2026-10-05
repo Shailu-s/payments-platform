@@ -9,28 +9,14 @@ import (
 	"time"
 )
 
-// Evidence for PLAN.md §7: what SKIP LOCKED actually buys.
-//
-// The correctness tests pass either way — row locking alone already prevents
-// two workers claiming the same transfer. That is worth knowing and worth
-// saying: SKIP LOCKED is not what makes the queue correct. What it changes is
-// whether adding workers adds throughput.
-//
-// Without it, a second worker's claim query BLOCKS on the rows the first has
-// locked. It waits for that transaction to commit, then re-reads and takes
-// different work — so workers take turns instead of working in parallel, and
-// the queue drains at one worker's pace no matter how many are running.
-//
-//	go test ./internal/worker/ -run TestSkipLockedThroughput -v
+// Row locking prevents duplicate claims either way; compare whether SKIP LOCKED
+// lets additional workers avoid waiting behind an active claim.
 func TestSkipLockedThroughput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("throughput comparison is slow")
 	}
 
-	// Each claim holds its lock for this long before committing, standing in
-	// for the work a real worker does inside the transaction. With no hold at
-	// all the transactions are too short to contend and the difference cannot
-	// be seen.
+	// Hold the transaction open to make lock contention observable.
 	const holdFor = 5 * time.Millisecond
 	const transfersPerRun = 120
 	const workers = 6
@@ -151,7 +137,6 @@ func claimHolding(ctx context.Context, skipLocked bool, limit int, hold time.Dur
 		return waited, 0, err
 	}
 
-	// The work a real worker does before committing.
 	if count > 0 {
 		time.Sleep(hold)
 	}

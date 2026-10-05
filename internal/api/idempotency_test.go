@@ -14,9 +14,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/auth"
 )
 
-// doWithKey sends a request carrying an Idempotency-Key. Each call builds its
-// own body reader, because a shared one is consumed by whichever goroutine
-// reaches it first and the rest send nothing.
+// Each request needs its own reader; sharing one would consume another goroutine's body.
 func doWithKey(h http.Handler, method, path, apiKey, idempotencyKey, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	if apiKey != "" {
@@ -30,30 +28,21 @@ func doWithKey(h http.Handler, method, path, apiKey, idempotencyKey, body string
 	return rec
 }
 
-// ⭐ Guarantee 2: the same idempotency key never creates two transfers.
-//
-// One hundred identical requests, released together, must produce exactly one
-// transfer and one hundred identical responses.
-//
-// PHASE 3.1: this test is expected to FAIL. The implementation reads by key and
-// inserts if nothing came back, and every goroutine runs that read before any
-// of them writes. Watching it fail is the point — the failure output is the
-// evidence behind the guarantee.
+// Guarantee 2: the same idempotency key never creates two transfers.
 func TestIdempotentRequestsCreateOneTransfer(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 1000000) // enough for any transfer in this test
+	fund(t, source.ID, 1000000)
 
 	const requests = 100
 	const idempotencyKey = "7da2f1c9-4e1b-4a22-9f3e-1d0c8b7a6e55"
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
 		source.ID, destination.ID)
 
-	// Released together, so the requests genuinely overlap. Without this they
-	// trickle out one at a time and the race never happens.
+	// Release together to exercise concurrent inserts, not sequential retries.
 	var start sync.WaitGroup
 	start.Add(1)
 	var done sync.WaitGroup
@@ -80,10 +69,7 @@ func TestIdempotentRequestsCreateOneTransfer(t *testing.T) {
 	start.Done()
 	done.Wait()
 
-	// The assertion that matters is the row count, not the responses. Counting
-	// 202s would pass while the database held three transfers, because all
-	// three requests succeeded as far as their callers could tell. The money is
-	// in the table, so the table is what gets counted.
+	// Successful responses alone cannot detect duplicate stored transfers.
 	var created int
 	if err := testPool.QueryRow(ctx,
 		`SELECT count(*) FROM transfers WHERE idempotency_key = $1`, idempotencyKey).Scan(&created); err != nil {
@@ -94,8 +80,6 @@ func TestIdempotentRequestsCreateOneTransfer(t *testing.T) {
 			"the same instruction was paid for %d times", requests, created, created)
 	}
 
-	// Every caller must get the same answer. A client that retries and receives
-	// a different transfer id has no way to know which one is real.
 	distinct := map[string]bool{}
 	for _, id := range transferIDs {
 		if id != "" {
@@ -106,9 +90,7 @@ func TestIdempotentRequestsCreateOneTransfer(t *testing.T) {
 		t.Errorf("callers received %d distinct transfer ids, want 1", len(distinct))
 	}
 
-	// And none of them may be an error: a retry answered with a 409 leaves the
-	// client unable to tell "already done" from "rejected", and its only safe
-	// move is to retry harder.
+	// A retry returns the original outcome, not a conflict.
 	for i, status := range statuses {
 		if status != http.StatusAccepted {
 			t.Errorf("request %d returned %d, want 202", i, status)
@@ -130,15 +112,12 @@ func TestIdempotentRequestsCreateOneTransfer(t *testing.T) {
 	}
 }
 
-// A sequential retry must return the original transfer, not a new one. This is
-// the case the naive implementation does handle, and it is worth pinning down
-// so 3.2 cannot regress it.
 func TestSequentialRetryReturnsTheSameTransfer(t *testing.T) {
 	h, apiKey := newTestServer(t)
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 1000000) // enough for any transfer in this test
+	fund(t, source.ID, 1000000)
 
 	const idempotencyKey = "retry-me-please"
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -181,7 +160,7 @@ func TestTransferRequiresAnIdempotencyKey(t *testing.T) {
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 1000000) // enough for any transfer in this test
+	fund(t, source.ID, 1000000)
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
 		source.ID, destination.ID)
 
@@ -212,14 +191,13 @@ func TestTransferRequiresAnIdempotencyKey(t *testing.T) {
 	}
 }
 
-// Different keys are different payments. Two genuine payments to the same
-// vendor for the same amount must both go through.
+// Identical terms with different keys are distinct payments, not retries.
 func TestDifferentKeysCreateDifferentTransfers(t *testing.T) {
 	h, apiKey := newTestServer(t)
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 1000000) // enough for any transfer in this test
+	fund(t, source.ID, 1000000)
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
 		source.ID, destination.ID)
 
@@ -240,16 +218,14 @@ func TestDifferentKeysCreateDifferentTransfers(t *testing.T) {
 	}
 }
 
-// Same key, different request. A client bug, not a retry — and the dangerous
-// kind, because returning the original transfer would let the caller believe a
-// payment happened that never did.
+// Replaying a different request would falsely imply the new payment happened.
 func TestSameKeyDifferentBodyIsRejected(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 1000000) // enough for any transfer in this test
+	fund(t, source.ID, 1000000)
 
 	const idempotencyKey = "invoice-4471"
 	original := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -264,7 +240,6 @@ func TestSameKeyDifferentBodyIsRejected(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	// Same key, a different amount.
 	changed := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":80000,"currency":"USD"}`,
 		source.ID, destination.ID)
 	second := doWithKey(h, "POST", "/v1/transfers", apiKey, idempotencyKey, changed)
@@ -277,7 +252,6 @@ func TestSameKeyDifferentBodyIsRejected(t *testing.T) {
 		t.Errorf("error code = %q, want %q", got, CodeIdempotencyKeyReused)
 	}
 
-	// The original must be untouched, and no second transfer created.
 	var count int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&count); err != nil {
 		t.Fatalf("count: %v", err)
@@ -296,7 +270,6 @@ func TestSameKeyDifferentBodyIsRejected(t *testing.T) {
 	}
 }
 
-// A changed destination is as much a different request as a changed amount.
 func TestSameKeyDifferentDestinationIsRejected(t *testing.T) {
 	h, apiKey := newTestServer(t)
 
@@ -347,9 +320,7 @@ func TestIdempotencyKeysAreScopedToTheCaller(t *testing.T) {
 		t.Fatalf("first caller status = %d, want 202", rec.Code)
 	}
 
-	// The second caller sends the same key with the same body. The fingerprint
-	// includes the api key, so this is a different request and is refused
-	// rather than answered with the first caller's transfer.
+	// Caller identity in the fingerprint prevents another caller's outcome leaking.
 	rec := doWithKey(h, "POST", "/v1/transfers", secondPlaintext, sharedKey, body)
 	if rec.Code == http.StatusAccepted {
 		var leaked transferResponse
@@ -362,14 +333,13 @@ func TestIdempotencyKeysAreScopedToTheCaller(t *testing.T) {
 	}
 }
 
-// A replay must return the ledger state of the original, not create more.
 func TestReplayDoesNotMoveMoneyAgain(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 1000000) // enough for any transfer in this test
+	fund(t, source.ID, 1000000)
 
 	const idempotencyKey = "only-once"
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
@@ -404,19 +374,14 @@ func TestReplayDoesNotMoveMoneyAgain(t *testing.T) {
 	}
 }
 
-// The case most implementations get wrong: the key is taken but the winning
-// transaction has not committed, so the row is not visible to anyone else.
-//
-// Simulated by taking the key in an open transaction and holding it while a
-// second request arrives. What the second request must NOT do is conclude the
-// transfer does not exist and create another one.
+// An uncommitted key must block a second insert even though its row is invisible.
 func TestKeyTakenButNotYetCommittedIsSerialised(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
 
 	source := createAccount(t, h, apiKey, "asset")
 	destination := createAccount(t, h, apiKey, "liability")
-	fund(t, source.ID, 1000000) // enough for any transfer in this test
+	fund(t, source.ID, 1000000)
 
 	var apiKeyID string
 	if err := testPool.QueryRow(ctx, `SELECT id FROM api_keys LIMIT 1`).Scan(&apiKeyID); err != nil {
@@ -425,15 +390,13 @@ func TestKeyTakenButNotYetCommittedIsSerialised(t *testing.T) {
 
 	const idempotencyKey = "in-flight-key"
 
-	// Hold the key in an uncommitted transaction, exactly as a winning request
-	// would while it finishes the rest of its work.
+	// Hold the winning insert open while a retry arrives.
 	tx, err := testPool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
 	holderID := newID("tr")
-	// The same fingerprint the handler will compute for the second request, so
-	// this stands in for a genuine first attempt rather than a different one.
+	// Match the retry's fingerprint so the test isolates index contention.
 	holderFingerprint := fingerprintRequest(apiKeyID, createTransferRequest{
 		SourceAccount:      source.ID,
 		DestinationAccount: destination.ID,
@@ -450,7 +413,6 @@ func TestKeyTakenButNotYetCommittedIsSerialised(t *testing.T) {
 		t.Fatalf("hold the key: %v", err)
 	}
 
-	// While the key is held, nothing is visible to anyone else.
 	var visible int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&visible); err != nil {
 		tx.Rollback(ctx)
@@ -461,9 +423,7 @@ func TestKeyTakenButNotYetCommittedIsSerialised(t *testing.T) {
 		t.Fatalf("%d transfers visible, want 0: the holder has not committed", visible)
 	}
 
-	// A second request for the same key. Its insert blocks on the held index
-	// entry rather than proceeding — that blocking IS the serialisation, and it
-	// is what application code cannot do for itself.
+	// The retry must block on the uncommitted unique index entry.
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
 		source.ID, destination.ID)
 	done := make(chan *httptest.ResponseRecorder, 1)
@@ -489,7 +449,6 @@ func TestKeyTakenButNotYetCommittedIsSerialised(t *testing.T) {
 
 	select {
 	case rec := <-done:
-		// It must replay the holder's transfer, not create a second one.
 		if rec.Code != http.StatusAccepted {
 			t.Errorf("status = %d, want 202 replaying the committed transfer: %s",
 				rec.Code, rec.Body.String())

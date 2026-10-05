@@ -6,8 +6,7 @@ import (
 	"testing"
 )
 
-// Guarantee 1: the ledger always balances — every transaction's debits equal
-// its credits.
+// Guarantee 1: every ledger transaction's debits equal its credits.
 func TestRecordMovesMoneyAndBalances(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -41,9 +40,7 @@ func TestRecordMovesMoneyAndBalances(t *testing.T) {
 		t.Errorf("Balance(acc_b) = %d, want 50000", balanceB)
 	}
 
-	// The invariant itself: the transaction's entries sum to zero. Asserting
-	// the two balances is not the same claim — this one holds for any number
-	// of entries on either side.
+	// Check the transaction invariant separately from individual account balances.
 	var sum int64
 	if err := testPool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END), 0)
@@ -55,9 +52,7 @@ func TestRecordMovesMoneyAndBalances(t *testing.T) {
 	}
 }
 
-// An unbalanced write must be refused AND must leave nothing behind. The second
-// half is the real assertion: an error return means nothing if half a
-// transaction was already committed.
+// An error alone is insufficient: refusal must leave no partial transaction.
 func TestRecordRejectsUnbalancedAndWritesNothing(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -78,8 +73,6 @@ func TestRecordRejectsUnbalancedAndWritesNothing(t *testing.T) {
 	}
 }
 
-// Validation that happens before BEGIN. Table-driven because each case is the
-// same shape and the list is what documents the contract.
 func TestRecordRejectsInvalidEntries(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
@@ -122,9 +115,7 @@ func TestRecordRejectsInvalidEntries(t *testing.T) {
 	}
 }
 
-// A failure the database raises mid-transaction, after BEGIN and after the
-// transaction row is already inserted. Validation cannot catch this one, so
-// only the rollback prevents an orphaned ledger transaction.
+// An FK failure after the transaction insert must roll back the parent row too.
 func TestRecordRollsBackWhenDatabaseRejectsAnEntry(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()

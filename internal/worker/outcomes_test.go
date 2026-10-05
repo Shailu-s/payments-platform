@@ -28,8 +28,6 @@ func seedOne(t *testing.T, amount int64) string {
 		t.Fatalf("api key: %v", err)
 	}
 
-	// Fund the source, then move the money to settlement as creating the
-	// transfer would.
 	if _, err := ledger.Record(ctx, testPool, "funding", []ledger.Entry{
 		{AccountID: transfers.SettlementAccountID, Direction: ledger.DirectionDebit, Amount: amount * 10},
 		{AccountID: "acc_src", Direction: ledger.DirectionCredit, Amount: amount * 10},
@@ -75,8 +73,7 @@ func balanceOf(t *testing.T, accountID string) int64 {
 	return b
 }
 
-// Outcome 1: accepted. The reference is stored, the transfer stays processing,
-// and the destination has NOT been credited — the money is still ours.
+// Provider acceptance is not settlement; the destination must remain uncredited.
 func TestAcceptedTransferStoresReferenceAndWaits(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -107,8 +104,7 @@ func TestAcceptedTransferStoresReferenceAndWaits(t *testing.T) {
 	}
 }
 
-// Outcome 2: rejected. Terminal, and the money goes back with a NEW ledger
-// transaction rather than an edit.
+// Guarantee 6: rejection refunds with new entries, leaving the original entries unchanged.
 func TestRejectedTransferIsReversed(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -124,12 +120,10 @@ func TestRejectedTransferIsReversed(t *testing.T) {
 		t.Fatalf("status = %q, want failed", got)
 	}
 
-	// The money is back where it started.
 	if got := balanceOf(t, "acc_src"); got != before+50000 {
 		t.Errorf("source balance = %d, want %d: the money was not returned", got, before+50000)
 	}
 
-	// Two ledger transactions for one transfer, and the first is untouched.
 	var movements int
 	if err := testPool.QueryRow(ctx,
 		`SELECT count(*) FROM ledger_transactions WHERE reference IN ($1, $2)`,
@@ -141,7 +135,6 @@ func TestRejectedTransferIsReversed(t *testing.T) {
 			"movement and its reversal", movements)
 	}
 
-	// Guarantee 6: the original entries still say what they always said.
 	var originalDebit int64
 	if err := testPool.QueryRow(ctx, `
 		SELECT amount FROM ledger_entries e
@@ -155,10 +148,7 @@ func TestRejectedTransferIsReversed(t *testing.T) {
 	}
 }
 
-// ⭐ Outcome 3: the outcome is unknown. The hardest case in the project.
-//
-// Not retried, because the rail may already have moved the money. Not failed,
-// because it may have succeeded. Parked, and left alone.
+// Unknown outcomes must neither be resubmitted nor refunded without confirmation.
 func TestTimedOutTransferIsParkedNotRetriedNotFailed(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -224,8 +214,6 @@ func TestUnavailableProviderIsRetriedNotParked(t *testing.T) {
 	}
 }
 
-// The other half of parking: something must come back for it. A later lookup
-// against the rail discovers the payment did settle.
 func TestUnresolvedTransferIsRescuedByALookup(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -239,7 +227,6 @@ func TestUnresolvedTransferIsRescuedByALookup(t *testing.T) {
 		t.Fatalf("status = %q, want unresolved", got)
 	}
 
-	// The rail can now be asked, and says the payment went through.
 	fake.mu.Lock()
 	fake.lookup = func(ref string) (provider.Payment, error) {
 		return provider.Payment{
@@ -262,8 +249,6 @@ func TestUnresolvedTransferIsRescuedByALookup(t *testing.T) {
 	}
 }
 
-// And if the rail never received it, the transfer goes back in the queue rather
-// than staying parked forever.
 func TestUnresolvedTransferTheProviderNeverSawIsRequeued(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -283,7 +268,6 @@ func TestUnresolvedTransferTheProviderNeverSawIsRequeued(t *testing.T) {
 	}
 }
 
-// A lookup that says the payment failed returns the money.
 func TestUnresolvedTransferThatFailedIsReversed(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -316,7 +300,7 @@ func TestUnresolvedTransferThatFailedIsReversed(t *testing.T) {
 	}
 }
 
-// ⭐ Guarantee 4: the same settlement applied twice has one financial effect.
+// Guarantee 4: the same settlement applied twice has one financial effect.
 func TestSettlingTwiceCreditsTheDestinationOnce(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -343,8 +327,7 @@ func TestSettlingTwiceCreditsTheDestinationOnce(t *testing.T) {
 	}
 }
 
-// The full accounting story of a successful transfer: two ledger transactions,
-// the money ending where it should, and everything still balancing.
+// Guarantee 1: creation and settlement keep the ledger balanced.
 func TestSettlementMovesMoneyTheRestOfTheWay(t *testing.T) {
 	id := seedOne(t, 50000)
 	ctx := context.Background()
@@ -371,7 +354,6 @@ func TestSettlementMovesMoneyTheRestOfTheWay(t *testing.T) {
 			"for this transfer any more", got)
 	}
 
-	// Guarantee 1 still holds across the whole thing.
 	var total int64
 	if err := testPool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END), 0)

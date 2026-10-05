@@ -1,4 +1,4 @@
--- Phase 1: the ledger. Three tables, no balance column anywhere.
+-- Balances are derived from entries, never stored.
 
 CREATE TABLE accounts (
     id         text        PRIMARY KEY,
@@ -13,7 +13,7 @@ CREATE TABLE ledger_transactions (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- APPEND ONLY. No UPDATE, no DELETE, ever.
+-- Application writes are append-only; this schema does not prohibit UPDATE or DELETE.
 CREATE TABLE ledger_entries (
     id         text        PRIMARY KEY,
     txn_id     text        NOT NULL REFERENCES ledger_transactions (id),

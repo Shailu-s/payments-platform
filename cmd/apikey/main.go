@@ -1,8 +1,4 @@
-// Command apikey mints an API key and prints it once.
-//
-// There is no POST /api_keys endpoint in V1: an unauthenticated endpoint that
-// mints credentials is worse than no endpoint at all, and an authenticated one
-// needs a first key that has to come from somewhere anyway.
+// Command apikey manages API keys outside the public HTTP API.
 package main
 
 import (
@@ -12,10 +8,9 @@ import (
 	"os"
 
 	"github.com/Shailu-s/payments-platform/internal/auth"
+	"github.com/Shailu-s/payments-platform/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-const defaultDSN = "postgres://payments:payments@localhost:5433/payments?sslmode=disable"
 
 func main() {
 	name := flag.String("name", "", "what this key is for, shown in logs and the dashboard")
@@ -23,9 +18,10 @@ func main() {
 	list := flag.Bool("list", false, "list keys: id, prefix, name, status. Never the secret")
 	flag.Parse()
 
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = defaultDSN
+	var env config.Env
+	dsn := env.Require("DATABASE_URL")
+	if err := env.Err(); err != nil {
+		fail("%v", err)
 	}
 
 	ctx := context.Background()
@@ -34,7 +30,7 @@ func main() {
 		err = pool.Ping(ctx)
 	}
 	if err != nil {
-		fail("no database at %s: %v\nrun `make up && make migrate-up` first", dsn, err)
+		fail("no database: %v\nrun `make up && make migrate-up` first", err)
 	}
 	defer pool.Close()
 

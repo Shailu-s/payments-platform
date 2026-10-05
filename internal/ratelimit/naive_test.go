@@ -8,14 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// allowNaive is the WRONG implementation, and it lives in a test file because
-// it is evidence rather than product code.
-//
-// It reads the count, decides, then writes — correct in a single thread and
-// broken the moment two requests overlap: both read the same value, both
-// conclude they are under the limit, and both allow themselves. No amount of
-// care in application code closes that window; only the database can serialise
-// it, which is what the real Allow does with ON CONFLICT.
+// Deliberately incorrect read-then-write implementation for the concurrency comparison.
 func (l *Limiter) allowNaive(ctx context.Context, apiKeyID string) (Decision, error) {
 	windowStart := l.windowStart(nowUTC())
 
@@ -26,8 +19,7 @@ func (l *Limiter) allowNaive(ctx context.Context, apiKeyID string) (Decision, er
 		return Decision{}, fmt.Errorf("naive rate limit read %s: %w", apiKeyID, err)
 	}
 
-	// The gap. Everything that has already read this value is about to make the
-	// same decision from it.
+	// Another request may change the count between this decision and the write.
 	if count >= l.limit {
 		return Decision{Allowed: false, Limit: l.limit}, nil
 	}

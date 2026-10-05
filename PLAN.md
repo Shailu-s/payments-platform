@@ -8,14 +8,21 @@ on a portfolio commit).
 
 ---
 
-## 🚨 Working method (non-negotiable)
+## 🚨 Working method
 
-**Claude instructs. Shailendra types.**
+**Changed 2026-10-05: Claude writes, Shailendra reviews and explains.**
 
-- Claude explains what to build and why, then he writes the code.
-- If a snippet is genuinely needed, it goes in chat to copy — not written into project files.
-- Reviewing and correcting his code afterwards is Claude's job.
-- **Why:** code he did not type teaches him nothing, and interviewers ask about every line.
+- Claude writes each piece into the repo in small commits, tested before it is shown.
+- He reads every diff and **explains it back in his own words before it is committed** — what
+  it does, the constraint that forces it, and the cost. No explanation, no commit.
+- He still types **one interview-critical piece per phase** by hand.
+- **Why the change:** through phase 5 the old method (Claude instructs, he types everything)
+  roughly doubled the time per feature — code was written, verified, pasted, retyped, then
+  re-reviewed for typing mistakes — and the learning came from the experiments and the "why"
+  questions, not the typing. Interviewers ask about every line, so the explain-back is the
+  part that cannot be skipped.
+
+*Original rule, 2026-09-19 to 2026-10-04: Claude instructs, he types every line.*
 
 Update the LOG at the bottom of this file at the end of every session.
 
@@ -580,6 +587,19 @@ authentication (who is calling) but not authorisation (what they may touch): a v
 can act on any account. Adding it means `tenant_id` on every table and a scoping check on
 every read path. Deliberate trade — that weekend went to correctness under failure.
 
+✂️ **Scope cut on 2026-10-05 (fast-track), to finish V1 in ~4–5 sessions:**
+
+```
+Phase 5     finish: demote the poller, the SIGKILL test. Kafka-down = one manual run, noted.
+Phase 6     inbound: HMAC signature + replay window only (dedupe, status guard, unknown
+            transfer already exist from phase 4). Outbound: one consumer with retries,
+            backoff and a DLQ status. CUT: manual replay, delivery history.
+Phase 7     kept in full.
+Chaos Mode  CUT as an API. duplicate_webhook and timeout_after_success become tests.
+Dashboard   CUT.
+README      kept: the eight guarantees, each tied to its test, plus the evidence numbers.
+```
+
 ⚠️ **Scope was already expanded once, on day zero** (auth, rate limiting and the evidence rule
 were added on 2026-09-19 before any code existed). That is the exact behaviour that killed
 `card-engine`. Phase count stayed at seven on purpose. **Nothing else gets added to V1 until
@@ -614,8 +634,10 @@ than the identity of the project.
   start.
 - **The scope fence is closed until phase 4 runs.** It was opened once on day zero; that was
   the allowance, not a precedent.
-- **Small, reviewable commits** following the build order. No AI attribution trailers, ever.
-  After the first commit, stop and let him review before continuing.
+- **Small, reviewable commits** following the build order. Avoid voluntary AI attribution;
+  tool-required metadata is permitted (approved 2026-10-05), with `Shailu-s` /
+  `srajawat024@gmail.com` retained as the commit author. After the first commit, stop and let
+  him review before continuing unless he explicitly approves the batch.
 - **Never commit secrets or generated files.** `git status --porcelain -uall` before staging.
 - If a phase is dragging past its weekend, **cut scope within the phase** rather than
   skipping ahead.
@@ -666,3 +688,37 @@ recorded as a known limitation:
 **Next session — Phase 1:** the three tables, the balanced-transaction writer, the derived
 balance, and the two tests (books balance; float loses money). Auth and rate limiting are
 phase 2 — do not start them early.
+
+**2026-09-21 → 2026-10-05 — phases 1–4 done, phase 5 nearly done.** The detailed build log
+moved to a local `PROGRESS.md` on 2026-09-21 and this LOG was not kept in step; this entry
+closes the gap. Phases 1–4 merged (PRs #1–#4). Phase 5 on `phase-5-kafka-outbox`: outbox,
+Kafka in compose, relay (with a crash-republish test), consumer loop, `watch`, `SendByID` with
+the claim guard (watched double-paying 29 of 50 transfers in its naive form first),
+`transfer-sender`, and every setting moved to required environment variables.
+**Decided 2026-10-05:** the working method changes to "Claude writes, he reviews and explains",
+and V1 is fast-tracked — see the working method section and the scope cut above.
+
+**2026-10-05 — poller demoted; comment cleanup committed.** `8151e4b` gives the event
+consumer a 30s head start. Comment-only cleanup `f914551`: 61 Go files passed comment-free
+parser/formatter and token comparisons against the preceding HEAD; 15 non-Go files retained
+identical non-comment content. Comment lines 1,673 -> 579. Build and full tests passed
+against healthy Compose services. Three pre-existing gofmt issues were left outside scope.
+The webhook event record and financial transition commit separately: failed application
+can be skipped on redelivery; logged as an unfixed gap in PROGRESS.md.
+The user deferred comment explain-back and approved commit/push, permitting tool-required
+attribution metadata while retaining his Git author identity. Rules updated accordingly;
+this rules/log update is separate from the comment-only cleanup. Next implementation:
+scripted sender SIGKILL/redelivery proof (5.5); no new phase-5 feature code written yet.
+
+**2026-10-05 — phase 5 failure proof implemented, tested, approved for commit.**
+`make chaos-kill-consumer` SIGKILLs an isolated child running production consumer/sender
+logic after provider-reference persistence and before offset commit. Negative control:
+6 submissions for 5 transfers without the claim guard. With SendByID: 5 submissions,
+same record redelivered with sent=false, unchanged entries on replay, five settlements.
+Three repeated runs, full build/tests and race detector passed. Kafka-down experiment:
+poller submission after 30.233s, callback settlement verified, unpublished event retained;
+Kafka restored with existing topics intact. This is a controlled-provider test, not a
+production rebalance or MockBank settlement-latency measurement. The earlier provider
+acceptance/reference-persistence crash window and webhook two-commit gap remain documented
+limits. The user explained the two failure scenarios and approved the commit. Next is
+phase 6, starting with atomic webhook deduplication/application before HMAC verification.

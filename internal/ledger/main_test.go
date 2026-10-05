@@ -10,10 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Each package gets its own schema, so `go test ./...` can run them in parallel
-// without one package's truncate deleting another's rows. Tests run against
-// real Postgres because phase 3 turns on SELECT FOR UPDATE and SERIALIZABLE,
-// and no in-memory substitute implements those honestly.
+// Separate schemas keep parallel packages from truncating each other's fixtures.
 const testSchema = "test_ledger"
 
 var testPool *pgxpool.Pool
@@ -23,8 +20,7 @@ func TestMain(m *testing.M) {
 
 	pool, err := testdb.Connect(ctx, testSchema)
 	if err != nil {
-		// Fail, do not skip: a suite reporting ok having run zero tests is a
-		// green light CI would believe.
+		// Missing infrastructure must not look like a passing suite.
 		fmt.Fprint(os.Stderr, testdb.ConnectionHint(err))
 		if os.Getenv("LEDGER_TESTS") == "skip" {
 			os.Exit(0)
@@ -38,9 +34,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// resetDB empties this package's schema. Registered with t.Cleanup as well as
-// run up front, because cross-test leakage turns one real failure into several
-// fake ones.
+// Reset before and after each test to avoid fixture leakage on failures.
 func resetDB(t *testing.T) {
 	t.Helper()
 	truncate := func() {
@@ -52,8 +46,6 @@ func resetDB(t *testing.T) {
 	t.Cleanup(truncate)
 }
 
-// createAccount inserts an account directly. Phase 1 has no account package;
-// the ledger only needs the row to exist for the foreign key.
 func createAccount(t *testing.T, id string) {
 	t.Helper()
 	if _, err := testPool.Exec(context.Background(),
@@ -62,7 +54,6 @@ func createAccount(t *testing.T, id string) {
 	}
 }
 
-// countRows returns the number of ledger transactions and entries.
 func countRows(t *testing.T) (txns, entries int) {
 	t.Helper()
 	ctx := context.Background()

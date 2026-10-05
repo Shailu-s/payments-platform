@@ -60,9 +60,7 @@ type submitRequest struct {
 }
 
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
-	// Asked before the work, so a scenario can make this call time out from the
-	// caller's point of view while the instruction is still accepted — which is
-	// the failure the contract warns about.
+	// Delays can outlive the client's deadline while the instruction is still accepted.
 	if delay := s.behaviour.SubmitDelay(); delay > 0 {
 		time.Sleep(delay)
 	}
@@ -131,9 +129,7 @@ func validateSubmit(req *submitRequest) (string, bool) {
 	return "", true
 }
 
-// scheduleOutcome decides the payment's fate and delivers the webhook, later
-// and out of band. The caller's request has already returned by then, which is
-// the entire point: a rail does not finish while you wait.
+// Outcomes run independently of the request and may precede its acknowledgement.
 func (s *Server) scheduleOutcome(p Payment) {
 	status, reason, after := s.behaviour.Outcome(p)
 
@@ -161,10 +157,7 @@ type webhookEvent struct {
 	FailureReason   *string   `json:"failure_reason"`
 }
 
-// deliverWebhook posts the outcome, retrying on 5xx and transport failures with
-// the backoff the contract promises. The same event_id is sent every time, so a
-// receiver can tell a redelivery from a new event — and a receiver that cannot
-// will double-count money, which is what guarantee 4 exists to prevent.
+// Redeliver with the same event ID so the receiver can deduplicate retries.
 func (s *Server) deliverWebhook(p Payment) {
 	if s.webhookURL == "" {
 		return
@@ -247,8 +240,7 @@ func (s *Server) handleGetByProviderRef(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, payment)
 }
 
-// handleGetByClientReference is how a caller resolves a submit that timed out
-// before it ever learned a provider_ref. Without it that state is unrecoverable.
+// Client-reference lookup resolves lost submission acknowledgements.
 func (s *Server) handleGetByClientReference(w http.ResponseWriter, r *http.Request) {
 	ref := strings.TrimSpace(r.URL.Query().Get("client_reference"))
 	if ref == "" {

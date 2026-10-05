@@ -9,10 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// Querier and Execer are satisfied by a pool, a connection and a transaction
-// alike, so every function here can run inside a caller's transaction. Phase 2
-// needs that: POST /transfers writes the transfer and its ledger entries in one
-// transaction, and phase 5 adds an outbox row to the same one.
+// Querier and Execer allow operations on pools, connections or caller transactions.
 type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }

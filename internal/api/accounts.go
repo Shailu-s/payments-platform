@@ -13,8 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// V1 is one currency. The check exists so that adding a second is a deliberate
-// migration rather than something that quietly half-works.
+// Currency support must be added explicitly, not accepted before the rail supports it.
 const supportedCurrency = "USD"
 
 var accountTypes = map[string]bool{"asset": true, "liability": true, "settlement": true}
@@ -68,10 +67,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	// The account is looked up separately from its balance, deliberately.
-	// ledger.Balance sums entries and returns 0 for an id that does not exist,
-	// so it cannot answer "is this account real" — using it that way would
-	// return a cheerful 200 for a typo.
+	// Balance returns zero for unknown IDs, so existence needs a separate lookup.
 	const q = `SELECT currency, type, created_at FROM accounts WHERE id = $1`
 	var acc accountResponse
 	err := s.db.QueryRow(r.Context(), q, id).Scan(&acc.Currency, &acc.Type, &acc.CreatedAt)
@@ -95,16 +91,12 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, acc)
 }
 
-// decodeJSON reads a JSON body and reports whether the handler should continue.
-// It writes the error response itself, so handlers stay linear.
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	// Bounded: an unbounded read lets one request exhaust memory, and every
-	// legitimate body here is a few hundred bytes.
+	// Bound memory consumption from caller-controlled bodies.
 	const maxBody = 64 << 10
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
 
-	// Unknown fields are rejected rather than ignored. A caller who sends
-	// "ammount" should be told, not silently charged zero.
+	// Reject misspelled fields rather than silently treating them as absent.
 	dec.DisallowUnknownFields()
 
 	if err := dec.Decode(v); err != nil {
@@ -120,8 +112,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 		return false
 	}
 
-	// A second value in the body means the caller sent something other than the
-	// one object this endpoint accepts.
+	// Decode accepts a prefix; require EOF to reject a second JSON value.
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "request body must contain a single json object")
 		return false

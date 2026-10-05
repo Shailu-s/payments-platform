@@ -1,11 +1,5 @@
-// Package transfers holds the business intent of moving money: who paid whom,
-// how much, and what state that instruction is in.
-//
-// It sits on top of the ledger rather than replacing it. The ledger records the
-// accounting fact; a transfer records what a caller asked for. One transfer
-// produces several ledger transactions over its life — the movement now, the
-// settlement in phase 4, perhaps a reversal or a fee — which is why the two are
-// separate tables.
+// Package transfers stores payment instructions and their lifecycle.
+// One transfer can produce multiple immutable ledger transactions.
 package transfers
 
 import (
@@ -19,24 +13,19 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// Status values. Mutable, unlike a ledger entry, and that distinction is
-// coherent: this is business state, not an accounting record. The append-only
-// rule applies to ledger_entries.
+// Transfer statuses are mutable; ledger entries are not.
 const (
 	StatusCreated    = "created"
 	StatusProcessing = "processing"
 	StatusSettled    = "settled"
 	StatusFailed     = "failed"
-	// StatusUnresolved means a call to the rail timed out and we genuinely do
-	// not know whether the money moved. Not a failure and not a retry.
+	// StatusUnresolved means the provider outcome is unknown, not failed.
 	StatusUnresolved = "unresolved"
 )
 
 var (
 	ErrNotFound = errors.New("transfer not found")
-	// ErrDuplicateKey means the unique index on idempotency_key refused this
-	// insert: another request already owns the key. It is not a failure, it is
-	// the signal that this request is a retry.
+	// ErrDuplicateKey means another transfer owns the idempotency key.
 	ErrDuplicateKey = errors.New("idempotency key already used")
 )
 
@@ -49,31 +38,24 @@ type Transfer struct {
 	Status             string
 	LedgerTxnID        *string
 	APIKeyID           string
-	// Supplied by the client so a retry can be recognised as one. Nullable
-	// because transfers created by anything other than the API — a reversal in
-	// phase 4, say — have no client instruction behind them.
+	// IdempotencyKey is nullable for transfers created outside the API.
 	IdempotencyKey *string
-	// A hash of the request that created this transfer. Same key with a
-	// different fingerprint is a client bug rather than a retry.
+	// RequestFingerprint distinguishes key reuse with different terms from a retry.
 	RequestFingerprint *string
-	// The rail's own identifier, once it has accepted the instruction. Nil
-	// until then, and nil forever on a transfer the rail never saw.
+	// ProviderRef is nil until acceptance is recorded, including unknown outcomes.
 	ProviderRef *string
-	// How many times a worker has sent this to the rail. For observability and
-	// for giving up, not for deciding what to do next.
+	// AttemptCount counts claims, not confirmed provider submissions.
 	AttemptCount int
-	// When this transfer next becomes claimable. Nil means never, which is how
-	// an unresolved transfer stops being retried.
+	// NextAttemptAt is the retry deadline. Nil processing transfers without a
+	// provider reference use the consumer or wait for the poller's HeadStart.
 	NextAttemptAt *time.Time
-	// The last thing the rail said. Kept for an operator to read, not parsed.
+	// LastError is diagnostic text, not machine-readable state.
 	LastError *string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
-// Querier is satisfied by a pool, a connection and a transaction alike, so
-// Insert can run inside the caller's transaction. That is the whole point:
-// POST /transfers writes the transfer and its ledger entries atomically.
+// Querier allows store operations to share the caller's transaction.
 type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -99,8 +81,6 @@ func Insert(ctx context.Context, db Querier, t Transfer) (Transfer, error) {
 
 	stored, err := scan(row)
 	if IsDuplicateKey(err) {
-		// The unique index fired: another request holds this key. Returned
-		// unwrapped so the caller can branch on it without unwrapping first.
 		return Transfer{}, ErrDuplicateKey
 	}
 	if err != nil {
@@ -109,18 +89,13 @@ func Insert(ctx context.Context, db Querier, t Transfer) (Transfer, error) {
 	return stored, nil
 }
 
-// IsDuplicateKey reports whether an error is Postgres 23505, unique_violation.
-//
-// Branching on the SQLSTATE rather than on a string match of the message: the
-// message is localised and can change between versions, the code cannot.
+// IsDuplicateKey checks SQLSTATE 23505 rather than a localised error message.
 func IsDuplicateKey(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation
 }
 
-// SetLedgerTxn links a transfer to the ledger transaction that recorded its
-// movement. Called inside the same transaction as the insert, so a transfer is
-// never visible without its accounting.
+// SetLedgerTxn links the initial movement; call it in the transfer's transaction.
 func SetLedgerTxn(ctx context.Context, db Querier, transferID, ledgerTxnID string) error {
 	const q = `
 		UPDATE transfers
@@ -135,13 +110,8 @@ func SetLedgerTxn(ctx context.Context, db Querier, transferID, ledgerTxnID strin
 	return nil
 }
 
-// FindByIdempotencyKey returns the transfer a client's key already created, if
-// there is one.
-//
-// On its own this is NOT enough to make POST /transfers idempotent: a caller
-// that reads here and inserts afterwards has a window between the two in which
-// a concurrent request reads the same nothing. Phase 3.2 adds the unique
-// constraint that closes it.
+// FindByIdempotencyKey returns the transfer owning a key.
+// This lookup alone cannot prevent concurrent inserts; the unique index does.
 func FindByIdempotencyKey(ctx context.Context, db Querier, key string) (Transfer, error) {
 	const q = `SELECT ` + columns + ` FROM transfers WHERE idempotency_key = $1`
 
@@ -168,10 +138,8 @@ func Get(ctx context.Context, db Querier, id string) (Transfer, error) {
 	return t, nil
 }
 
-// List returns transfers newest first. The cursor is the id of the last row of
-// the previous page, paired with its created_at: ordering by a timestamp alone
-// is not stable when two rows share one, and an OFFSET would skip or repeat
-// rows as new transfers arrive.
+// List pages newest first using (created_at, id); timestamps alone are not unique
+// and OFFSET can skip or repeat rows as transfers arrive.
 func List(ctx context.Context, db Querier, limit int, cursorCreatedAt *time.Time, cursorID string) ([]Transfer, error) {
 	var (
 		rows pgx.Rows
@@ -207,8 +175,6 @@ func List(ctx context.Context, db Querier, limit int, cursorCreatedAt *time.Time
 	return out, nil
 }
 
-// scannable is satisfied by both pgx.Row and pgx.Rows, so one scan function
-// serves a single-row query and a loop over many.
 type scannable interface {
 	Scan(dest ...any) error
 }

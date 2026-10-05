@@ -117,11 +117,7 @@ func (c *countingProvider) duplicates() []string {
 	return out
 }
 
-// ⭐ Two workers, 50 transfers, each sent to the provider exactly once.
-//
-// This is the claim test carried through to its consequence: SKIP LOCKED stops
-// two workers claiming one row, and what that buys is that the rail is never
-// told to pay the same vendor twice.
+// Concurrent workers must submit each transfer once; the row lock protects the claim.
 func TestTwoWorkersSendEachTransferOnce(t *testing.T) {
 	const total = 50
 	ids := seedFunded(t, total, 1000)
@@ -161,7 +157,6 @@ func TestTwoWorkersSendEachTransferOnce(t *testing.T) {
 		t.Errorf("%d submissions for %d transfers, want %d", got, total, total)
 	}
 
-	// Every transfer now carries a provider reference.
 	var withoutRef int
 	if err := testPool.QueryRow(ctx,
 		`SELECT count(*) FROM transfers WHERE provider_ref IS NULL`).Scan(&withoutRef); err != nil {
@@ -171,7 +166,6 @@ func TestTwoWorkersSendEachTransferOnce(t *testing.T) {
 		t.Errorf("%d transfers were never sent", withoutRef)
 	}
 
-	// And settling them all credits the destination exactly once each.
 	for _, id := range ids {
 		if err := transfers.Settle(ctx, testPool, id); err != nil {
 			t.Fatalf("Settle %s: %v", id, err)
@@ -182,12 +176,8 @@ func TestTwoWorkersSendEachTransferOnce(t *testing.T) {
 	}
 }
 
-// ⭐ A worker killed mid-run loses nothing and double-sends nothing.
-//
-// The first worker is cancelled while its batch is in flight. Its claimed
-// transfers have had next_attempt_at pushed forward, so they are not
-// immediately reclaimable — which is deliberate: a crashed worker costs one
-// backoff rather than a tight retry loop against the rail.
+// Cancel a worker mid-batch, then reclaim after backoff. This tests context
+// cancellation and reference persistence, not SIGKILL.
 func TestWorkerRestartLosesNothingAndDoubleSendsNothing(t *testing.T) {
 	const total = 30
 	seedFunded(t, total, 1000)
@@ -202,7 +192,7 @@ func TestWorkerRestartLosesNothingAndDoubleSendsNothing(t *testing.T) {
 	cfg.RetryBackoff = 200 * time.Millisecond
 	cfg.PollInterval = 10 * time.Millisecond
 
-	// First worker: killed after a moment.
+	// Cancel while the first worker is sending.
 	firstCtx, killFirst := context.WithCancel(ctx)
 	firstDone := make(chan struct{})
 	go func() {
@@ -256,7 +246,6 @@ func TestWorkerRestartLosesNothingAndDoubleSendsNothing(t *testing.T) {
 		t.Fatal("the second worker did not stop when cancelled")
 	}
 
-	// Nothing lost: every transfer reached the rail.
 	var withoutRef int
 	if err := testPool.QueryRow(ctx,
 		`SELECT count(*) FROM transfers WHERE provider_ref IS NULL`).Scan(&withoutRef); err != nil {
@@ -266,15 +255,11 @@ func TestWorkerRestartLosesNothingAndDoubleSendsNothing(t *testing.T) {
 		t.Errorf("%d transfers lost across the restart", withoutRef)
 	}
 
-	// Nothing double-sent: the interrupted batch was not re-sent by the second
-	// worker on top of what the first already delivered.
 	if dupes := rail.duplicates(); len(dupes) > 0 {
 		t.Errorf("transfers sent twice across the restart: %v", dupes)
 	}
 }
 
-// A worker must stop when asked, or every later test is noisier and phase 5's
-// deliberate kill proves nothing.
 func TestWorkerStopsWhenCancelled(t *testing.T) {
 	seedFunded(t, 3, 1000)
 

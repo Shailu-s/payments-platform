@@ -8,13 +8,7 @@ import (
 	"time"
 )
 
-// Payment is MockBank's own record of an instruction. It lives in MockBank's
-// memory and nowhere else.
-//
-// The store is deliberately in-process and has no access to the payments
-// database. A provider that can read our ledger is not a provider — it is a
-// function call wearing an HTTP costume, and every failure mode we want to
-// rehearse depends on the two sides genuinely not sharing state.
+// Payment is MockBank's independent, in-memory payment record.
 type Payment struct {
 	ProviderRef     string     `json:"provider_ref"`
 	ClientReference string     `json:"client_reference"`
@@ -43,9 +37,7 @@ var (
 
 type Store struct {
 	mu sync.RWMutex
-	// Two indexes over the same payments: by the provider's reference, and by
-	// the caller's. The second is what lets a client resolve a submit that
-	// timed out before it ever learned a provider_ref.
+	// Client-reference lookup resolves submissions whose acknowledgement was lost.
 	byProviderRef     map[string]*Payment
 	byClientReference map[string]*Payment
 }
@@ -57,14 +49,8 @@ func NewStore() *Store {
 	}
 }
 
-// Submit records an instruction, or returns the existing one if this
-// client_reference has been seen.
-//
-// Deduplication by client_reference is what makes a caller's retry after a
-// timeout safe rather than a second payment. Real rails do this; the contract
-// promises it; and the contract also warns callers not to rely on it as their
-// only protection, because a rail that dedupes only within a window is a rail
-// that eventually pays twice.
+// Submit records an instruction or replays one with the same client reference.
+// Deduplication lasts only as long as this in-memory store survives.
 func (s *Store) Submit(p Payment) (stored *Payment, duplicate bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -114,9 +100,7 @@ func (s *Store) ByClientReference(ref string) (*Payment, error) {
 	return &copied, nil
 }
 
-// Settle moves a payment to its terminal state. Returns the payment as stored,
-// and whether this call changed anything: a payment already terminal is left
-// alone, because a rail does not un-settle money.
+// Settle returns the stored payment and whether it transitioned; terminal states stay unchanged.
 func (s *Store) Settle(ref, status string, failureReason *string) (*Payment, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -12,10 +12,7 @@ import (
 	"time"
 )
 
-// These test MockBank against docs/mockbank-api.md — the promises it makes to a
-// client, not its internals. A client is written against that document, so a
-// promise MockBank quietly breaks is a bug in the integration nobody would see
-// until the client mishandles the real thing.
+// Exercise the HTTP contract in docs/mockbank-api.md, not just store internals.
 
 func newTestBank(t *testing.T, behaviour Behaviour, webhookURL string) http.Handler {
 	t.Helper()
@@ -68,9 +65,7 @@ func TestSubmitReturns202Processing(t *testing.T) {
 	}
 }
 
-// ⭐ The property the whole integration rests on: the same client_reference
-// returns the same provider_ref and moves money once. This is what makes a
-// caller's retry after a timeout safe.
+// Retrying a client reference must return the original provider reference.
 func TestSameClientReferenceReturnsTheSamePayment(t *testing.T) {
 	h := newTestBank(t, wellBehaved{settleDelay: time.Hour}, "")
 
@@ -192,8 +187,7 @@ func TestGetByProviderRef(t *testing.T) {
 	}
 }
 
-// ⭐ How a caller resolves a submit that timed out before it ever learned a
-// provider_ref. Without this endpoint that state is unrecoverable.
+// Lost acknowledgements must remain resolvable by client reference.
 func TestGetByClientReferenceRescuesAnUnknownOutcome(t *testing.T) {
 	h := newTestBank(t, wellBehaved{settleDelay: time.Hour}, "")
 
@@ -218,7 +212,6 @@ func TestGetByClientReferenceRescuesAnUnknownOutcome(t *testing.T) {
 	}
 }
 
-// The webhook arrives later, on its own, with nobody watching.
 func TestWebhookIsDeliveredAfterSettlement(t *testing.T) {
 	var received atomic.Int64
 	events := make(chan webhookEvent, 4)

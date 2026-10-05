@@ -35,7 +35,7 @@ func TestCreateTransferAccepts202Processing(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 
 	got := createTransfer(t, h, key, source.ID, destination.ID, 50000)
 
@@ -53,16 +53,13 @@ func TestCreateTransferAccepts202Processing(t *testing.T) {
 	}
 }
 
-// The money is debited from the source and credited to SETTLEMENT, not to the
-// destination. At this moment the money is ours and earmarked; the destination
-// is credited in phase 4 when the provider confirms. Crediting it now would
-// write a permanent lie into an append-only table.
+// The destination must not be credited before provider confirmation.
 func TestCreateTransferCreditsSettlementNotTheDestination(t *testing.T) {
 	h, key := newTestServer(t)
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 
 	createTransfer(t, h, key, source.ID, destination.ID, 50000)
 
@@ -93,13 +90,13 @@ func TestCreateTransferCreditsSettlementNotTheDestination(t *testing.T) {
 	}
 }
 
-// Guarantee 1 holds across the API, not just inside the ledger package.
+// Guarantee 1: transfers created through the API keep the ledger balanced.
 func TestCreateTransferKeepsTheBooksBalanced(t *testing.T) {
 	h, key := newTestServer(t)
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 
 	for _, amount := range []int64{50000, 250, 1} {
 		createTransfer(t, h, key, source.ID, destination.ID, amount)
@@ -116,16 +113,12 @@ func TestCreateTransferKeepsTheBooksBalanced(t *testing.T) {
 	}
 }
 
-// The transfer and its ledger entries are one atomic unit. A transfer with no
-// accounting behind it is an instruction nobody recorded; entries with no
-// transfer are money moved for no stated reason.
 func TestRejectedTransferLeavesNothingBehind(t *testing.T) {
 	h, key := newTestServer(t)
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 
-	// The destination does not exist, so the request fails after validation
-	// would have to touch the database.
+	// Missing-account validation rejects this before any writes.
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":"acc_nope","amount":500,"currency":"USD"}`,
 		source.ID)
 	rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), body)
@@ -140,7 +133,7 @@ func TestCreateTransferRejectsBadInput(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 
 	tests := []struct {
 		name   string
@@ -175,7 +168,7 @@ func TestCreateTransferRejectsAFractionalAmount(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 
 	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":500.75,"currency":"USD"}`,
 		source.ID, destination.ID)
@@ -186,13 +179,13 @@ func TestCreateTransferRejectsAFractionalAmount(t *testing.T) {
 	}
 }
 
-// Guarantee 5: every financial state change records who asked for it.
+// Guarantee 5: transfer creation records the authorising caller.
 func TestTransferRecordsTheAuthenticatingKey(t *testing.T) {
 	h, key := newTestServer(t)
 	ctx := context.Background()
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 
 	created := createTransfer(t, h, key, source.ID, destination.ID, 500)
 
@@ -219,7 +212,7 @@ func TestGetTransfer(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 	created := createTransfer(t, h, key, source.ID, destination.ID, 50000)
 
 	rec := do(t, h, "GET", "/v1/transfers/"+created.ID, key, "")
@@ -251,7 +244,7 @@ func TestListTransfersIsNewestFirstAndPages(t *testing.T) {
 	h, key := newTestServer(t)
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
-	fund(t, source.ID, 1000000) // the balance check is phase 3; fund the source
+	fund(t, source.ID, 1000000)
 
 	var created []string
 	for i := 0; i < 5; i++ {
@@ -272,12 +265,10 @@ func TestListTransfersIsNewestFirstAndPages(t *testing.T) {
 	if page.NextCursor == nil {
 		t.Fatal("no next_cursor on a page that has more")
 	}
-	// Newest first: the last created comes back first.
 	if page.Data[0].ID != created[4] {
 		t.Errorf("first transfer = %s, want the newest %s", page.Data[0].ID, created[4])
 	}
 
-	// Walk the rest and confirm every transfer appears exactly once.
 	seen := map[string]int{}
 	for _, tr := range page.Data {
 		seen[tr.ID]++
@@ -336,12 +327,7 @@ func TestListTransfersRejectsABadLimitOrCursor(t *testing.T) {
 	}
 }
 
-// assertNothingWritten confirms a rejected request left no transfer and no
-// NEW ledger rows. An error response means little if half the work was
-// committed.
-//
-// Counts against a baseline rather than against zero, because tests fund their
-// source account first and that funding is legitimately in the ledger.
+// Ignore funding rows when checking that rejection wrote no transfer accounting.
 func assertNothingWritten(t *testing.T, ctx context.Context) {
 	t.Helper()
 	counts := func() (transfers, txns, entries int) {
@@ -362,8 +348,6 @@ func assertNothingWritten(t *testing.T, ctx context.Context) {
 		t.Errorf("a rejected request left %d transfers, want 0", transferCount)
 	}
 
-	// Whatever is in the ledger must still balance and must contain no entry
-	// belonging to a transfer, since no transfer exists.
 	var orphaned int
 	if err := testPool.QueryRow(ctx, `
 		SELECT count(*) FROM ledger_transactions WHERE reference LIKE 'transfer %'`).Scan(&orphaned); err != nil {
@@ -374,12 +358,8 @@ func assertNothingWritten(t *testing.T, ctx context.Context) {
 	}
 }
 
-// A failure that happens after the transfer row is written and before the
-// ledger entries are. Validation cannot catch this one, so only the database
-// transaction prevents a transfer existing with no accounting behind it.
-//
-// The settlement account is removed to force it: ledger.Record then violates a
-// foreign key, mid-transaction.
+// Remove settlement to force an FK failure after the transfer insert, testing rollback
+// rather than validation before BEGIN.
 func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 	h, key := newTestServer(t)
 	ctx := context.Background()
@@ -409,7 +389,6 @@ func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 		t.Fatal("a transfer was accepted although its ledger entries could not be written")
 	}
 
-	// The transfer row must not survive its own failed accounting.
 	var transferCount int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&transferCount); err != nil {
 		t.Fatalf("count transfers: %v", err)

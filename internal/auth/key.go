@@ -1,8 +1,6 @@
 // Package auth issues and verifies API keys.
 //
-// V1 has authentication but not authorisation: a valid key identifies the
-// caller and is recorded against every transfer, but any valid key may act on
-// any account. Multi-tenancy is a deliberate omission, recorded in PLAN.md.
+// Authentication only: any valid key may act on any account.
 package auth
 
 import (
@@ -22,14 +20,9 @@ import (
 // Plaintext keys look like "pk_live_" + 43 base64url characters.
 const (
 	keyPrefix = "pk_live_"
-	// 32 bytes, 256 bits. Far beyond brute force, which is what makes a fast
-	// hash the right choice below.
+
 	keyBytes = 32
-	// Characters of the secret kept in the prefix column, after the "pk_live_"
-	// marker. Eight characters of the literal key would be "pk_live_" itself,
-	// which is identical for every key and identifies nothing; these are the
-	// first 8 of the random material instead, so a key is recognisable in a log
-	// line while 35 characters of secret remain unknown.
+	// Count random characters, not the common pk_live_ marker, for identification.
 	prefixLen = 8
 )
 
@@ -38,8 +31,7 @@ var (
 	ErrRevokedKey = errors.New("api key has been revoked")
 )
 
-// Key is an api_keys row. It never holds the plaintext: after Generate returns,
-// the only copy is the string handed to the caller.
+// Key holds the stored hash and metadata, never the plaintext.
 type Key struct {
 	ID        string
 	Hash      string
@@ -49,18 +41,14 @@ type Key struct {
 	RevokedAt *time.Time
 }
 
-// Generate mints a key. The plaintext is returned once and is unrecoverable
-// afterwards, because only its hash is ever written down: a stolen database
-// dump must not yield working keys.
+// Generate returns plaintext once and a hash-only record for storage.
 func Generate(name string) (plaintext string, key Key, err error) {
 	if strings.TrimSpace(name) == "" {
 		return "", Key{}, errors.New("api key needs a name")
 	}
 
 	var secret [keyBytes]byte
-	// Since Go 1.24 crypto/rand.Read never returns an error: it panics
-	// internally if the entropy source fails rather than returning a short
-	// read. Discarded explicitly so that reads as a decision.
+	// Go 1.24+ rand.Read fills the buffer or terminates on entropy failure.
 	_, _ = rand.Read(secret[:])
 
 	plaintext = keyPrefix + base64.RawURLEncoding.EncodeToString(secret[:])
@@ -73,8 +61,7 @@ func Generate(name string) (plaintext string, key Key, err error) {
 	}, nil
 }
 
-// Insert writes a generated key. Separate from Generate so that minting is
-// pure and testable without a database.
+// Insert stores a generated key's hash and metadata.
 func Insert(ctx context.Context, db Execer, key Key) error {
 	const q = `INSERT INTO api_keys (id, key_hash, prefix, name) VALUES ($1, $2, $3, $4)`
 	if _, err := db.Exec(ctx, q, key.ID, key.Hash, key.Prefix, key.Name); err != nil {
@@ -83,16 +70,8 @@ func Insert(ctx context.Context, db Execer, key Key) error {
 	return nil
 }
 
-// Verify resolves a plaintext key to its row. It returns ErrInvalidKey for
-// anything unknown and ErrRevokedKey for a key that existed and was withdrawn
-// — the caller maps both to 401, but the distinction matters in a log line.
-//
-// There is no constant-time comparison here, deliberately. Timing attacks
-// matter when a secret is compared byte by byte and an early mismatch returns
-// sooner, leaking the prefix one character at a time. This does not compare:
-// it hashes the presented key and asks the database for that exact hash, so
-// either a row exists or it does not. The lookup is an index probe whose timing
-// says nothing about how much of a wrong key was correct.
+// Verify resolves a key by its hash, returning ErrInvalidKey or ErrRevokedKey.
+// It performs an exact hash lookup, not a byte-by-byte plaintext comparison.
 func Verify(ctx context.Context, db Querier, plaintext string) (Key, error) {
 	// Cheap shape check first, so a malformed header never reaches the database.
 	if !strings.HasPrefix(plaintext, keyPrefix) || len(plaintext) != len(keyPrefix)+43 {
@@ -104,8 +83,7 @@ func Verify(ctx context.Context, db Querier, plaintext string) (Key, error) {
 		FROM api_keys
 		WHERE key_hash = $1`
 
-	// Lookup is by hash, not by prefix: the hash is UNIQUE and indexed, and the
-	// prefix is not a secret and is not unique.
+	// The display prefix is neither secret nor unique.
 	var key Key
 	err := db.QueryRow(ctx, q, hashKey(plaintext)).
 		Scan(&key.ID, &key.Hash, &key.Prefix, &key.Name, &key.CreatedAt, &key.RevokedAt)
@@ -136,11 +114,7 @@ func Revoke(ctx context.Context, db Execer, id string) error {
 	return nil
 }
 
-// hashKey is SHA-256, deliberately, and this is the decision to be able to
-// defend. bcrypt and argon2 are slow on purpose because passwords are
-// low-entropy and guessable. An api key is 256 bits of crypto/rand and cannot
-// be brute-forced, so the slow-hash argument does not apply — while bcrypt on
-// every request would add tens of milliseconds to the hot path of every call.
+// Random 256-bit keys do not need password-style slow hashing on every request.
 func hashKey(plaintext string) string {
 	sum := sha256.Sum256([]byte(plaintext))
 	return hex.EncodeToString(sum[:])

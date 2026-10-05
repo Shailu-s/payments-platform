@@ -14,27 +14,18 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/auth"
 )
 
-// The middleware chain, and the order is load-bearing:
-//
-//	request id  →  logging  →  auth  →  rate limit  →  handler
-//
-// Auth comes before the rate limit because the limit is per key, so there is
-// nothing to count against until the caller is known. Logging wraps auth rather
-// than the reverse, so a rejected request still appears in the log — a 401 you
-// cannot see is a 401 you cannot debug.
+// Logging wraps auth to capture rejected requests; auth precedes per-key limits.
 type middleware func(http.Handler) http.Handler
 
 func chain(h http.Handler, middlewares ...middleware) http.Handler {
-	// Applied in reverse so the first argument is the outermost layer and the
-	// list reads in request order.
+	// First argument is outermost, matching request order.
 	for i := len(middlewares) - 1; i >= 0; i-- {
 		h = middlewares[i](h)
 	}
 	return h
 }
 
-// Context keys are an unexported type so no other package can collide with
-// them, which is the documented reason not to use a bare string.
+// A private key type prevents collisions with other packages' context values.
 type contextKey int
 
 const (
@@ -48,22 +39,15 @@ func RequestIDFrom(ctx context.Context) string {
 	return id
 }
 
-// APIKeyFrom returns the authenticated caller. The second result is false on an
-// unauthenticated route, so a handler cannot silently treat "nobody" as a
-// caller and attribute a transfer to a zero-valued key.
+// APIKeyFrom returns the authenticated caller and whether one is present.
 func APIKeyFrom(ctx context.Context) (auth.Key, bool) {
 	key, ok := ctx.Value(apiKeyKey).(auth.Key)
 	return key, ok
 }
 
-// withRequestID gives every request an id, echoed in the response header and
-// carried into every log line. It is what lets a caller quoting one line of
-// output be traced through the system.
 func withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Honour an inbound id so a trace survives a proxy, but bound its length
-		// and character set: this value reaches logs, and a caller-supplied
-		// string with newlines in it can forge log entries.
+		// Preserve proxy correlation, but reject values that could forge log entries.
 		id := r.Header.Get("X-Request-Id")
 		if !isSafeRequestID(id) {
 			id = newRequestID()
@@ -75,8 +59,6 @@ func withRequestID(next http.Handler) http.Handler {
 	})
 }
 
-// statusRecorder captures the status code, which http.ResponseWriter does not
-// expose after the fact.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -119,10 +101,7 @@ func withLogging(next http.Handler) http.Handler {
 	})
 }
 
-// withRecovery turns a panic into a 500 rather than a dropped connection. A
-// payments API that silently closes the socket on a nil dereference gives the
-// caller no way to tell "it failed" from "it may have worked" — which is the
-// single most expensive ambiguity in this domain.
+// Report panics without silently dropping the connection; this does not undo a commit.
 func withRecovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -141,9 +120,7 @@ func withRecovery(next http.Handler) http.Handler {
 	})
 }
 
-// withRateLimit caps requests per API key. It runs after auth because the limit
-// is per key: there is nothing to count against until the caller is known, and
-// counting by IP would let one caller behind a NAT exhaust everyone's quota.
+// Per-key limits avoid sharing a quota between unrelated callers behind a NAT.
 func (s *Server) withRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.limiter == nil {
@@ -153,8 +130,7 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 
 		key, ok := APIKeyFrom(r.Context())
 		if !ok {
-			// Unreachable behind withAuth. Failing closed rather than open,
-			// because an unlimited path is worse than a rejected request.
+			// Fail closed if middleware ordering loses the caller.
 			writeError(w, http.StatusUnauthorized, CodeUnauthorized, "no authenticated api key")
 			return
 		}
@@ -165,8 +141,7 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 			return
 		}
 
-		// Sent on every response, not just refusals, so a caller can pace
-		// itself instead of discovering the limit by hitting it.
+		// Include quota on successes too, so callers can pace requests.
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(decision.Limit))
 		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(decision.Remaining))
 		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(decision.ResetAt.Unix(), 10))
@@ -182,9 +157,6 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// withAuth resolves `Authorization: Bearer <key>` to an api_keys row, or 401s.
-// Nothing downstream runs without a caller: the rate limiter counts per key and
-// every transfer records who asked for it.
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		plaintext, ok := bearerToken(r.Header.Get("Authorization"))
@@ -197,9 +169,6 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 		key, err := auth.Verify(r.Context(), s.db, plaintext)
 		switch {
 		case errors.Is(err, auth.ErrRevokedKey):
-			// Distinguished from invalid in the body and the logs, because
-			// "your key was revoked" and "that key never existed" are different
-			// problems for the caller. Both are 401.
 			writeError(w, http.StatusUnauthorized, CodeRevokedKey, "this api key has been revoked")
 			return
 		case errors.Is(err, auth.ErrInvalidKey):
@@ -235,9 +204,7 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// isSafeRequestID accepts a bounded, printable ASCII id. An inbound value goes
-// straight into log lines, so a newline in it would let a caller write their
-// own entries.
+// Request IDs enter logs; accept only bounded alphanumeric, dash and underscore values.
 func isSafeRequestID(id string) bool {
 	if id == "" || len(id) > 64 {
 		return false

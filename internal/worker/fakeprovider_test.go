@@ -9,15 +9,11 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/provider"
 )
 
-// fakeProvider is a rail that can be told to misbehave. The three outcomes only
-// become testable if the provider can time out and reject on demand, which a
-// real sandbox will not do.
+// fakeProvider injects submission and lookup outcomes deterministically.
 type fakeProvider struct {
 	mu sync.Mutex
 
-	// submit decides what Submit returns. Set per test.
 	submit func(req provider.SubmitRequest) (provider.Payment, error)
-	// lookup decides what Get and GetByClientReference return.
 	lookup func(ref string) (provider.Payment, error)
 
 	submitted atomic.Int64
@@ -77,10 +73,8 @@ func (f *fakeProvider) submissionsFor(clientReference string) int {
 	return count
 }
 
-// accepts returns a provider that accepts everything.
 func accepts() *fakeProvider { return &fakeProvider{} }
 
-// rejects returns a provider that declines everything, terminally.
 func rejects(reason string) *fakeProvider {
 	return &fakeProvider{
 		submit: func(provider.SubmitRequest) (provider.Payment, error) {
@@ -89,8 +83,7 @@ func rejects(reason string) *fakeProvider {
 	}
 }
 
-// timesOut returns a provider whose answer never arrives: the instruction may
-// or may not have been received, and nothing can distinguish the two.
+// Simulate an ambiguous submission, not proof the provider did nothing.
 func timesOut() *fakeProvider {
 	return &fakeProvider{
 		submit: func(provider.SubmitRequest) (provider.Payment, error) {
@@ -99,9 +92,7 @@ func timesOut() *fakeProvider {
 	}
 }
 
-// unavailable returns a provider that refuses to consider the request at all.
-// Nothing happened, so this is safe to retry — which is what distinguishes it
-// from a timeout.
+// Simulate the contract's known-unprocessed refusal, unlike an ambiguous timeout.
 func unavailable() *fakeProvider {
 	return &fakeProvider{
 		submit: func(provider.SubmitRequest) (provider.Payment, error) {

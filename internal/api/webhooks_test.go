@@ -14,8 +14,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 )
 
-// sendWebhook posts a provider event. Unauthenticated, because the rail has no
-// api key of ours — phase 6 authenticates it with a signature instead.
+// Provider callbacks bypass customer API-key authentication.
 func sendWebhook(h http.Handler, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest("POST", "/v1/webhooks/mockbank", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -75,7 +74,6 @@ func TestWebhookSettlesATransfer(t *testing.T) {
 		t.Errorf("transfer status = %q, want settled", status)
 	}
 
-	// This is the moment the destination is finally credited.
 	balance, err := ledger.Balance(ctx, testPool, destination)
 	if err != nil {
 		t.Fatalf("balance: %v", err)
@@ -85,7 +83,7 @@ func TestWebhookSettlesATransfer(t *testing.T) {
 	}
 }
 
-// ⭐ Guarantee 4: duplicate provider events never duplicate financial effects.
+// Guarantee 4: duplicate provider events never duplicate financial effects.
 func TestDuplicateWebhookHasOneFinancialEffect(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -95,8 +93,7 @@ func TestDuplicateWebhookHasOneFinancialEffect(t *testing.T) {
 
 	for i := 0; i < 6; i++ {
 		rec := sendWebhook(h, event)
-		// Every delivery is acknowledged. Answering 4xx to a duplicate would
-		// tell the provider to stop retrying an event we may still need.
+		// A duplicate is acknowledged, not treated as a delivery failure.
 		if rec.Code != http.StatusOK {
 			t.Fatalf("delivery %d status = %d, want 200: %s", i, rec.Code, rec.Body.String())
 		}
@@ -131,8 +128,6 @@ func TestDuplicateWebhookHasOneFinancialEffect(t *testing.T) {
 	}
 }
 
-// The same event delivered concurrently, which is what a provider retrying
-// under load actually does.
 func TestConcurrentDuplicateWebhooksHaveOneEffect(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -173,9 +168,7 @@ func TestConcurrentDuplicateWebhooksHaveOneEffect(t *testing.T) {
 	}
 }
 
-// A different event for an already-settled transfer. Deduplication does not
-// catch this one — the status guard in Settle does, which is why there are two
-// defences rather than one.
+// A new event ID bypasses event deduplication; the terminal status guard must still protect money.
 func TestNewEventForASettledTransferMovesNoMoney(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -199,8 +192,6 @@ func TestNewEventForASettledTransferMovesNoMoney(t *testing.T) {
 	}
 }
 
-// A failure event returns the money to the source with a new reversing
-// transaction.
 func TestWebhookFailureReversesTheTransfer(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -224,7 +215,6 @@ func TestWebhookFailureReversesTheTransfer(t *testing.T) {
 		t.Errorf("status = %q, want failed", status)
 	}
 
-	// The money is back, and the destination never received it.
 	sourceBalance, _ := ledger.Balance(ctx, testPool, source)
 	if sourceBalance != 1000000 {
 		t.Errorf("source balance = %d, want 1000000: the money should be returned", sourceBalance)
@@ -247,9 +237,7 @@ func TestWebhookForAnUnknownReferenceAsksForRedelivery(t *testing.T) {
 	}
 }
 
-// The race the contract warns about: the event arrives before the worker has
-// stored the provider reference. The provider echoes our own reference back,
-// which is enough to find the transfer.
+// The echoed client reference must resolve an event arriving before provider_ref is stored.
 func TestWebhookArrivingBeforeTheProviderRefIsStored(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()

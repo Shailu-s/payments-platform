@@ -1,20 +1,11 @@
-// Command mock-bank simulates a bank rail: it accepts payment instructions,
-// answers immediately, and confirms the outcome later by webhook.
-//
-// It is a separate process on its own port with its own in-memory storage, and
-// it has no access to the payments database. That separation is the point: a
-// provider that can read our ledger is a function call wearing an HTTP costume,
-// and none of the failures worth rehearsing — timeouts, duplicate events,
-// settlement arriving before acknowledgement — are real unless the two sides
-// genuinely do not share state.
-//
-// Its behaviour is specified in docs/mockbank-api.md, which was written before
-// either side's code.
+// Command mock-bank simulates the rail contract in docs/mockbank-api.md.
+// It uses independent in-memory state, not the platform database.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,20 +13,26 @@ import (
 	"strconv"
 	"syscall"
 	"time"
-)
 
-const (
-	defaultAddr        = ":8081"
-	defaultWebhookURL  = "http://localhost:8080/v1/webhooks/mockbank"
-	defaultSettleDelay = 2 * time.Second
+	"github.com/Shailu-s/payments-platform/internal/config"
 )
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	addr := envOr("MOCKBANK_ADDR", defaultAddr)
-	webhookURL := envOr("WEBHOOK_URL", defaultWebhookURL)
-	settleDelay := durationEnv("SETTLE_DELAY", defaultSettleDelay)
+	var env config.Env
+	addr := env.Require("MOCKBANK_ADDR")
+	webhookURL := env.Require("WEBHOOK_URL")
+	rawDelay := env.Require("SETTLE_DELAY")
+	if err := env.Err(); err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+	settleDelay, err := parseDuration(rawDelay)
+	if err != nil {
+		slog.Error("SETTLE_DELAY", "error", err)
+		os.Exit(1)
+	}
 
 	server := NewServer(NewStore(), wellBehaved{settleDelay: settleDelay}, webhookURL)
 
@@ -77,25 +74,14 @@ func main() {
 	slog.Info("stopped cleanly")
 }
 
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func durationEnv(name string, fallback time.Duration) time.Duration {
-	v := os.Getenv(name)
-	if v == "" {
-		return fallback
-	}
+// parseDuration accepts a Go duration ("2s", "500ms") or a bare number of
+// milliseconds, which is convenient in tests.
+func parseDuration(v string) (time.Duration, error) {
 	if d, err := time.ParseDuration(v); err == nil {
-		return d
+		return d, nil
 	}
-	// Bare number means milliseconds, which is convenient in tests.
 	if ms, err := strconv.Atoi(v); err == nil {
-		return time.Duration(ms) * time.Millisecond
+		return time.Duration(ms) * time.Millisecond, nil
 	}
-	slog.Warn("unparseable duration, using default", "name", name, "value", v)
-	return fallback
+	return 0, fmt.Errorf("%q is not a duration: use 2s, 500ms, or a number of milliseconds", v)
 }

@@ -1,18 +1,5 @@
-// Package testdb gives each test package its own isolated schema.
-//
-// The constraint: `go test ./...` runs packages in parallel, and every package
-// here truncates tables before each test. Sharing one schema means one package
-// deletes another's rows mid-test, or two truncates deadlock against each
-// other — which is exactly what happened: four packages, foreign key
-// violations and SQLSTATE 40P01.
-//
-// `-p 1` hides it by serialising, but a suite that only passes through a
-// Makefile flag looks broken to anyone who clones the repository and runs the
-// standard command, CI included. It also gets slower with every package added.
-//
-// So each package connects to the same database with its own search_path,
-// migrates into it, and truncates only its own tables. Parallel packages can no
-// longer see each other.
+// Package testdb isolates each test package in its own PostgreSQL schema.
+// Shared tables would let parallel packages truncate each other's fixtures.
 package testdb
 
 import (
@@ -36,11 +23,7 @@ func DSN() string {
 	return defaultDSN
 }
 
-// Connect returns a pool scoped to its own schema, named after the caller's
-// package, with every migration applied inside it.
-//
-// The returned error is for the caller to report: TestMain wants to print the
-// "run make up first" hint rather than have a library decide how to exit.
+// Connect recreates the named test schema, applies migrations, and returns a scoped pool.
 func Connect(ctx context.Context, schema string) (*pgxpool.Pool, error) {
 	if schema == "" {
 		return nil, fmt.Errorf("testdb: a schema name is required")
@@ -51,12 +34,10 @@ func Connect(ctx context.Context, schema string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("testdb: parse %s: %w", DSN(), err)
 	}
 
-	// Set on every connection in the pool, including ones opened later, so a
-	// query can never silently land in public.
+	// Scope every pooled connection, including connections opened later.
 	config.ConnConfig.RuntimeParams["search_path"] = schema
 
-	// The schema has to exist before any pooled connection sets search_path to
-	// it, so this one is created on a connection that does not.
+	// Create the schema before opening connections scoped to it.
 	if err := createSchema(ctx, schema); err != nil {
 		return nil, err
 	}
@@ -87,8 +68,7 @@ func createSchema(ctx context.Context, schema string) error {
 	if err := admin.Ping(ctx); err != nil {
 		return fmt.Errorf("testdb: ping: %w", err)
 	}
-	// Dropped and recreated, so a schema left behind by an interrupted run
-	// cannot carry stale tables into this one.
+	// An interrupted run must not leave stale tables for this run.
 	if _, err := admin.Exec(ctx, fmt.Sprintf(
 		`DROP SCHEMA IF EXISTS %s CASCADE; CREATE SCHEMA %s`, quote(schema), quote(schema))); err != nil {
 		return fmt.Errorf("testdb: create schema %s: %w", schema, err)
@@ -96,9 +76,7 @@ func createSchema(ctx context.Context, schema string) error {
 	return nil
 }
 
-// migrate applies every .up.sql file into the schema, in filename order. The
-// migrate CLI is not used here because it tracks versions per database rather
-// than per schema, and these schemas are disposable.
+// Apply ordered migrations directly: these schemas are disposable and need no version table.
 func migrate(ctx context.Context, schema string) error {
 	pool, err := connectTo(ctx, schema)
 	if err != nil {
@@ -143,10 +121,8 @@ func migrationsDir() string {
 	return filepath.Join(filepath.Dir(thisFile), "..", "..", "db", "migrations")
 }
 
-// TruncateAll empties every table in the schema. The list comes from the
-// catalogue rather than being written by hand, because a hand-written list goes
-// stale the moment a migration adds a table and the failure surfaces as a
-// foreign key error in an unrelated package.
+// TruncateAll discovers and empties the schema's tables, then restores settlement.
+// Catalogue discovery prevents new tables leaking state between tests.
 func TruncateAll(ctx context.Context, pool *pgxpool.Pool, schema string) error {
 	const q = `
 		SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
@@ -163,9 +139,7 @@ func TruncateAll(ctx context.Context, pool *pgxpool.Pool, schema string) error {
 		return fmt.Errorf("testdb: truncate: %w", err)
 	}
 
-	// Migration 000003 creates the settlement account and truncating removes
-	// it, while every transfer credits it. Restored here rather than in each
-	// test, so a forgotten setup cannot make a test pass for the wrong reason.
+	// Every transfer needs the settlement account removed by truncation.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO accounts (id, currency, type) VALUES ('acc_settlement_usd', 'USD', 'settlement')
 		 ON CONFLICT (id) DO NOTHING`); err != nil {
@@ -174,9 +148,6 @@ func TruncateAll(ctx context.Context, pool *pgxpool.Pool, schema string) error {
 	return nil
 }
 
-// quote renders an identifier safely. Schema names here are compile-time
-// constants, but building SQL by concatenation without one is a habit worth not
-// forming.
 func quote(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }

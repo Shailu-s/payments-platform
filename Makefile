@@ -1,7 +1,9 @@
-DB_URL ?= postgres://payments:payments@localhost:5433/payments?sslmode=disable
+# Load .env and export settings to target commands.
+-include .env
+export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender chaos-kill-consumer
 
 up:
 	$(COMPOSE) up -d --wait
@@ -13,40 +15,52 @@ psql:
 	$(COMPOSE) exec postgres psql -U payments -d payments
 
 migrate-up:
-	migrate -path db/migrations -database "$(DB_URL)" up
+	migrate -path db/migrations -database "$(DATABASE_URL)" up
 
 migrate-down:
-	migrate -path db/migrations -database "$(DB_URL)" down 1
+	migrate -path db/migrations -database "$(DATABASE_URL)" down 1
 
 migrate-redo: migrate-down migrate-up
 
-# No -p 1: each package migrates into its own schema (internal/testdb), so
-# parallel packages cannot see each other's tables. `go test ./...` on its own
-# works too, which matters because that is what anyone cloning this runs.
+# Per-package schemas isolate parallel tests; no -p 1 workaround needed.
 test:
 	go test ./... -count=1
 
-# Walk through everything phase 2 built, against a running API.
-# Needs `make run` in another terminal.
+chaos-kill-consumer:
+	@bash scripts/chaos-kill-consumer.sh
+
+# Requires `make run` in another terminal; resets the local database.
 demo:
 	@./scripts/demo.sh
 
 # Send accepted transfers to the provider. Run alongside `make run`.
 worker:
-	@DATABASE_URL="$(DB_URL)" PROVIDER_URL="http://localhost:8081" go run ./cmd/worker
+	@go run ./cmd/worker
 
-# Serve MockBank on :8081. Run it alongside `make run`.
+# Publish outbox events to Kafka. Run alongside `make run`.
+relay:
+	@go run ./cmd/relay
+
+# Print every event from transfers topic
+watch:
+	@go run ./cmd/watch
+
+# Send transfers to MockBank as their events arrive. Run alongside `make run` and `make relay`.
+sender:
+	@go run ./cmd/sender
+
+# Run alongside `make run`; address comes from MOCKBANK_ADDR.
 mock-bank:
-	@WEBHOOK_URL="http://localhost:8080/v1/webhooks/mockbank" go run ./cmd/mock-bank
+	@go run ./cmd/mock-bank
 
-# Serve the API on :8080
+# Address comes from API_ADDR.
 run:
-	@DATABASE_URL="$(DB_URL)" go run ./cmd/api
+	@go run ./cmd/api
 
 # Mint an API key and print it once. NAME is required: `make apikey NAME="local dev"`
 apikey:
-	@DATABASE_URL="$(DB_URL)" go run ./cmd/apikey -name "$(NAME)"
+	@go run ./cmd/apikey -name "$(NAME)"
 
 # List keys. Shows the prefix, never the secret.
 apikeys:
-	@DATABASE_URL="$(DB_URL)" go run ./cmd/apikey -list
+	@go run ./cmd/apikey -list

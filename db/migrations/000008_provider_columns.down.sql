@@ -6,9 +6,7 @@ ALTER TABLE transfers DROP COLUMN IF EXISTS next_attempt_at;
 ALTER TABLE transfers DROP COLUMN IF EXISTS attempt_count;
 ALTER TABLE transfers DROP COLUMN IF EXISTS provider_ref;
 
--- Anything left at 'unresolved' has no representation in the old constraint.
--- Moved to 'processing' rather than dropped: a transfer whose outcome is
--- unknown must not silently become a transfer that never happened.
+-- Preserve unresolved rows when restoring the old status constraint.
 UPDATE transfers SET status = 'processing' WHERE status = 'unresolved';
 
 ALTER TABLE transfers DROP CONSTRAINT transfers_status_check;
