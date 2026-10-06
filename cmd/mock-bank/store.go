@@ -64,7 +64,8 @@ func (s *Store) Submit(p Payment) (stored *Payment, duplicate bool, err error) {
 			existing.Destination != p.Destination {
 			return nil, false, ErrReferenceConflict
 		}
-		return existing, true, nil
+		copied := *existing
+		return &copied, true, nil
 	}
 
 	p.ProviderRef = newProviderRef()
@@ -73,7 +74,8 @@ func (s *Store) Submit(p Payment) (stored *Payment, duplicate bool, err error) {
 
 	s.byProviderRef[p.ProviderRef] = &p
 	s.byClientReference[p.ClientReference] = &p
-	return &p, false, nil
+	copied := p
+	return &copied, false, nil
 }
 
 func (s *Store) ByProviderRef(ref string) (*Payment, error) {
