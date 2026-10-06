@@ -32,9 +32,9 @@ Consequences that are easy to skip and should not be:
 | Timestamps | RFC 3339 with timezone, e.g. `2026-09-22T10:04:11.219Z` |
 | Identifiers | opaque strings. Do not parse them or assume a length |
 
-**Authentication is out of scope for v1.** A real rail would require mutual TLS
-or a signed request. MockBank accepts unauthenticated calls, and the client must
-not be written in a way that makes adding credentials a rewrite.
+**Submission and lookup requests remain unauthenticated in v1.** A real rail
+would require mutual TLS or signed requests. Webhook deliveries are authenticated
+using the shared signing key described below.
 
 ---
 
@@ -235,9 +235,33 @@ need to make.
 If a receiver does not yet recognise the `provider_ref`, `503` is the correct
 answer: it asks for redelivery once the race has resolved.
 
-Signatures are **not** implemented in v1. A receiver must not assume payload
-authenticity, and the endpoint should be written so verification can be added
-without restructuring it.
+### Signature and replay protection
+
+API and MockBank require the same `MOCKBANK_WEBHOOK_SECRET`, a random secret of
+at least 32 bytes. Keep it in local/deployment configuration, never source control.
+A locally generated hex string containing 32 random bytes is suitable; its exact
+string bytes are the HMAC key, not a hex-decoded value.
+
+Each delivery includes:
+
+- `X-MockBank-Timestamp`: delivery time in decimal Unix seconds.
+- `X-MockBank-Signature`: `v1=` followed by the hexadecimal HMAC-SHA256 digest.
+
+The signed bytes are the timestamp header, one ASCII dot, and the **exact raw
+request body**. Verify before JSON decoding or any database lookup. Decoding and
+re-encoding JSON first would change the signed bytes. Compare digests in constant
+time and accept only timestamps within five minutes of the receiver's clock,
+including the five-minute boundary in either direction.
+
+Missing/malformed signatures, wrong keys, altered bodies/timestamps, and timestamps
+outside the window return `401` without recording the event or changing money.
+Bodies are limited to 64 KiB. A valid signature does not bypass payload validation.
+
+`occurred_at` is the event's business time, not the replay clock: an old event may
+be legitimately delivered later. MockBank creates a fresh timestamp/signature for
+each HTTP attempt while keeping the same event ID and body on retries. Replays
+inside the time window are still harmless because event application is atomic
+and deduplicated. Signatures authenticate the payload; they do not encrypt it.
 
 ---
 

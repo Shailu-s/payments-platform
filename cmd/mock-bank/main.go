@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/config"
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 )
 
 func main() {
@@ -24,8 +25,13 @@ func main() {
 	addr := env.Require("MOCKBANK_ADDR")
 	webhookURL := env.Require("WEBHOOK_URL")
 	rawDelay := env.Require("SETTLE_DELAY")
+	webhookSecret := env.Require("MOCKBANK_WEBHOOK_SECRET")
 	if err := env.Err(); err != nil {
 		slog.Error(err.Error())
+		os.Exit(1)
+	}
+	if len(webhookSecret) < webhooks.MinSecretBytes {
+		slog.Error("MOCKBANK_WEBHOOK_SECRET must contain at least 32 bytes")
 		os.Exit(1)
 	}
 	settleDelay, err := parseDuration(rawDelay)
@@ -34,7 +40,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	server := NewServer(NewStore(), wellBehaved{settleDelay: settleDelay}, webhookURL)
+	server := NewServer(NewStore(), wellBehaved{settleDelay: settleDelay}, webhookURL, []byte(webhookSecret))
 
 	srv := &http.Server{
 		Addr:              addr,

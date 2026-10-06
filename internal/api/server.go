@@ -22,8 +22,9 @@ type DB interface {
 }
 
 type Server struct {
-	db      DB
-	limiter *ratelimit.Limiter
+	db            DB
+	limiter       *ratelimit.Limiter
+	webhookSecret []byte
 }
 
 const (
@@ -36,10 +37,11 @@ const (
 	sweepRetention = time.Hour
 )
 
-func NewServer(pool *pgxpool.Pool) *Server {
+func NewServer(pool *pgxpool.Pool, webhookSecret []byte) *Server {
 	return &Server{
-		db:      pool,
-		limiter: ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
+		db:            pool,
+		limiter:       ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
+		webhookSecret: append([]byte(nil), webhookSecret...),
 	}
 }
 
@@ -61,7 +63,7 @@ func (s *Server) Handler() http.Handler {
 	// Readiness removes an instance from traffic when the database is unavailable.
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	// Provider callbacks bypass customer API keys; signature verification is not yet implemented.
+	// Provider callbacks use their signing key, not a customer API key.
 	mux.HandleFunc("POST /v1/webhooks/mockbank", s.handleProviderWebhook)
 
 	authenticated := chain(s.routes(), s.withAuth, s.withRateLimit)

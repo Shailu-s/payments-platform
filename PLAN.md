@@ -13,8 +13,10 @@ on a portfolio commit).
 **Changed 2026-10-05: Claude writes, Shailendra reviews and explains.**
 
 - Claude writes each piece into the repo in small, tested changes before it is shown.
-- Before review, explain in plain, short steps: the constraint and why we need the piece,
-  what changed, how the actual code/data flow works, the failure tests, and the cost.
+- Before review, explain conversationally with a concrete payment example: the constraint
+  and why we need the piece, what changed, actual code/data flow, failure tests and cost.
+  Give enough detail to understand, one concept at a time; terse file lists or compressed
+  summaries are not a substitute for a human explanation (clarified 2026-10-06).
 - He reads every diff and **explains the logic back in his own words before any commit or
   push**. Resolve confusion and obtain explicit approval; understanding only the feature
   summary is not enough. Approval of an earlier piece does not cover later changes.
@@ -772,3 +774,24 @@ second delivery processes after rollback, and rejection of the outer COMMIT undo
 event and ledger changes. Failure tests/cost explained; explicit commit/push approval given.
 Next piece: inbound HMAC signature and replay window, tested then explained before any
 further commit/push.
+
+**2026-10-06 — atomicity pushed; inbound HMAC/replay slice tested, awaiting code review.**
+Approved atomicity commit `4a19435` is on origin/phase-6-webhooks. Added HMAC-SHA256 over
+signed delivery timestamp + dot + raw body, an inclusive five-minute clock window, and
+verification before JSON/DB work. MockBank signs each retry afresh. First red test showed
+an unsigned request crediting 50000 cents; it now returns 401 without an event or credit.
+Matching/mismatched-key real-handler HTTP tests, full tests, vet, formatting and targeted
+race tests pass. Expanded race checks also exposed a pre-existing live-pointer response
+bug in MockBank Submit; snapshot returns and a failing-first regression fix it.
+HMAC/snapshot changes remain uncommitted pending explanation/understanding/approval.
+Required local signing key and safe MockBank rollout are pending user action; no secret
+values exposed, local .env edited or containers restarted. Outbound delivery remains next.
+
+**2026-10-06 — inbound signing reviewed; commit/push approved.** Explained the shared-key
+HMAC, raw input, signed freshness timestamp, duplicate handling and the full function flow.
+He correctly explained that changing a captured request's timestamp while retaining its
+signature fails verification because the timestamp is signed. Explicit push approval was
+given. Snapshot race fix committed separately as `ca783e5`; signing/config/tests follow in
+the next commit. Local key configuration and container rollout remain pending, not silently
+performed. The next feature is outbound customer delivery with retries/backoff/DLQ status;
+manual replay and delivery history remain cut.

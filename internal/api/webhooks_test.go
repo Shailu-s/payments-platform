@@ -4,20 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/ledger"
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 )
+
+const testWebhookSecret = "test-only-webhook-secret-never-use-in-production"
 
 // Provider callbacks bypass customer API-key authentication.
 func sendWebhook(h http.Handler, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest("POST", "/v1/webhooks/mockbank", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	req.Header.Set(webhooks.TimestampHeader, timestamp)
+	req.Header.Set(webhooks.SignatureHeader, webhooks.Sign([]byte(testWebhookSecret), timestamp, []byte(body)))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -80,6 +89,109 @@ func TestWebhookSettlesATransfer(t *testing.T) {
 	}
 	if balance != 50000 {
 		t.Errorf("destination balance = %d, want 50000", balance)
+	}
+}
+
+func TestUnsignedWebhookCannotMoveMoney(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	id, _, destination := sentTransfer(t, h, apiKey, "mb_unsigned")
+	req := httptest.NewRequest("POST", "/v1/webhooks/mockbank", strings.NewReader(eventFor("evt_unsigned", "mb_unsigned", id, "settled")))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("unsigned webhook = %d, want 401", rec.Code)
+	}
+	if got := countRows(t, "webhook_events"); got != 0 {
+		t.Errorf("unsigned webhook recorded %d events, want 0", got)
+	}
+	balance, err := ledger.Balance(context.Background(), testPool, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if balance != 0 {
+		t.Errorf("unsigned webhook credited %d, want 0", balance)
+	}
+}
+
+func TestWebhookRejectsInvalidSignaturesWithoutEffects(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*http.Request, string)
+	}{
+		{"missing timestamp", func(r *http.Request, _ string) { r.Header.Del(webhooks.TimestampHeader) }},
+		{"missing signature", func(r *http.Request, _ string) { r.Header.Del(webhooks.SignatureHeader) }},
+		{"wrong key", func(r *http.Request, body string) {
+			r.Header.Set(webhooks.SignatureHeader, webhooks.Sign([]byte(strings.Repeat("x", 32)), r.Header.Get(webhooks.TimestampHeader), []byte(body)))
+		}},
+		{"altered timestamp", func(r *http.Request, _ string) {
+			r.Header.Set(webhooks.TimestampHeader, strconv.FormatInt(time.Now().Unix()+60, 10))
+		}},
+		{"old timestamp", func(r *http.Request, body string) {
+			timestamp := strconv.FormatInt(time.Now().Unix()-600, 10)
+			r.Header.Set(webhooks.TimestampHeader, timestamp)
+			r.Header.Set(webhooks.SignatureHeader, webhooks.Sign([]byte(testWebhookSecret), timestamp, []byte(body)))
+		}},
+		{"future timestamp", func(r *http.Request, body string) {
+			timestamp := strconv.FormatInt(time.Now().Unix()+600, 10)
+			r.Header.Set(webhooks.TimestampHeader, timestamp)
+			r.Header.Set(webhooks.SignatureHeader, webhooks.Sign([]byte(testWebhookSecret), timestamp, []byte(body)))
+		}},
+		{"malformed signature", func(r *http.Request, _ string) { r.Header.Set(webhooks.SignatureHeader, "v1="+strings.Repeat("g", 64)) }},
+		{"altered body whitespace", func(r *http.Request, body string) {
+			r.Body = io.NopCloser(strings.NewReader(body + " "))
+			r.ContentLength = int64(len(body) + 1)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, apiKey := newTestServer(t)
+			id, _, destination := sentTransfer(t, h, apiKey, "mb_signature")
+			body := eventFor("evt_signature", "mb_signature", id, "settled")
+			req := httptest.NewRequest("POST", "/v1/webhooks/mockbank", strings.NewReader(body))
+			timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+			req.Header.Set(webhooks.TimestampHeader, timestamp)
+			req.Header.Set(webhooks.SignatureHeader, webhooks.Sign([]byte(testWebhookSecret), timestamp, []byte(body)))
+			tc.mutate(req, body)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401: %s", rec.Code, rec.Body.String())
+			}
+			if got := countRows(t, "webhook_events"); got != 0 {
+				t.Errorf("invalid signature recorded %d events, want 0", got)
+			}
+			balance, err := ledger.Balance(context.Background(), testPool, destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if balance != 0 {
+				t.Errorf("invalid signature credited %d, want 0", balance)
+			}
+		})
+	}
+}
+
+func TestWebhookAuthenticatesBeforeJSONOrDatabase(t *testing.T) {
+	h := (&Server{webhookSecret: []byte(testWebhookSecret)}).Handler()
+	for _, body := range []string{"not json", eventFor("evt_untrusted", "mb_untrusted", "tr_untrusted", "settled")} {
+		req := httptest.NewRequest("POST", "/v1/webhooks/mockbank", strings.NewReader(body))
+		req.Header.Set(webhooks.TimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
+		req.Header.Set(webhooks.SignatureHeader, "v1="+strings.Repeat("0", 64))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("untrusted request = %d, want 401 before parsing or touching the nil DB", rec.Code)
+		}
+	}
+}
+
+func TestWebhookBodyLimitStillAppliesWithValidSignature(t *testing.T) {
+	h, _ := newTestServer(t)
+	if rec := sendWebhook(h, strings.Repeat("x", (64<<10)+1)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized signed body = %d, want 413", rec.Code)
+	}
+	if got := countRows(t, "webhook_events"); got != 0 {
+		t.Errorf("oversized request recorded %d events, want 0", got)
 	}
 }
 

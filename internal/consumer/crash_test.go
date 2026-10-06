@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,13 +26,17 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/relay"
 	"github.com/Shailu-s/payments-platform/internal/testdb"
 	"github.com/Shailu-s/payments-platform/internal/transfers"
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 	"github.com/Shailu-s/payments-platform/internal/worker"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-const crashBrokers = "localhost:9092"
+const (
+	crashBrokers       = "localhost:9092"
+	crashWebhookSecret = "test-only-webhook-secret-never-use-in-production"
+)
 
 // Guarantee 7: SIGKILL before offset commit redelivers an accepted payment without sending it twice.
 func TestSenderSIGKILLRedeliversWithoutDuplicatePayment(t *testing.T) {
@@ -363,7 +368,7 @@ func newCrashFixture(t *testing.T, count int) *crashFixture {
 	if err := auth.Insert(ctx, f.pool, key); err != nil {
 		t.Fatal(err)
 	}
-	f.handler = api.NewServer(f.pool).Handler()
+	f.handler = api.NewServer(f.pool, []byte(crashWebhookSecret)).Handler()
 	for i := 0; i < count; i++ {
 		req := httptest.NewRequest("POST", "/v1/transfers", strings.NewReader(`{"source_account":"acc_src","destination_account":"acc_dst","amount":1000,"currency":"USD"}`))
 		req.Header.Set("Authorization", "Bearer "+plaintext)
@@ -409,8 +414,12 @@ func (f *crashFixture) settleAndAssertOnce(t *testing.T, ctx context.Context) {
 	t.Helper()
 	for _, id := range f.ids {
 		payload := fmt.Sprintf(`{"event_id":"evt_%s","provider_ref":"mb_%s","client_reference":"%s","status":"settled","amount":1000,"currency":"USD"}`, id, id, id)
+		req := httptest.NewRequest("POST", "/v1/webhooks/mockbank", strings.NewReader(payload))
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		req.Header.Set(webhooks.TimestampHeader, timestamp)
+		req.Header.Set(webhooks.SignatureHeader, webhooks.Sign([]byte(crashWebhookSecret), timestamp, []byte(payload)))
 		rec := httptest.NewRecorder()
-		f.handler.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/webhooks/mockbank", strings.NewReader(payload)))
+		f.handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("settle %s: %d %s", id, rec.Code, rec.Body.String())
 		}

@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/transfers"
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 	"github.com/jackc/pgx/v5"
 )
 
 // Delivery is at least once and unordered; events may precede stored provider references.
-// This endpoint does not yet verify signatures or enforce a replay window.
+// Signed delivery timestamps bound replay age; event IDs prevent duplicate effects.
 type providerEvent struct {
 	EventID         string    `json:"event_id"`
 	ProviderRef     string    `json:"provider_ref"`
@@ -26,8 +28,23 @@ type providerEvent struct {
 }
 
 func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		status := http.StatusBadRequest
+		if errors.As(err, &maxErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeError(w, status, CodeInvalidRequest, "could not read webhook body")
+		return
+	}
+	if !webhooks.Verify(s.webhookSecret, r.Header.Get(webhooks.TimestampHeader),
+		r.Header.Get(webhooks.SignatureHeader), body, time.Now()) {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "invalid webhook signature or timestamp")
+		return
+	}
 	var event providerEvent
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&event); err != nil {
+	if err := json.Unmarshal(body, &event); err != nil {
 		// Malformed events cannot be fixed by redelivery.
 		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "event body is not valid json")
 		return

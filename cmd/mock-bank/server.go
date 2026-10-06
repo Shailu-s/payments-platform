@@ -9,28 +9,33 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 )
 
 type Server struct {
-	store      *Store
-	behaviour  Behaviour
-	webhookURL string
-	client     *http.Client
+	store         *Store
+	behaviour     Behaviour
+	webhookURL    string
+	webhookSecret []byte
+	client        *http.Client
 
 	// Tracked so shutdown can wait for in-flight webhook deliveries rather
 	// than cutting them off mid-send.
 	pending sync.WaitGroup
 }
 
-func NewServer(store *Store, behaviour Behaviour, webhookURL string) *Server {
+func NewServer(store *Store, behaviour Behaviour, webhookURL string, webhookSecret []byte) *Server {
 	return &Server{
-		store:      store,
-		behaviour:  behaviour,
-		webhookURL: webhookURL,
-		client:     &http.Client{Timeout: 10 * time.Second},
+		store:         store,
+		behaviour:     behaviour,
+		webhookURL:    webhookURL,
+		webhookSecret: append([]byte(nil), webhookSecret...),
+		client:        &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -197,6 +202,9 @@ func (s *Server) deliverOnce(event webhookEvent, body []byte) {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-MockBank-Event-Id", event.EventID)
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		req.Header.Set(webhooks.TimestampHeader, timestamp)
+		req.Header.Set(webhooks.SignatureHeader, webhooks.Sign(s.webhookSecret, timestamp, body))
 
 		resp, err := s.client.Do(req)
 		if err == nil {
