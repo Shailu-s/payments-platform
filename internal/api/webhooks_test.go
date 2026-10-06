@@ -263,6 +263,89 @@ func TestWebhookArrivingBeforeTheProviderRefIsStored(t *testing.T) {
 	}
 }
 
+// Guarantee 4: a failed webhook attempt can retry without losing or duplicating its effect.
+func TestWebhookRetriesAfterFailedTransaction(t *testing.T) {
+	for _, failure := range []string{"ledger_write", "commit"} {
+		for _, status := range []string{"settled", "failed"} {
+			t.Run(failure+"/"+status, func(t *testing.T) {
+				h, apiKey := newTestServer(t)
+				ctx := context.Background()
+				id, source, destination := sentTransfer(t, h, apiKey, "mb_retry")
+				event := eventFor("evt_retry", "mb_retry", id, status)
+				table := "ledger_entries"
+				trigger := `CREATE TRIGGER fail_webhook_effect BEFORE INSERT ON ledger_entries
+					FOR EACH ROW EXECUTE FUNCTION fail_webhook_effect();`
+				if failure == "commit" {
+					table = "webhook_events"
+					trigger = `CREATE CONSTRAINT TRIGGER fail_webhook_effect AFTER INSERT ON webhook_events
+						DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_webhook_effect();`
+				}
+				if _, err := testPool.Exec(ctx, `
+					CREATE FUNCTION fail_webhook_effect() RETURNS trigger LANGUAGE plpgsql AS $$
+					BEGIN
+						RAISE EXCEPTION 'injected webhook failure';
+					END $$;`+trigger); err != nil {
+					t.Fatal(err)
+				}
+				removeFailure := func() {
+					if _, err := testPool.Exec(ctx, `DROP TRIGGER IF EXISTS fail_webhook_effect ON `+table+`;
+						DROP FUNCTION IF EXISTS fail_webhook_effect();`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				t.Cleanup(removeFailure)
+				if rec := sendWebhook(h, event); rec.Code != http.StatusInternalServerError {
+					t.Fatalf("failed attempt = %d, want 500: %s", rec.Code, rec.Body.String())
+				}
+				var events int
+				if err := testPool.QueryRow(ctx, `SELECT count(*) FROM webhook_events WHERE event_id = 'evt_retry'`).Scan(&events); err != nil {
+					t.Fatal(err)
+				}
+				if events != 0 {
+					t.Errorf("failed attempt left %d dedupe events, want 0", events)
+				}
+				var storedStatus string
+				if err := testPool.QueryRow(ctx, `SELECT status FROM transfers WHERE id = $1`, id).Scan(&storedStatus); err != nil {
+					t.Fatal(err)
+				}
+				if storedStatus != "processing" {
+					t.Errorf("status after failure = %q, want processing", storedStatus)
+				}
+				removeFailure()
+				for i := 0; i < 2; i++ {
+					if rec := sendWebhook(h, event); rec.Code != http.StatusOK {
+						t.Fatalf("retry %d = %d, want 200: %s", i, rec.Code, rec.Body.String())
+					}
+				}
+				if err := testPool.QueryRow(ctx, `SELECT status FROM transfers WHERE id = $1`, id).Scan(&storedStatus); err != nil {
+					t.Fatal(err)
+				}
+				if storedStatus != status {
+					t.Errorf("status after retry = %q, want %q", storedStatus, status)
+				}
+				account, want, reference := destination, int64(50000), "settlement "+id
+				if status == "failed" {
+					account, want, reference = source, 1000000, "reversal "+id
+				}
+				balance, err := ledger.Balance(ctx, testPool, account)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if balance != want {
+					t.Errorf("balance after retry = %d, want %d", balance, want)
+				}
+				var movements int
+				if err := testPool.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions WHERE reference = $1`, reference).Scan(&movements); err != nil {
+					t.Fatal(err)
+				}
+				if movements != 1 {
+					t.Errorf("financial effects after retries = %d, want 1", movements)
+				}
+			})
+		}
+	}
+}
+
 func TestWebhookRejectsMalformedEvents(t *testing.T) {
 	h, _ := newTestServer(t)
 

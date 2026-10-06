@@ -12,9 +12,13 @@ on a portfolio commit).
 
 **Changed 2026-10-05: Claude writes, Shailendra reviews and explains.**
 
-- Claude writes each piece into the repo in small commits, tested before it is shown.
-- He reads every diff and **explains it back in his own words before it is committed** — what
-  it does, the constraint that forces it, and the cost. No explanation, no commit.
+- Claude writes each piece into the repo in small, tested changes before it is shown.
+- Before review, explain in plain, short steps: the constraint and why we need the piece,
+  what changed, how the actual code/data flow works, the failure tests, and the cost.
+- He reads every diff and **explains the logic back in his own words before any commit or
+  push**. Resolve confusion and obtain explicit approval; understanding only the feature
+  summary is not enough. Approval of an earlier piece does not cover later changes.
+  **Reaffirmed 2026-10-06: no understanding, no commit or push.**
 - He still types **one interview-critical piece per phase** by hand.
 - **Why the change:** through phase 5 the old method (Claude instructs, he types everything)
   roughly doubled the time per feature — code was written, verified, pasted, retyped, then
@@ -722,3 +726,49 @@ production rebalance or MockBank settlement-latency measurement. The earlier pro
 acceptance/reference-persistence crash window and webhook two-commit gap remain documented
 limits. The user explained the two failure scenarios and approved the commit. Next is
 phase 6, starting with atomic webhook deduplication/application before HMAC verification.
+
+**2026-10-05 — phase 5 committed; first phase 6 fix tested, awaiting review.** Commit
+`b722f5a` contains the failure demonstrations (now pushed in PR #5). Reproduced the inbound
+webhook split-commit bug: HTTP 500 left the event marked seen, so retries skipped the
+financial effect. Event recording, state transition and ledger now share one transaction;
+duplicates use ON CONFLICT DO NOTHING without aborting it. Regression tests cover ledger
+write and final COMMIT failure for settlement and refund, then retry and duplicate delivery.
+Build, full tests, vet and targeted race tests passed. The fix is uncommitted. Next: review,
+then inbound HMAC/replay protection; outbound retries/backoff/DLQ remains after that.
+
+**2026-10-05 — phase 5 PR opened; phase 6 paused until merge.** User clarified that each
+phase's PR must merge into main before the next phase begins. Pushed through `e74a0aa`,
+including phase-5 proofs and a separate formatting-only cleanup, and opened PR #5 with gh:
+https://github.com/Shailu-s/payments-platform/pull/5. Verified the committed phase-5 snapshot
+in an isolated worktree: build, full tests, vet, SIGKILL race test and formatting checks pass.
+PR is open, not merged. Phase-6 source edits and this later log remain uncommitted and are
+excluded from the PR. Next: review/merge phase 5, then preserve those edits on a new phase-6
+branch before continuing. Local CLAUDE.md now explicitly records the merge gate.
+
+**2026-10-05 — user merged PR #5; stopping until the next session.** Verified GitHub main
+at `9d0639545161581d815cbdc9fcbc22ef683ab0ca`. Phase 5 is merged. Phase-6 atomicity edits
+remain local and uncommitted; no branch switch or further feature work. Next session:
+create a phase-6 branch from updated main without losing those edits, review/commit the
+atomicity fix, then inbound HMAC/replay protection and outbound retries/backoff/DLQ.
+
+**2026-10-06 — working method reaffirmed before resuming phase 6.** For each piece, explain
+the constraint/why, what changed, actual code/data flow, tests and cost in short steps.
+Confirm understanding through explain-back and resolve confusion before explicit approval
+for any commit or push. Project docs/memory reread; phase 5 merge and preserved phase-6
+edits verified. Only workflow documentation changed; no new application code or Git action.
+Next: time budget, safe phase-6 branch setup, then explain the prepared atomicity fix.
+
+**2026-10-06 — phase-6 branch created safely; first fix ready for code review.** With more
+than 3 hours available, created phase-6-webhooks from merged origin/main at 9d06395 after
+checking tree equality; preserved all existing edits. Re-verified the prepared atomicity
+fix with build, full tests, vet and targeted race tests. No new feature code or commit/push.
+Next: explain the actual transaction/duplicate/rollback code and confirm understanding
+before approval; HMAC/replay work waits until that piece is reviewed.
+
+**2026-10-06 — atomic webhook fix reviewed and approved for commit/push.** Walked through
+shared transaction/rollback, INSERT ON CONFLICT and its row-count result, and pgx savepoints.
+He explained that a rolled-back attempt leaves the retry as a first attempt, a waiting
+second delivery processes after rollback, and rejection of the outer COMMIT undoes both
+event and ledger changes. Failure tests/cost explained; explicit commit/push approval given.
+Next piece: inbound HMAC signature and replay window, tested then explained before any
+further commit/push.
