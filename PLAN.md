@@ -795,3 +795,22 @@ given. Snapshot race fix committed separately as `ca783e5`; signing/config/tests
 the next commit. Local key configuration and container rollout remain pending, not silently
 performed. The next feature is outbound customer delivery with retries/backoff/DLQ status;
 manual replay and delivery history remain cut.
+
+**2026-10-06 — outbound slice 1: terminal events ready, awaiting code review.** First
+watched the missing-event test fail: settled/failed transfers had no completion outbox row.
+Shared Settle/Fail now write transfer.settled/transfer.failed with a six-field public payload
+on the same transaction as state/ledger effects. Duplicate/concurrent/conflicting callbacks
+emit no additional completion event. Outbox-insert and final-commit failures leave no orphan
+notification; retries succeed after recovery. Build, full tests, vet and targeted race
+checks pass. No new schema, settings or broker. Changes uncommitted pending explanation
+and approval; customer delivery consumer/retries/DLQ are the following slices. Private
+signing-key setup and safe runtime rollout remain pending; no service was restarted.
+
+**2026-10-06 — terminal-event explanation reviewed; commit/push approved.** Used the
+customer invoice example and walked through shared Settle/Fail plus the event writer.
+He explained that an outbox insert failure rolls back our attempted status/ledger changes,
+allowing the callback to retry. Clarified that only actual final transitions emit, the
+bank's payment is not rolled back, and MockBank's finite in-memory retry is the current
+redelivery source (not a durable inbound inbox). He explicitly approved commit/push and
+building customer delivery next. Customer HTTP outages must retry notification work only,
+never undo or resend the payment; replay/history remain outside scope.

@@ -269,6 +269,9 @@ func TestConcurrentDuplicateWebhooksHaveOneEffect(t *testing.T) {
 	if got := accepted.Load(); got != deliveries {
 		t.Errorf("%d of %d deliveries acknowledged, want all", got, deliveries)
 	}
+	if got := countRows(t, "outbox_events"); got != 2 {
+		t.Errorf("concurrent deliveries produced %d outbox rows, want creation plus one terminal", got)
+	}
 
 	balance, err := ledger.Balance(ctx, testPool, destination)
 	if err != nil {
@@ -416,6 +419,9 @@ func TestWebhookRetriesAfterFailedTransaction(t *testing.T) {
 				if events != 0 {
 					t.Errorf("failed attempt left %d dedupe events, want 0", events)
 				}
+				if got := countRows(t, "outbox_events"); got != 1 {
+					t.Errorf("failed attempt left %d outbox rows, want only the creation event", got)
+				}
 				var storedStatus string
 				if err := testPool.QueryRow(ctx, `SELECT status FROM transfers WHERE id = $1`, id).Scan(&storedStatus); err != nil {
 					t.Fatal(err)
@@ -452,6 +458,9 @@ func TestWebhookRetriesAfterFailedTransaction(t *testing.T) {
 				}
 				if movements != 1 {
 					t.Errorf("financial effects after retries = %d, want 1", movements)
+				}
+				if got := countRows(t, "outbox_events"); got != 2 {
+					t.Errorf("retry left %d outbox rows, want creation plus terminal", got)
 				}
 			})
 		}

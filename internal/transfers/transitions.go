@@ -33,11 +33,11 @@ func Settle(ctx context.Context, db Beginner, transferID string) error {
 		UPDATE transfers
 		SET status = 'settled', updated_at = now()
 		WHERE id = $1 AND status IN ('processing', 'unresolved')
-		RETURNING source_account, destination_account, amount`
+		RETURNING source_account, destination_account, amount, currency`
 
-	var source, destination string
+	var source, destination, currency string
 	var amount int64
-	err = tx.QueryRow(ctx, claim, transferID).Scan(&source, &destination, &amount)
+	err = tx.QueryRow(ctx, claim, transferID).Scan(&source, &destination, &amount, &currency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No eligible transition, including duplicates; acknowledge without another effect.
 		slog.InfoContext(ctx, "settle ignored, transfer is already terminal",
@@ -55,6 +55,12 @@ func Settle(ctx context.Context, db Beginner, transferID string) error {
 		return fmt.Errorf("settle %s: %w", transferID, err)
 	}
 
+	if err := insertTerminalEvent(ctx, tx, TerminalEvent{
+		TransferID: transferID, Status: StatusSettled, Amount: amount, Currency: currency,
+		SourceAccount: source, DestinationAccount: destination,
+	}); err != nil {
+		return fmt.Errorf("settlement event %s: %w", transferID, err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit settle %s: %w", transferID, err)
 	}
@@ -76,11 +82,11 @@ func Fail(ctx context.Context, db Beginner, transferID, reason string) error {
 		UPDATE transfers
 		SET status = 'failed', last_error = $2, updated_at = now()
 		WHERE id = $1 AND status IN ('processing', 'unresolved')
-		RETURNING source_account, amount`
+		RETURNING source_account, destination_account, amount, currency`
 
-	var source string
+	var source, destination, currency string
 	var amount int64
-	err = tx.QueryRow(ctx, claim, transferID, truncate(reason, 500)).Scan(&source, &amount)
+	err = tx.QueryRow(ctx, claim, transferID, truncate(reason, 500)).Scan(&source, &destination, &amount, &currency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		slog.InfoContext(ctx, "fail ignored, transfer is already terminal",
 			"transfer_id", transferID)
@@ -97,6 +103,12 @@ func Fail(ctx context.Context, db Beginner, transferID, reason string) error {
 		return fmt.Errorf("reverse %s: %w", transferID, err)
 	}
 
+	if err := insertTerminalEvent(ctx, tx, TerminalEvent{
+		TransferID: transferID, Status: StatusFailed, Amount: amount, Currency: currency,
+		SourceAccount: source, DestinationAccount: destination,
+	}); err != nil {
+		return fmt.Errorf("failure event %s: %w", transferID, err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit fail %s: %w", transferID, err)
 	}

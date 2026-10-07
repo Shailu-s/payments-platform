@@ -167,8 +167,8 @@ func TestPollerSettlesWithKafkaUnavailable(t *testing.T) {
 	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE published_at IS NULL`).Scan(&unpublished); err != nil {
 		t.Fatal(err)
 	}
-	if unpublished != 1 {
-		t.Errorf("unpublished events = %d, want 1 while Kafka is down", unpublished)
+	if unpublished != 2 {
+		t.Errorf("unpublished events = %d, want creation and settlement while Kafka is down", unpublished)
 	}
 	t.Logf("Kafka unavailable: transfer settled via poller in %s, one provider submission, event retained in outbox", elapsed.Round(time.Millisecond))
 }

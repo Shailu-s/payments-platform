@@ -119,6 +119,13 @@ func TestRejectedTransferIsReversed(t *testing.T) {
 	if got := statusOf(t, id); got != "failed" {
 		t.Fatalf("status = %q, want failed", got)
 	}
+	var events int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'transfer.failed'`, id).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Errorf("provider rejection produced %d failure events, want 1", events)
+	}
 
 	if got := balanceOf(t, "acc_src"); got != before+50000 {
 		t.Errorf("source balance = %d, want %d: the money was not returned", got, before+50000)
