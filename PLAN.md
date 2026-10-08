@@ -814,3 +814,28 @@ bank's payment is not rolled back, and MockBank's finite in-memory retry is the 
 redelivery source (not a durable inbound inbox). He explicitly approved commit/push and
 building customer delivery next. Customer HTTP outages must retry notification work only,
 never undo or resend the payment; replay/history remain outside scope.
+
+**2026-10-07 — terminal events pushed; customer delivery ready for review, not committed.**
+Pushed approved terminal-event commit 3718b8c before writing delivery code. Added migration
+000011 and internal/customerwebhooks: consumer durably saves one current delivery per event
+before offset acknowledgment; a separate DB loop sends signed notifications to one configured
+customer URL. Stable envelope event_id/event_type/data, X-Payments-Event-Id/Timestamp/Signature
+headers, separate required customer key. Retry transport/timeout/5xx/408/429 with exponential
+backoff; permanent errors/exhaustion record dead status. Persisted leases/attempt fences
+survive worker restart and block stale response overwrites. Response loss can replay, so
+customers must deduplicate by event ID. No history/replay API or additional broker/DLQ topic.
+Red/green tests, actual outbox→Kafka→consumer→customer 503/recovery proof, full build/tests/vet
+and relevant full race suites pass without additional ledger effects. New make webhook-sender
+command uses independent customer-webhooks group and drains existing jobs even if Kafka
+startup ping fails. Local env, primary schema and running services untouched. Outbound code
+uncommitted pending teaching/explain-back/handwritten piece and approval. Private config,
+safe rollout, phase-6 PR and merge remain before phase 7.
+
+**2026-10-07 — customer delivery flow reviewed; commit/push approved.** Explained the
+actual relay→Kafka→customer consumer→delivery table→HTTP worker path and where each function
+lives. He initially applied recovery to the unsafe acknowledge-before-save hypothetical;
+clarified no job would exist there. He then correctly identified saving the pending delivery
+in DB as the step required before Kafka acknowledgment. Explicit commit/push request given.
+Delivery engine/schema/proofs committed as 015941b; command/env wiring follows separately.
+No local migration, private-config edit, service restart or external endpoint call performed.
+The handwritten claim/retry piece and final local rollout/PR review remain pending.
