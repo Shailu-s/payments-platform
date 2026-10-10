@@ -45,6 +45,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /transfers", s.handleSubmit)
 	mux.HandleFunc("GET /transfers/{ref}", s.handleGetByProviderRef)
 	mux.HandleFunc("GET /transfers", s.handleGetByClientReference)
+	mux.HandleFunc("GET /settlements", s.handleSettlements)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
