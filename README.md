@@ -4,8 +4,8 @@ Payment infrastructure: a backend platform for moving money reliably through ext
 payment providers. It maintains its own double-entry ledger and stays correct under retries,
 concurrency, duplicate events, provider failures, and reconciliation mismatches.
 
-**Status: phases 1–4 done (ledger, transfer API, idempotency and concurrency, provider
-simulator). Phase 5 (Kafka and the transactional outbox) in progress.** See [PLAN.md](PLAN.md).
+**Status: phases 1–6 merged. Phase 7 (reconciliation) is implemented on
+`phase-7-reconciliation`, pending review and merge.** See [PLAN.md](PLAN.md).
 
 ---
 
@@ -118,6 +118,92 @@ If `kafka-init` failed, its output says why:
 ```sh
 docker logs $(docker ps -aqf name=kafka-init)
 ```
+
+## Reconciliation
+
+Apply migration 12 with `make migrate-up`. MockBank must be running the new source/image
+with `GET /settlements`; rebuilding an existing MockBank container discards its in-memory
+history, so do not use a restart to make an old report appear clean.
+
+```sh
+make reconcile
+make reconcile ARGS='-report bank.csv -run-id run_001'
+make reconcile ARGS='-report bank.csv -run-id run_001'
+make reconcile ARGS='-list'
+make reconcile ARGS='-inspect run_001 -classification AMOUNT_MISMATCH'
+make reconcile ARGS='-inspect run_001 -client-reference tr_example'
+make reconcile ARGS='-interval 24h'
+```
+
+The command reads `DATABASE_URL` and, for downloads, `PROVIDER_URL`. A recurring process
+must be supervised by the operator; it stops on SIGINT/SIGTERM and logs failed attempts.
+It runs immediately, then waits the interval after each attempt. It is not a durable
+scheduler and its next deadline is not retained across restart.
+
+Authenticated read-only routes (same API-key/rate-limit middleware as transfers):
+
+```text
+GET /v1/reconciliation/runs?limit=25&offset=0
+GET /v1/reconciliation/runs/{id}
+GET /v1/reconciliation/runs/{id}/findings?classification=AMOUNT_MISMATCH&client_reference=tr_example
+```
+
+Each run atomically retains the raw provider CSV, its SHA-256, a consistent read-only
+Repeatable Read internal snapshot, both capture times, six finding counts, and the full
+original evidence. Results are append-only at the database level. The same run ID and exact
+report bytes return the original run even if transfers subsequently change; different bytes
+with that ID are rejected. A new ID deliberately captures a new internal snapshot.
+Malformed/oversized reports or failed commits never leave a successful partial run.
+
+Classification rules and internal cutoff/scope are in [the provider contract](docs/mockbank-api.md#reconciliation-snapshot).
+The provider and internal captures are not atomic across systems: intervening acceptance or
+status changes can create transient exceptions. Old reports are compared with current internal
+state, not reconstructed historical state. Inspect the capture times and rerun with a fresh
+report; never automatically settle, refund, or resubmit because of a reconciliation finding.
+MockBank's report is a complete current in-memory snapshot, not a historical daily statement.
+
+Proofs: `TestProviderDiscrepanciesAreDetectedWithoutFinancialMutation` covers all six outcomes
+with persisted original evidence and unchanged transfer/ledger data;
+`TestRealBankReportDetectsLostCallbackWithoutSettlingPayment` exercises the real MockBank HTTP
+export; `TestConcurrentRerunsPersistOneOriginalSnapshot` covers 20 simultaneous retries;
+`TestFailedCommitLeavesNoPartialRunAndCanRetry` injects a final-commit failure.
+
+### Measured reconciliation cost
+
+2026-10-10, Apple M4, macOS/arm64, Go 1.26, PostgreSQL in local Docker. Three samples;
+10,000 generated USD payments in each run. Reproduce with `make bench-reconciliation`
+(Postgres required; these benchmarks use fresh disposable schemas).
+
+| Work | Time per 10,000 rows | Allocated memory per operation |
+| --- | --- | --- |
+| CSV parse + validation | 1.77–1.86 ms | 5.60 MB |
+| In-memory comparison | 4.83–5.03 ms | 10.94 MB |
+| Parse + DB snapshot + comparison + atomic evidence persistence + result read | 164–270 ms (median 189 ms) | 38.18 MB |
+
+The full run added about **5.54 MB of database storage** (including indexes/TOAST) per 10,000
+matched payments. Pure benchmarks run for one second per sample; database benchmarks use
+three runs per sample. This small local experiment is not a capacity estimate, p99 latency,
+HTTP/provider throughput, or a claim that 10,000 payments can settle in 189 ms. Fixture setup
+and provider downloading are excluded from the database benchmark. CLI `elapsed_ms` includes
+the provider download and persisted run; stored `preparation_ms` excludes result persistence.
+
+The cost is retaining whole snapshots and a finding per payment on every run; storage grows
+with both payment history and run count. There is no automatic evidence-retention policy in V1.
+
+### Existing hot-path experiments rerun
+
+On the same machine/date, three runs of `TestLockStrategyComparison` each spent 200
+fully affordable payments from one hot account. At 50 writers, `FOR UPDATE` carried all
+200 in every sample at 700–1,340 spends/s; sample p99s were 40.4–128.5 ms. The bounded
+`SERIALIZABLE` path carried 137–144, with 56–63 failed attempts, at 228–355 spends/s.
+This is a database ledger-debit experiment, not full HTTP-to-provider settlement throughput.
+The contention shape is deliberately one account, not uniform traffic across accounts.
+
+The Postgres rate limiter measured 0.171–0.253 ms per allowed request, against
+0.101–0.144 ms for `SELECT 1`; these were sequential samples, not paired latency measurements.
+Both include the local Docker database round trip. Reproduce all three experiments with
+`make bench`. The existing hot-path fixtures are reset in package-specific `test_*` schemas;
+use `TEST_DATABASE_URL` pointing to a disposable database, never production.
 
 ## Scope
 
