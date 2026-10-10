@@ -265,6 +265,65 @@ and deduplicated. Signatures authenticate the payload; they do not encrypt it.
 
 ---
 
+## Reconciliation snapshot
+
+```http
+GET /settlements
+```
+
+Returns `200` with `Content-Type: text/csv; charset=utf-8` and a complete current
+snapshot of every accepted instruction retained by this MockBank process, including
+`processing`, `settled` and `failed`. It is not a historical daily statement. The
+store is copied under one read lock; the capture time and copied statuses belong
+to that same snapshot. Rows are sorted by provider reference.
+
+The CSV begins with capture metadata, then the exact column header:
+
+```csv
+snapshot_at,2026-10-10T06:00:00Z
+provider_ref,client_reference,amount,currency,status
+mb_example,tr_example,50000,USD,settled
+```
+
+`snapshot_at` is a UTC RFC3339Nano timestamp ending in `Z`. Amounts are positive integer minor
+units, currency is `USD`, and both references are required. An empty snapshot still
+contains the two header records. No date-filtered or paginated variant exists in
+V1; query parameters are rejected with `400` so a partial report cannot appear
+complete. Directly rejected instructions were never accepted into this store and
+therefore do not appear.
+
+Consumers retain repeated rows and classify duplicate provider or client references;
+they must not silently deduplicate the input. Missing/surplus columns, malformed CSV,
+invalid timestamps, invalid amounts/currencies/statuses or absent references reject
+the whole report. A failed parse must not produce a successful all-matched run.
+The platform limits a downloaded report to 10 MiB.
+
+The echoed client reference links unknown-response submissions to internal transfer
+IDs; a known provider reference must belong to that same transfer. Conflicting
+identities fail the comparison rather than inventing a clean match. Amount and
+status differences are both retained when they overlap. Duplicate groups retain
+all original rows and are never matched by arbitrarily choosing one of them. Duplicate
+classification takes precedence over amount/status comparisons inside that group;
+unknown duplicated instructions retain both MISSING_INTERNAL and DUPLICATE_EXTERNAL.
+Counts are findings, not distinct payments, so overlapping findings can exceed the row count.
+Blank, NUL-containing or non-UTF-8 identities are invalid; identities are never normalised.
+
+Internal scope includes transfers created no later than `snapshot_at` with a provider
+reference, unresolved outcome, or attempted processing state. Unsubmitted instructions
+and direct failures without a provider reference are excluded unless the report itself
+identifies them by client reference. This also covers a resolved failure whose provider
+reference was never persisted. Attempted processing does not prove acceptance: a
+MISSING_EXTERNAL finding is evidence for investigation, not proof of a lost payment.
+
+The internal database snapshot is captured separately; two systems cannot be read
+atomically. A run records both capture times so a status change between snapshots
+can be investigated. Reconciliation detects differences and never applies settlement,
+refund or ledger changes automatically. Restarting MockBank loses retained report
+history as well as payment state; an empty report after restart is not proof that
+money was not moved earlier.
+
+---
+
 ## Sandbox — operator endpoints
 
 Not part of the payment contract. Used by tests and by the chaos work later.

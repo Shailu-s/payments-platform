@@ -872,3 +872,68 @@ race test and permanent-failure dead status both pass. Docker exclusions/version
 and final evidence follow as a small commit; create/merge PR through gh without bypassing
 checks. Phase 7 is planning only: provider file contract, six classifications, persisted
 exceptions and deliberately corrupted fixture; detect differences, never auto-fix money.
+
+**2026-10-10 — phase 6 merged; phase 7 plan only.** Final commit 7c88388 contains safe
+Docker build/version alignment and exact five-failure/sixth-success retry proof. Created
+PR #6 with gh, reviewed all seven commits and verified head/mergeability. GitHub had no
+configured checks; local build/full tests/vet/broad races and live smoke provided evidence.
+Merged only the reviewed head, without admin/bypass flags or branch deletion. Verified
+PR MERGED and main at e75002e086e93f091a576c0308c56d019c1fa6ed. Local main fast-forwarded;
+private env/ignored smoke helper preserved. No phase-7 implementation started. Deferred
+handwritten claim/retry learning remains a retrieval task, not a claim of completion.
+
+**Next phase-7 build sequence (keep full six-classification scope):**
+1. Define provider settlement CSV fields, matching references and date/cutoff scope first;
+   extend MockBank's written contract and add a deterministic report export.
+2. First failing integration test: a clean report classifies internal/provider agreement
+   MATCHED. Then one behavior at a time for AMOUNT_MISMATCH, MISSING_EXTERNAL,
+   MISSING_INTERNAL, STATUS_MISMATCH and DUPLICATE_EXTERNAL. Never silently deduplicate
+   external rows or hide invalid input; establish precedence for overlapping differences.
+3. Compare against a consistent internal snapshot including submitted processing/unresolved
+   records as appropriate to the cutoff, so a lost settled callback is detected rather than
+   excluded. Keep integer USD amounts and original evidence from both sides.
+4. Persist run metadata and searchable exceptions with internal/provider identifiers and
+   evidence; make reruns well-defined without duplicating results or overwriting evidence.
+5. Add a manual reconciler command first, a read-only summary/detail path and an operator
+   schedule after it runs. No automatic settlement/refund, dashboard or extra broker.
+6. Finish with an isolated deliberately corrupted report covering all six outcomes, plus
+   input-error/rerun tests, unchanged-ledger assertions and measured rows/counts/runtime.
+   Explain/review each small tested commit, open/merge phase-7 PR, then the README evidence.
+
+**2026-10-10 — phase 7 implemented and benchmarked; PR review requested.** User requested
+finishing phase 7 and opening a PR for his review, with limited time; no phase-6 work was
+needed because PR #6 is already merged. Preserved the existing uncommitted comparison,
+parser and report-contract work, then completed MockBank's locked CSV snapshot export,
+read-only Repeatable Read internal snapshot with provider cutoff, migration 12, atomic
+append-only run/finding evidence, exact-report/run-ID replay and conflict detection,
+authenticated summary/detail/filter routes, manual CSV/download CLI and cancellable
+recurring download mode. The schedule is process-local, not a durable nightly scheduler.
+
+Observed red tests: missing HTTP export returned 404; missing persisted-run schema rejected
+clean reconciliation; failed lookup without a persisted provider reference incorrectly
+became MISSING_INTERNAL; whitespace identities were accepted; authenticated inspection
+returned 404; download and command entry points were absent. Fixed each path and verified
+its regression. The corrupted-report integration retains all six classifications, original
+amount/status evidence and unchanged entire financial snapshots. Twenty concurrent retries
+retain one original run; a deferred final-commit rejection leaves no partial run, and retry
+succeeds. Real MockBank HTTP export detects a lost settled callback without crediting the
+destination. Invalid/oversized reports cannot create successful runs. No automatic money fix.
+
+Benchmarks, Apple M4/macOS arm64: three samples of 10,000 rows. Parse 1.77–1.86ms,
+comparison 4.83–5.03ms, complete database-backed run 164–270ms (median 189ms), about 38.18MB
+allocated/run and 5.54MB additional persisted storage/run. Database fixture setup and HTTP
+download excluded; each database sample contains three runs, not enough for capacity/p99
+claims. Re-ran the existing hot-account comparison three times: at 50 writers FOR UPDATE
+carried 200/200 at 700–1340 spends/s, while SERIALIZABLE carried 137–144/200 with 56–63
+failed attempts. Rate limiter 0.171–0.253ms vs bare round trip 0.101–0.144ms. README records
+scope, reproduction commands, evidence and limits; make bench/bench-reconciliation added.
+
+Verification uses a freshly created disposable database rather than resetting the existing
+application/test schemas. Final build, vet, full tests and full race suite all pass, including
+the real-bank integration. Go 1.26.0 verified. No primary migration, secret edit, container
+restart or merge performed. Disposable verification DB `payments_phase7_verify_a71c4e`
+is retained for inspection; application data and services are untouched. User explicitly
+selected "Commit, push, open PR", waiving pre-commit explain-back for these three tested
+commits only. Publication: `phase-7-reconciliation` against `main`; review and merge remain
+with the user, and no merge is authorised. V1's final all-eight-guarantee README audit and
+deferred handwritten retrieval work are not claimed done.

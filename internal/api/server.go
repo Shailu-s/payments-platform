@@ -82,6 +82,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/transfers", s.handleCreateTransfer)
 	mux.HandleFunc("GET /v1/transfers/{id}", s.handleGetTransfer)
 	mux.HandleFunc("GET /v1/transfers", s.handleListTransfers)
+	mux.HandleFunc("GET /v1/reconciliation/runs", s.handleListReconciliationRuns)
+	mux.HandleFunc("GET /v1/reconciliation/runs/{id}", s.handleGetReconciliationRun)
+	mux.HandleFunc("GET /v1/reconciliation/runs/{id}/findings", s.handleReconciliationFindings)
 
 	// Keep unknown-route errors JSON, unlike the mux's plain-text default.
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {

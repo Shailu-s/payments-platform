@@ -138,6 +138,17 @@ func (s *Store) All() []Payment {
 	return out
 }
 
+func (s *Store) Snapshot() (time.Time, []Payment) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	capturedAt := time.Now().UTC()
+	out := make([]Payment, 0, len(s.byProviderRef))
+	for _, p := range s.byProviderRef {
+		out = append(out, *p)
+	}
+	return capturedAt, out
+}
+
 func (s *Store) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

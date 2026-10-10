@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender webhook-sender chaos-kill-consumer
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench
 
 up:
 	$(COMPOSE) up -d --wait
@@ -51,6 +51,18 @@ sender:
 
 webhook-sender:
 	@go run ./cmd/webhook-sender
+
+reconcile:
+	@go run ./cmd/reconcile $(ARGS)
+
+bench:
+	@go test ./internal/api -run '^TestLockStrategyComparison$$' -v -count=3
+	@go test ./internal/ratelimit -run '^$$' -bench 'Benchmark(Allow|BaselineRoundTrip)$$' -benchmem -benchtime=1s -count=3
+	@$(MAKE) --no-print-directory bench-reconciliation
+
+bench-reconciliation:
+	@go test ./internal/reconciliation -run '^$$' -bench 'Benchmark(Compare|ReadReport)' -benchmem -benchtime=1s -count=3
+	@go test ./internal/reconciliation -run '^$$' -bench BenchmarkReconcile -benchmem -benchtime=3x -count=3
 
 # Run alongside `make run`; address comes from MOCKBANK_ADDR.
 mock-bank:
