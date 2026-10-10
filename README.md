@@ -1,129 +1,198 @@
 # payments-platform
 
-Payment infrastructure: a backend platform for moving money reliably through external
-payment providers. It maintains its own double-entry ledger and stays correct under retries,
-concurrency, duplicate events, provider failures, and reconciliation mismatches.
+Payment infrastructure for reliably moving money through external providers. A double-entry
+ledger stays correct under retries, concurrent spending, duplicate events, provider failures,
+and reconciliation mismatches.
 
-**Status: phases 1–6 merged. Phase 7 (reconciliation) is implemented on
-`phase-7-reconciliation`, pending review and merge.** See [PLAN.md](PLAN.md).
+**Status:** V1 is implemented in this source snapshot, including the closure guardrails,
+minimal metrics and end-to-end failure proof. All seven build phases are merged; [PLAN.md](PLAN.md)
+records review/merge state, decisions and the build log. Upgrading a running sandbox still
+requires explicit migrations and deployment of the new binaries.
 
----
+## Eight guarantees, with their proof
 
-## The problem
+| Guarantee | Named automated proof |
+| --- | --- |
+| Every committed ledger transaction balances. | [TestRecordMovesMoneyAndBalances](internal/ledger/record_test.go), [TestRecordRejectsOverflowingTotals](internal/ledger/overflow_test.go) |
+| One transfer per API key + idempotency key, including concurrent retries. | [TestIdempotentRequestsCreateOneTransfer](internal/api/idempotency_test.go) |
+| Concurrent requests cannot overspend an account. | [TestConcurrentTransfersCannotOverspend](internal/api/overspend_test.go) |
+| Duplicate provider events have one financial effect. | [TestConcurrentDuplicateWebhooksHaveOneEffect](internal/api/webhooks_test.go), [TestWebhookRetriesAfterFailedTransaction](internal/api/webhooks_test.go) |
+| Every financial transfer transition retains audit evidence. | [TestEveryFinancialTransitionRetainsAuditEvidence](internal/api/audit_test.go), [TestTerminalOutboxFailureRollsBackFinancialEffect](internal/api/terminal_events_test.go) |
+| Ledger history rejects UPDATE/DELETE; corrections append new entries. | [TestLedgerHistoryRejectsUpdatesAndDeletes](internal/ledger/immutable_test.go) |
+| Kafka redelivery does not duplicate payment effects or durable notification jobs. | [TestSenderSIGKILLRedeliversWithoutDuplicatePayment](internal/consumer/crash_test.go), [TestKafkaRedeliveryCreatesOneDurableJob](internal/customerwebhooks/worker_test.go) |
+| Reconciliation detects all six defined outcomes in validated complete snapshots. | [TestProviderDiscrepanciesAreDetectedWithoutFinancialMutation](internal/reconciliation/evidence_test.go) |
 
-External payment providers are slow, unreliable and inconsistent. They time out after
-already succeeding. They send the same notification twice. They report a payment settled
-before they reported it started. Sometimes they simply disagree with you about what happened.
+These guarantees cover the implemented API/worker paths and the provider contract, not
+arbitrary administrator changes to the database. The ledger writer validates positive integer
+minor units, bounded totals, and equal debits/credits before writing. Migration 13 rejects
+ordinary UPDATE/DELETE on entries and transaction metadata; trusted administrators can still
+TRUNCATE, disable triggers, or issue DDL. No restricted production database role is provisioned
+in this local sandbox.
 
-This platform sits between an application and those providers: one API to move money, and a
-permanent, auditable record of every cent that survives everything above.
+## The problem and the flow
 
-## The guarantees
+A bank can accept a payment and then time out, deliver a callback twice, or disagree with our
+records. The API must not guess that a timeout means failure, refund money blindly, or turn a
+retry into a second payment.
 
-Each of these will be backed by a named automated test.
-
-1. The ledger always balances — every transaction's debits equal its credits.
-2. The same idempotency key never creates two transfers.
-3. Money cannot be overspent by concurrent requests.
-4. Duplicate provider events never duplicate financial effects.
-5. Every financial state change has an audit trail.
-6. Ledger entries are never modified or deleted.
-7. Kafka redelivery never causes duplicate processing.
-8. Provider discrepancies are always detected by reconciliation.
-
-## Stack
-
-Go, PostgreSQL, Kafka, Docker Compose. Modular monolith plus workers.
-
-## Running it locally
-
-Needs Docker, Go 1.26, and the `migrate` CLI
-(`go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@latest`).
-
-```sh
-cp .env.example .env   # once: every setting lives here; nothing has a fallback
-make up            # Postgres :5433, MockBank :8081, Kafka :9092, and the Kafka topics
-make migrate-up    # apply db/migrations
-make test          # the full suite, against the real Postgres
+```text
+POST /v1/transfers + API key + Idempotency-Key
+  -> Postgres transaction: intent + source-to-settlement ledger + outbox
+  -> relay -> Kafka -> sender -> MockBank
+  -> signed provider callback -> destination credit OR source refund + completion outbox
+  -> relay -> Kafka -> durable customer delivery -> signed HTTP notification/retries
+  -> provider CSV + internal snapshot -> reconciliation findings (detect, never auto-fix)
 ```
 
-Postgres is on **5433**, not 5432, so it does not collide with a local install.
+Go 1.26, PostgreSQL, Kafka, Docker Compose. Modular monolith plus workers, not microservices.
+Amounts are integer cents: `500` is $5, not a floating-point value. A transfer returns
+`processing`; it is not settled until a callback or resolving lookup confirms its outcome.
 
-Every command reads its settings from the environment and **stops at startup if one is
-missing** — there are no built-in defaults to silently fall back to. The Makefile loads `.env`
-and passes it on, so run commands through `make`. `.env` is git-ignored; `.env.example` is the
-committed template.
+## Running locally
 
-### Running the system end to end
-
-Five terminals:
+Needs Docker, Go 1.26, and the golang-migrate v4 CLI built with its Postgres driver.
+Only copy the template if `.env` does not already exist:
 
 ```sh
-make apikey NAME="local dev"   # once: prints a key, shown only this one time
-make run                       # terminal 1 — the API on :8080
-make relay                     # terminal 2 — publishes outbox events to Kafka
-make sender                    # terminal 3 — sends each transfer to MockBank as its event arrives
-make worker                    # terminal 4 — the safety net: sends what the sender missed, after 30s
-make demo                      # terminal 5 — walks through the API
+test -f .env || cp .env.example .env
 ```
 
-Two paths can send a transfer, on purpose. The **sender** is the main path and reacts to the
-event within a second. The **worker** polls the database and only takes transfers older than
-30 seconds, so if Kafka or the relay is down, payments slow down instead of stopping. Both
-claim a transfer with the same guarded `UPDATE`, so it is sent once either way.
+Set `DATABASE_URL` for the local database; configure distinct random signing keys of at least
+32 bytes in `MOCKBANK_WEBHOOK_SECRET` and `CUSTOMER_WEBHOOK_SECRET`, plus a controlled
+`CUSTOMER_WEBHOOK_URL`. Keys belong only in the ignored `.env`; never commit or log them.
+Every runtime command reads required environment settings and fails rather than silently
+choosing another endpoint. Make loads `.env`; it does not export those values into your
+interactive shell. Tests have documented local infrastructure defaults, not runtime defaults.
 
-MockBank already runs in Compose. `make mock-bank` runs it from source instead, on the same
-port, so stop the container first (`docker stop payments-mock-bank`).
-
-### Kafka
-
-`make up` starts a single Kafka broker, and a one-shot `kafka-init` container creates the
-`transfers` topic with **3 partitions** (it skips the topic if it already exists). Kafka has
-no volume, so `make down` deletes every topic and message, and the next `make up` recreates
-the topic empty.
-
-Check the topic exists with 3 partitions:
+For a **fresh sandbox**:
 
 ```sh
-docker exec payments-kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 --describe --topic transfers
+make up
+make migrate-up
+make test
+make demo-v1
 ```
 
-List every topic:
+Postgres uses host port **5433**, MockBank **8081**, Kafka **9092**. `make migrate-up` applies
+all migrations, including reconciliation (12) and ledger immutability (13), without resetting
+application tables. When upgrading an existing sandbox, preserve its database and capture
+provider evidence before replacing MockBank: its payment history and deduplication state are
+in memory and disappear on restart. Running tests does not upgrade your live application schema.
+
+### Isolated, reproducible V1 demonstration
+
+`make demo-v1` runs
+[TestV1PaymentSurvivesTimeoutAfterSuccess](cmd/mock-bank/v1_demo_test.go). It needs the local
+Postgres and Kafka broker but **does not need or reset the running API/MockBank**, call a real
+bank/customer, or touch application tables. It creates disposable random schemas, loopback
+HTTP servers, and unique Kafka topics/groups. Topics are retained in the sandbox broker for
+inspection; outbox routing is changed only inside its disposable fixtures.
+
+Both normal and timeout-after-success cases exercise real production components:
+
+```text
+$10 source fixture -> authenticated $5 transfer -> outbox -> Kafka -> sender -> MockBank
+Normal:                 bank acknowledgement -> PROCESSING
+Timeout after success:  bank accepts/settles, acknowledgement withheld -> UNRESOLVED
+Before callback:        one submission; source $5, destination $0; STATUS_MISMATCH detected
+Duplicate signed callbacks -> one settlement; source $5, destination $5
+Customer returns 503, then 200 -> same signed event, two attempts, delivered
+Ledger -> three balanced transactions / six entries (funding, reservation, settlement)
+Final reconciliation -> MATCHED; no automatic repair or second payment
+```
+
+Failure timing is controlled by test-only acknowledgement/callback gates, not a shipped Chaos
+API. Customer backoff is shortened in this demonstration; the durable retry tests separately
+prove the production 1/2/4/8/16-second schedule. This is a correctness proof, not a performance
+benchmark or a claim about real bank behaviour.
+
+The older `make demo` script **resets the configured application database**. It is not the V1
+closure demo; do not run it against retained data.
+
+### Persistent development processes
+
+Mint an API key once with `make apikey NAME="local dev"` (it is shown once). `make apikeys`
+lists prefixes, never secrets. Run these in separate terminals; MockBank is already in Compose:
 
 ```sh
-docker exec payments-kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 --list
+make run
+make relay
+make sender
+make worker
+make webhook-sender
+make reconcile ARGS='-interval 24h'
 ```
 
-Read every message on `transfers` from the start, showing key, partition and headers (Ctrl-C to stop):
+`run` serves the API; `relay` publishes outbox rows; `sender` submits created transfers;
+`worker` is the polling safety net and resolves unknown outcomes; `webhook-sender` durably
+queues and retries customer notifications; `reconcile` runs immediately, then waits 24 hours
+between completed attempts. The sender has a 30-second head start over the poller. Both use
+the same guarded claim, so the two paths do not independently pay the same transfer.
+
+`make mock-bank` runs the provider from source using `MOCKBANK_ADDR`. Use a separate free port
+and matching provider/callback settings for a second sandbox; do not stop/reset an existing
+bank merely to resolve a disagreement. API readiness is `/readyz`, liveness is `/healthz`.
+
+### Verification
 
 ```sh
-docker exec -it payments-kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic transfers --from-beginning \
-  --property print.key=true --property print.partition=true --property print.headers=true
+make test
+go build ./...
+go vet ./...
+go test -race ./... -count=1
+make chaos-kill-consumer
+make bench
 ```
 
-List consumer groups, then see how far one group has read on each partition:
+Tests and existing hot-path benchmarks recreate package-specific `test_*` schemas and reset
+fixtures. Use `TEST_DATABASE_URL` pointing to a disposable local database, never production.
+The full suite also exercises local Kafka using isolated topics. The crash proof SIGKILLs only
+its own test child, not a live worker. `make chaos-kill-consumer` runs that proof independently.
 
-```sh
-docker exec payments-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-  --bootstrap-server localhost:9092 --list
-docker exec payments-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-  --bootstrap-server localhost:9092 --describe --group <group-name>
-```
+## Minimal metrics
 
-If `kafka-init` failed, its output says why:
+Authenticated `GET /metrics` returns Prometheus text format without a new dependency or
+monitoring container. A valid bearer API key is required; scrapes do not spend that key's
+payment rate-limit quota. Authentication plus collection share a two-second deadline.
 
-```sh
-docker logs $(docker ps -aqf name=kafka-init)
-```
+| Metric | Meaning |
+| --- | --- |
+| `payments_http_requests_total{status_class}` | Process-local completed HTTP request counter; fixed 1xx–5xx labels, excluding metrics scrapes. Resets on API restart. |
+| `payments_transfers{status}` | Current database transfer counts across the five defined states. |
+| `payments_outbox_pending` | Current unpublished outbox rows. |
+| `payments_customer_deliveries{status}` | Current pending/delivered/dead notification counts. |
+| `payments_reconciliation_exceptions{classification}` | Exception counts from the latest completed run, not a sum of historical runs. |
+| `payments_reconciliation_last_run_timestamp_seconds` | Latest run creation time in Unix seconds; zero means no completed run. |
+
+Database metrics are **gauges**, not process counters. They reflect shared database state:
+do not sum the same global gauges across API replicas. No account/transfer/event IDs, URLs,
+API keys, arbitrary paths, or request IDs become labels. A failed scrape returns an error,
+not partial or zero-valued apparently healthy output. Fixed labels produce 20 series per API
+instance; there is no dashboard, tracing, or alert engine in V1.
+
+Proofs: [TestMetricsRequiresAuthAndReportsBoundedHTTPCounts](internal/api/metrics_test.go),
+[TestMetricsReflectsDatabaseBacklogsAndLatestReconciliation](internal/api/metrics_test.go),
+[TestMetricsScrapesDoNotConsumePaymentQuota](internal/api/metrics_test.go), and the failed/
+blocked-database and concurrent-counter tests in the same file.
+
+**Measured cost:** Apple M4/macOS arm64, Go 1.26.0, local Docker Postgres, three samples.
+With 1,000 transfers, 1,000 outbox rows, and 1,000 delivery rows, an authenticated in-process
+HTTP scrape took **0.530–1.045 ms**, about **19 KB allocated / 172 allocations**. Production
+JSON logging was directed to a discard sink; socket/TLS latency and fixture setup are excluded.
+The isolated observation microbenchmark measured **16.9–23.5 ns**, **32 B / one allocation**,
+against a ~1.38 ns no-op handler. This single-thread microbenchmark is middleware-only cost,
+not whole-request latency or concurrent-counter throughput.
+Reproduce with `make bench-metrics`.
+
+The cost is an indexed auth lookup plus one aggregate query per scrape; exact transfer and
+delivery counts scan retained history. Keep scrape frequency modest at V1 volume. Fixed
+labels prevent cardinality growth but do not make database collection constant-time.
 
 ## Reconciliation
 
-Apply migration 12 with `make migrate-up`. MockBank must be running the new source/image
-with `GET /settlements`; rebuilding an existing MockBank container discards its in-memory
-history, so do not use a restart to make an old report appear clean.
+MockBank must expose `GET /settlements`. Its
+[CSV contract](docs/mockbank-api.md#reconciliation-snapshot) defines complete snapshots,
+matching identities, input rejection, classification precedence, and internal cutoff/scope.
 
 ```sh
 make reconcile
@@ -132,15 +201,16 @@ make reconcile ARGS='-report bank.csv -run-id run_001'
 make reconcile ARGS='-list'
 make reconcile ARGS='-inspect run_001 -classification AMOUNT_MISMATCH'
 make reconcile ARGS='-inspect run_001 -client-reference tr_example'
-make reconcile ARGS='-interval 24h'
 ```
 
-The command reads `DATABASE_URL` and, for downloads, `PROVIDER_URL`. A recurring process
-must be supervised by the operator; it stops on SIGINT/SIGTERM and logs failed attempts.
-It runs immediately, then waits the interval after each attempt. It is not a durable
-scheduler and its next deadline is not retained across restart.
+The repeated saved-file invocation is an identical retry: the same ID and exact report bytes
+return the original run even if transfers subsequently change. Different bytes cannot reuse
+that ID; a new ID deliberately captures fresh internal truth. Each run atomically retains the
+raw CSV, its SHA-256, a read-only Repeatable Read snapshot, both capture times, six finding
+counts, and original evidence. Malformed/oversized reports and failed commits never leave a
+successful partial run. Ordinary UPDATE/DELETE of persisted evidence is rejected.
 
-Authenticated read-only routes (same API-key/rate-limit middleware as transfers):
+Authenticated read-only routes:
 
 ```text
 GET /v1/reconciliation/runs?limit=25&offset=0
@@ -148,65 +218,70 @@ GET /v1/reconciliation/runs/{id}
 GET /v1/reconciliation/runs/{id}/findings?classification=AMOUNT_MISMATCH&client_reference=tr_example
 ```
 
-Each run atomically retains the raw provider CSV, its SHA-256, a consistent read-only
-Repeatable Read internal snapshot, both capture times, six finding counts, and the full
-original evidence. Results are append-only at the database level. The same run ID and exact
-report bytes return the original run even if transfers subsequently change; different bytes
-with that ID are rejected. A new ID deliberately captures a new internal snapshot.
-Malformed/oversized reports or failed commits never leave a successful partial run.
+Reconciliation only detects differences. It does not settle, refund, resubmit, or automatically
+repair money. The provider and internal captures are not atomic across systems; intervening
+acceptance/status changes can produce transient exceptions. Old reports compare against
+current state, not reconstructed historical state. Inspect capture times and use a fresh
+report when investigating. MockBank exports retained current in-memory history, not a
+historical daily settlement statement. Internal failed instructions without a provider
+reference are excluded unless the report identifies them by client reference.
 
-Classification rules and internal cutoff/scope are in [the provider contract](docs/mockbank-api.md#reconciliation-snapshot).
-The provider and internal captures are not atomic across systems: intervening acceptance or
-status changes can create transient exceptions. Old reports are compared with current internal
-state, not reconstructed historical state. Inspect the capture times and rerun with a fresh
-report; never automatically settle, refund, or resubmit because of a reconciliation finding.
-MockBank's report is a complete current in-memory snapshot, not a historical daily statement.
+The recurring command needs operator supervision: it is process-local, has no durable restart
+deadline, and does not automatically retain a missed schedule. Evidence has no automatic
+retention/deletion policy. These are deliberate V1 limits, not guarantees of unattended
+production operation.
 
-Proofs: `TestProviderDiscrepanciesAreDetectedWithoutFinancialMutation` covers all six outcomes
-with persisted original evidence and unchanged transfer/ledger data;
-`TestRealBankReportDetectsLostCallbackWithoutSettlingPayment` exercises the real MockBank HTTP
-export; `TestConcurrentRerunsPersistOneOriginalSnapshot` covers 20 simultaneous retries;
-`TestFailedCommitLeavesNoPartialRunAndCanRetry` injects a final-commit failure.
+### Recorded reconciliation and hot-path evidence
 
-### Measured reconciliation cost
+2026-10-10, Apple M4/macOS arm64, Go 1.26, Postgres in Docker; three samples of 10,000 rows:
 
-2026-10-10, Apple M4, macOS/arm64, Go 1.26, PostgreSQL in local Docker. Three samples;
-10,000 generated USD payments in each run. Reproduce with `make bench-reconciliation`
-(Postgres required; these benchmarks use fresh disposable schemas).
-
-| Work | Time per 10,000 rows | Allocated memory per operation |
+| Work | Time per 10,000 rows | Allocated memory |
 | --- | --- | --- |
 | CSV parse + validation | 1.77–1.86 ms | 5.60 MB |
 | In-memory comparison | 4.83–5.03 ms | 10.94 MB |
-| Parse + DB snapshot + comparison + atomic evidence persistence + result read | 164–270 ms (median 189 ms) | 38.18 MB |
+| Parse + DB snapshot + compare + atomic persistence + result read | 164–270 ms (median 189 ms) | 38.18 MB |
 
-The full run added about **5.54 MB of database storage** (including indexes/TOAST) per 10,000
-matched payments. Pure benchmarks run for one second per sample; database benchmarks use
-three runs per sample. This small local experiment is not a capacity estimate, p99 latency,
-HTTP/provider throughput, or a claim that 10,000 payments can settle in 189 ms. Fixture setup
-and provider downloading are excluded from the database benchmark. CLI `elapsed_ms` includes
-the provider download and persisted run; stored `preparation_ms` excludes result persistence.
+About **5.54 MB additional DB storage**, including indexes/TOAST, per 10,000 matched payments
+per run. Pure benchmarks run one second per sample; DB samples contain three runs. Fixture
+setup and provider downloading are excluded. CLI `elapsed_ms` includes downloading and
+persistence; stored `preparation_ms` excludes result persistence. Reproduce with
+`make bench-reconciliation`. These small local experiments are not capacity estimates, p99
+measurements, payment throughput, or a claim that 10,000 payments settle in 189 ms.
 
-The cost is retaining whole snapshots and a finding per payment on every run; storage grows
-with both payment history and run count. There is no automatic evidence-retention policy in V1.
+Three hot-account experiments each attempted 200 fully affordable spends. At 50 writers,
+`FOR UPDATE` carried 200/200 every time at 700–1,340 spends/s (sample p99 40.4–128.5 ms).
+Bounded `SERIALIZABLE` carried 137–144/200 with 56–63 failed attempts at 228–355 spends/s.
+This is a database ledger-debit experiment, not HTTP-to-provider settlement throughput;
+contention is concentrated on one account, not spread uniformly. Only the row-lock path ships.
+The trade is queued spending and a per-account throughput ceiling instead of retry exhaustion.
 
-### Existing hot-path experiments rerun
+The Postgres rate limiter measured 0.171–0.253 ms per allowed request versus 0.101–0.144 ms
+for `SELECT 1`; sequential samples, not paired latency measurements. Reproduce the recorded
+experiments plus the new metrics benchmarks with `make bench` in a disposable database.
 
-On the same machine/date, three runs of `TestLockStrategyComparison` each spent 200
-fully affordable payments from one hot account. At 50 writers, `FOR UPDATE` carried all
-200 in every sample at 700–1,340 spends/s; sample p99s were 40.4–128.5 ms. The bounded
-`SERIALIZABLE` path carried 137–144, with 56–63 failed attempts, at 228–355 spends/s.
-This is a database ledger-debit experiment, not full HTTP-to-provider settlement throughput.
-The contention shape is deliberately one account, not uniform traffic across accounts.
+## Honest V1 limits
 
-The Postgres rate limiter measured 0.171–0.253 ms per allowed request, against
-0.101–0.144 ms for `SELECT 1`; these were sequential samples, not paired latency measurements.
-Both include the local Docker database round trip. Reproduce all three experiments with
-`make bench`. The existing hot-path fixtures are reset in package-specific `test_*` schemas;
-use `TEST_DATABASE_URL` pointing to a disposable database, never production.
+- Authentication, not tenancy/authorisation: a valid API key can operate on any account.
+- MockBank is a controlled simulator, not a real provider integration. Restarting it loses
+  payment state and provider-side idempotency history.
+- Kafka storage is not pinned to a Compose-managed named data volume; the image creates
+  anonymous mounts. Container replacement is not a tested broker-durability guarantee.
+- At-least-once transport, not universal exactly-once execution: consumers may run again.
+  The SIGKILL proof covers reference persistence followed by a crash before offset commit;
+  the earlier bank-acceptance/local-persistence window relies on the provider's stable client
+  reference and retained lookup/deduplication state, not a cross-system transaction.
+- Ledger balances are derived; SQL row locks serialise spending from a hot account. The
+  ledger writer is the supported balanced-insert path; arbitrary administrator inserts are
+  outside its validation boundary.
+- One configured customer endpoint, signed retries and a dead status; no manual replay API
+  or delivery history. Customers must deduplicate `event_id` from the signed JSON envelope
+  after lost acknowledgements, not trust the event-ID header alone.
+- No automatic money repair, durable reconciliation scheduler, production DB roles, or
+  production monitoring/deployment claim. Apply migrations and deploy new binaries explicitly.
 
-## Scope
-
-V1 is one currency (USD) and one simulated bank rail. Deliberately out: cards, crypto, FX,
-real bank integration, Kubernetes, fraud, KYC, microservices. The scope fence and the
-reasoning are in [PLAN.md](PLAN.md).
+V1 is one currency (USD), one simulated rail, API-key authentication, Postgres rate limiting,
+ledger/concurrency correctness, Kafka/outbox, inbound/outbound webhooks, reconciliation,
+minimal metrics, and measured failure evidence. Dashboard, Chaos API, manual replay and
+notification history were cut. Real providers, FX, stablecoins, Redis/load testing at scale,
+Kubernetes, fraud/KYC, tracing and multi-tenancy remain outside V1. See the scope fence in
+[PLAN.md](PLAN.md); no additional product feature is needed to close this version.

@@ -937,3 +937,61 @@ selected "Commit, push, open PR", waiving pre-commit explain-back for these thre
 commits only. Publication: `phase-7-reconciliation` against `main`; review and merge remain
 with the user, and no merge is authorised. V1's final all-eight-guarantee README audit and
 deferred handwritten retrieval work are not claimed done.
+
+**2026-10-11 — phase 7 merge verified; V1 closure implemented and approved for PR publication.**
+User reviewed and merged PR #7; verified main merge `aaa436a826bb2908f4f963ffdb941040c78e34f4`.
+He approved the proposed closure pass with "do it". Started `v1-closure` from fetched
+origin/main with a clean tree. The previous explain-back waiver covered only phase 7;
+after final verification he explicitly selected "Commit, push, open PR" for four closure
+commits, permitting this batch without pre-commit explain-back but without merge/deployment.
+No additional product phase.
+
+Ledger mutation proof failed first: entries and transaction references could be rewritten,
+and entry deletion succeeded. Migration 13 rejects ordinary UPDATE/DELETE on both tables;
+compensating entries still work. This is not protection against privileged TRUNCATE, DDL or
+disabled triggers, and README explicitly states that no restricted production DB role is
+provisioned. The guarantee audit also reproduced integer-total overflow: three positive
+amounts wrapped to 8, the old writer accepted them against 8 on the other side, and PostgreSQL
+proved the transaction unbalanced. Validation now checks before addition, returns a named
+overflow error without writes, and still accepts the maximum representable total.
+
+Added the complete normal/timeout-after-success demonstration using real API, outbox relay,
+Kafka consumers, sender, MockBank, signed callbacks, durable customer delivery and CSV
+reconciliation. Test-only gates withhold the acknowledgement after bank acceptance and hold
+the callback until unresolved/no-refund/no-resubmit is verified. A $5 payment has one provider
+submission, duplicate callbacks with one settlement effect, 503/200 customer retry with the
+same signed event, three balanced ledger transactions/six entries and final MATCHED. Random
+schemas, loopback servers and isolated Kafka topics/groups preserve application data and live
+services. Topic routing changes only fixture outbox rows; test topics remain for inspection.
+Production backoff is independently tested; demo shortens it. Both scenarios passed three
+repeated race runs. Added the named creation/settlement/refund audit-evidence proof.
+
+Minimal authenticated /metrics failed first with 404, then passed fixed-cardinality format,
+concurrent counts, backlog/latest-run state, payment-quota independence and failed/blocked-DB
+checks. HTTP counters are process-local; database states/backlogs/latest-run exceptions are
+gauges. Latest-run timestamp distinguishes no run from a zero-exception run. Collection and
+authentication share a 2s deadline; failed scrapes do not emit healthy zeroes. No new dependency,
+monitoring container, IDs/URLs/keys in labels, dashboard, Chaos API or replay/history feature.
+A metrics regression exposed the existing recorder overwriting the first response status with
+an ignored later header; fixed after observing incorrect 2xx counts. Informational headers
+remain distinct from the final status.
+
+Three Apple M4/Go 1.26.0/local-Postgres samples: scrape with 1,000 rows in each of transfers,
+outbox and deliveries took 0.530–1.045ms, ~19KB/172 allocations. Socket/TLS and fixture setup
+excluded, production JSON logging sent to a discard sink. Memory-only single-thread observation
+benchmark 16.9–23.5ns vs ~1.38ns baseline, 32B/one allocation; not full HTTP or contention
+throughput. make bench-metrics and demo-v1 reproduce the new evidence; make bench includes it.
+README now links all eight guarantees to named tests, explains startup/customer delivery,
+warns about the old destructive demo, retains historical benchmarks and records exact limits.
+
+Build, vet, full tests and full race suite passed in new disposable DB
+`payments_v1_verify_b8f2d6`; no primary migration, secret edit or live container restart.
+Final build/vet/full tests/full race suite, demo-v1 command, demo-envelope assertions,
+formatting and diff checks all pass. Verified README proof names and publication file/secret
+patterns. Kafka inspection shows image-created anonymous mounts, not Compose-managed named
+broker storage; README states that replacement durability is not proved. Provider contract
+now reflects the Chaos API scope cut instead of promising scenario injection after phase 7.
+Publication: four dependency-ordered commits on `v1-closure`, targeting `main` for user review;
+no merge or deployment is authorised. The source-level V1 closure is complete. Deferred
+handwritten retrieval is learning, not represented as completed, and live migration/binary
+rollout remains explicit operator work. The verification DB is retained for inspection.
