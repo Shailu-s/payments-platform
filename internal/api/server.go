@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/ratelimit"
@@ -25,6 +26,7 @@ type Server struct {
 	db            DB
 	limiter       *ratelimit.Limiter
 	webhookSecret []byte
+	httpRequests  [5]atomic.Uint64
 }
 
 const (
@@ -56,6 +58,7 @@ func (s *Server) StartRateLimitSweeper(ctx context.Context) {
 // Handler builds the router and middleware stack.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// Database failure must not make liveness restart a healthy process.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -70,7 +73,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/v1/", authenticated)
 
 	// Recovery wraps all routes; request IDs must be assigned before logging.
-	return chain(mux, withRequestID, withRecovery, withLogging)
+	return chain(mux, withRequestID, s.withMetrics, withRecovery, withLogging)
 }
 
 func (s *Server) routes() http.Handler {
