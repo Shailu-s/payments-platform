@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -24,6 +25,7 @@ var (
 	ErrNonPositiveAmount = errors.New("entry amounts must be greater than zero")
 	ErrInvalidDirection  = errors.New("entry direction must be debit or credit")
 	ErrUnbalanced        = errors.New("debits do not equal credits")
+	ErrAmountOverflow    = errors.New("ledger total exceeds int64 minor units")
 )
 
 // Entry is one side of a movement. Amount is in minor units and is always
@@ -47,14 +49,19 @@ func Record(ctx context.Context, db Beginner, reference string, entries []Entry)
 		if e.Amount <= 0 {
 			return "", fmt.Errorf("record %q: entry %d amount %d: %w", reference, i, e.Amount, ErrNonPositiveAmount)
 		}
+		var total *int64
 		switch e.Direction {
 		case DirectionDebit:
-			debits += e.Amount
+			total = &debits
 		case DirectionCredit:
-			credits += e.Amount
+			total = &credits
 		default:
 			return "", fmt.Errorf("record %q: entry %d direction %q: %w", reference, i, e.Direction, ErrInvalidDirection)
 		}
+		if e.Amount > math.MaxInt64-*total {
+			return "", fmt.Errorf("record %q: entry %d: %w", reference, i, ErrAmountOverflow)
+		}
+		*total += e.Amount
 	}
 	if debits != credits {
 		return "", fmt.Errorf("record %q: debits %d, credits %d: %w", reference, debits, credits, ErrUnbalanced)
