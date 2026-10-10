@@ -1,0 +1,11 @@
+.env
+.env.*
+.git
+.devin
+.claude
+*.key
+*.pem
+CLAUDE.md
+PROGRESS.md
+bin
+build

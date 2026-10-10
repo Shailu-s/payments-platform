@@ -61,7 +61,7 @@ func newTestServer(t *testing.T) (http.Handler, string) {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	return (&Server{db: testPool}).Handler(), plaintext
+	return (&Server{db: testPool, webhookSecret: []byte(testWebhookSecret)}).Handler(), plaintext
 }
 
 // do sends a request through the whole middleware chain.

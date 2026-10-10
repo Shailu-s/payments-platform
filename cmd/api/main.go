@@ -13,6 +13,7 @@ import (
 
 	"github.com/Shailu-s/payments-platform/internal/api"
 	"github.com/Shailu-s/payments-platform/internal/config"
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -22,8 +23,14 @@ func main() {
 	var env config.Env
 	dsn := env.Require("DATABASE_URL")
 	addr := env.Require("API_ADDR")
+	webhookSecret := env.Require("MOCKBANK_WEBHOOK_SECRET")
 	if err := env.Err(); err != nil {
 		slog.Error(err.Error())
+		os.Exit(1)
+	}
+
+	if len(webhookSecret) < webhooks.MinSecretBytes {
+		slog.Error("MOCKBANK_WEBHOOK_SECRET must contain at least 32 bytes")
 		os.Exit(1)
 	}
 
@@ -43,7 +50,7 @@ func main() {
 	backgroundCtx, stopBackground := context.WithCancel(ctx)
 	defer stopBackground()
 
-	apiServer := api.NewServer(pool)
+	apiServer := api.NewServer(pool, []byte(webhookSecret))
 	apiServer.StartRateLimitSweeper(backgroundCtx)
 
 	srv := &http.Server{

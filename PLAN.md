@@ -12,9 +12,15 @@ on a portfolio commit).
 
 **Changed 2026-10-05: Claude writes, Shailendra reviews and explains.**
 
-- Claude writes each piece into the repo in small commits, tested before it is shown.
-- He reads every diff and **explains it back in his own words before it is committed** — what
-  it does, the constraint that forces it, and the cost. No explanation, no commit.
+- Claude writes each piece into the repo in small, tested changes before it is shown.
+- Before review, explain conversationally with a concrete payment example: the constraint
+  and why we need the piece, what changed, actual code/data flow, failure tests and cost.
+  Give enough detail to understand, one concept at a time; terse file lists or compressed
+  summaries are not a substitute for a human explanation (clarified 2026-10-06).
+- He reads every diff and **explains the logic back in his own words before any commit or
+  push**. Resolve confusion and obtain explicit approval; understanding only the feature
+  summary is not enough. Approval of an earlier piece does not cover later changes.
+  **Reaffirmed 2026-10-06: no understanding, no commit or push.**
 - He still types **one interview-critical piece per phase** by hand.
 - **Why the change:** through phase 5 the old method (Claude instructs, he types everything)
   roughly doubled the time per feature — code was written, verified, pasted, retyped, then
@@ -722,3 +728,147 @@ production rebalance or MockBank settlement-latency measurement. The earlier pro
 acceptance/reference-persistence crash window and webhook two-commit gap remain documented
 limits. The user explained the two failure scenarios and approved the commit. Next is
 phase 6, starting with atomic webhook deduplication/application before HMAC verification.
+
+**2026-10-05 — phase 5 committed; first phase 6 fix tested, awaiting review.** Commit
+`b722f5a` contains the failure demonstrations (now pushed in PR #5). Reproduced the inbound
+webhook split-commit bug: HTTP 500 left the event marked seen, so retries skipped the
+financial effect. Event recording, state transition and ledger now share one transaction;
+duplicates use ON CONFLICT DO NOTHING without aborting it. Regression tests cover ledger
+write and final COMMIT failure for settlement and refund, then retry and duplicate delivery.
+Build, full tests, vet and targeted race tests passed. The fix is uncommitted. Next: review,
+then inbound HMAC/replay protection; outbound retries/backoff/DLQ remains after that.
+
+**2026-10-05 — phase 5 PR opened; phase 6 paused until merge.** User clarified that each
+phase's PR must merge into main before the next phase begins. Pushed through `e74a0aa`,
+including phase-5 proofs and a separate formatting-only cleanup, and opened PR #5 with gh:
+https://github.com/Shailu-s/payments-platform/pull/5. Verified the committed phase-5 snapshot
+in an isolated worktree: build, full tests, vet, SIGKILL race test and formatting checks pass.
+PR is open, not merged. Phase-6 source edits and this later log remain uncommitted and are
+excluded from the PR. Next: review/merge phase 5, then preserve those edits on a new phase-6
+branch before continuing. Local CLAUDE.md now explicitly records the merge gate.
+
+**2026-10-05 — user merged PR #5; stopping until the next session.** Verified GitHub main
+at `9d0639545161581d815cbdc9fcbc22ef683ab0ca`. Phase 5 is merged. Phase-6 atomicity edits
+remain local and uncommitted; no branch switch or further feature work. Next session:
+create a phase-6 branch from updated main without losing those edits, review/commit the
+atomicity fix, then inbound HMAC/replay protection and outbound retries/backoff/DLQ.
+
+**2026-10-06 — working method reaffirmed before resuming phase 6.** For each piece, explain
+the constraint/why, what changed, actual code/data flow, tests and cost in short steps.
+Confirm understanding through explain-back and resolve confusion before explicit approval
+for any commit or push. Project docs/memory reread; phase 5 merge and preserved phase-6
+edits verified. Only workflow documentation changed; no new application code or Git action.
+Next: time budget, safe phase-6 branch setup, then explain the prepared atomicity fix.
+
+**2026-10-06 — phase-6 branch created safely; first fix ready for code review.** With more
+than 3 hours available, created phase-6-webhooks from merged origin/main at 9d06395 after
+checking tree equality; preserved all existing edits. Re-verified the prepared atomicity
+fix with build, full tests, vet and targeted race tests. No new feature code or commit/push.
+Next: explain the actual transaction/duplicate/rollback code and confirm understanding
+before approval; HMAC/replay work waits until that piece is reviewed.
+
+**2026-10-06 — atomic webhook fix reviewed and approved for commit/push.** Walked through
+shared transaction/rollback, INSERT ON CONFLICT and its row-count result, and pgx savepoints.
+He explained that a rolled-back attempt leaves the retry as a first attempt, a waiting
+second delivery processes after rollback, and rejection of the outer COMMIT undoes both
+event and ledger changes. Failure tests/cost explained; explicit commit/push approval given.
+Next piece: inbound HMAC signature and replay window, tested then explained before any
+further commit/push.
+
+**2026-10-06 — atomicity pushed; inbound HMAC/replay slice tested, awaiting code review.**
+Approved atomicity commit `4a19435` is on origin/phase-6-webhooks. Added HMAC-SHA256 over
+signed delivery timestamp + dot + raw body, an inclusive five-minute clock window, and
+verification before JSON/DB work. MockBank signs each retry afresh. First red test showed
+an unsigned request crediting 50000 cents; it now returns 401 without an event or credit.
+Matching/mismatched-key real-handler HTTP tests, full tests, vet, formatting and targeted
+race tests pass. Expanded race checks also exposed a pre-existing live-pointer response
+bug in MockBank Submit; snapshot returns and a failing-first regression fix it.
+HMAC/snapshot changes remain uncommitted pending explanation/understanding/approval.
+Required local signing key and safe MockBank rollout are pending user action; no secret
+values exposed, local .env edited or containers restarted. Outbound delivery remains next.
+
+**2026-10-06 — inbound signing reviewed; commit/push approved.** Explained the shared-key
+HMAC, raw input, signed freshness timestamp, duplicate handling and the full function flow.
+He correctly explained that changing a captured request's timestamp while retaining its
+signature fails verification because the timestamp is signed. Explicit push approval was
+given. Snapshot race fix committed separately as `ca783e5`; signing/config/tests follow in
+the next commit. Local key configuration and container rollout remain pending, not silently
+performed. The next feature is outbound customer delivery with retries/backoff/DLQ status;
+manual replay and delivery history remain cut.
+
+**2026-10-06 — outbound slice 1: terminal events ready, awaiting code review.** First
+watched the missing-event test fail: settled/failed transfers had no completion outbox row.
+Shared Settle/Fail now write transfer.settled/transfer.failed with a six-field public payload
+on the same transaction as state/ledger effects. Duplicate/concurrent/conflicting callbacks
+emit no additional completion event. Outbox-insert and final-commit failures leave no orphan
+notification; retries succeed after recovery. Build, full tests, vet and targeted race
+checks pass. No new schema, settings or broker. Changes uncommitted pending explanation
+and approval; customer delivery consumer/retries/DLQ are the following slices. Private
+signing-key setup and safe runtime rollout remain pending; no service was restarted.
+
+**2026-10-06 — terminal-event explanation reviewed; commit/push approved.** Used the
+customer invoice example and walked through shared Settle/Fail plus the event writer.
+He explained that an outbox insert failure rolls back our attempted status/ledger changes,
+allowing the callback to retry. Clarified that only actual final transitions emit, the
+bank's payment is not rolled back, and MockBank's finite in-memory retry is the current
+redelivery source (not a durable inbound inbox). He explicitly approved commit/push and
+building customer delivery next. Customer HTTP outages must retry notification work only,
+never undo or resend the payment; replay/history remain outside scope.
+
+**2026-10-07 — terminal events pushed; customer delivery ready for review, not committed.**
+Pushed approved terminal-event commit 3718b8c before writing delivery code. Added migration
+000011 and internal/customerwebhooks: consumer durably saves one current delivery per event
+before offset acknowledgment; a separate DB loop sends signed notifications to one configured
+customer URL. Stable envelope event_id/event_type/data, X-Payments-Event-Id/Timestamp/Signature
+headers, separate required customer key. Retry transport/timeout/5xx/408/429 with exponential
+backoff; permanent errors/exhaustion record dead status. Persisted leases/attempt fences
+survive worker restart and block stale response overwrites. Response loss can replay, so
+customers must deduplicate by event ID. No history/replay API or additional broker/DLQ topic.
+Red/green tests, actual outbox→Kafka→consumer→customer 503/recovery proof, full build/tests/vet
+and relevant full race suites pass without additional ledger effects. New make webhook-sender
+command uses independent customer-webhooks group and drains existing jobs even if Kafka
+startup ping fails. Local env, primary schema and running services untouched. Outbound code
+uncommitted pending teaching/explain-back/handwritten piece and approval. Private config,
+safe rollout, phase-6 PR and merge remain before phase 7.
+
+**2026-10-07 — customer delivery flow reviewed; commit/push approved.** Explained the
+actual relay→Kafka→customer consumer→delivery table→HTTP worker path and where each function
+lives. He initially applied recovery to the unsafe acknowledge-before-save hypothetical;
+clarified no job would exist there. He then correctly identified saving the pending delivery
+in DB as the step required before Kafka acknowledgment. Explicit commit/push request given.
+Delivery engine/schema/proofs committed as 015941b; command/env wiring follows separately.
+No local migration, private-config edit, service restart or external endpoint call performed.
+The handwritten claim/retry piece and final local rollout/PR review remain pending.
+
+**2026-10-07 — local setup started; migration 11 applied, keys block startup.** Ran the
+additive make -s migrate-up without resetting existing application tables. User specifically
+approved MockBank recreation (in-memory sandbox state loss disclosed) and selected a local
+test receiver. Despite reporting keys set, a non-disclosing length check still finds both
+required signing keys insufficient in the repository's loaded .env. No bank rebuild/API
+startup performed yet. Port 8082 is occupied by another process; leave it untouched and
+use free port 18082 for our controlled receiver. Asking for private config completion;
+live verification, handwritten review and PR remain pending. No secrets displayed.
+
+**2026-10-10 — real local phase-6 flow verified; Docker build fixes await commit approval.**
+Private keys/URL now validate without disclosure; migration 11 already applied. Added
+.dockerignore before any COPY build step to exclude local secrets. MockBank build failed
+because its 1.25 builder disables automatic toolchain downloads while go.mod needs 1.26.0.
+User approved pinned golang:1.26.7-alpine and the specific container recreation; build and
+rebuild succeeded without changing that restriction. Only approved MockBank memory reset;
+PG/Kafka and existing application data preserved. API, relay, customer worker and controlled
+receiver ran: fresh $5 sandbox transfer settled once; signed customer event returned 503
+then 200, same ID, two requests/one effect, source and destination 500 cents each, exactly
+three scoped ledger transactions. Unsigned bank callback rejected 401. No real customer
+endpoint used. Build exclusions/version change and this LOG uncommitted; handwritten
+claim/retry review and phase-6 PR/merge remain before phase 7. Services remain running.
+
+**2026-10-10 — user approved final commit/push/PR and phase-6 merge.** Short on time,
+he explicitly requested merging phase 6 and a phase-7 plan. Handwritten claim/retry exercise
+is deferred learning, not marked done and not a merge blocker under this latest request.
+Re-reviewed all phase-6 commits, identity and live proof; build, full tests, vet and broad
+race suites passed. Strengthened the durable retry test to exactly five failures then
+sixth-attempt success, with unchanged ID/body and 1/2/4/8/16-second persisted dates; targeted
+race test and permanent-failure dead status both pass. Docker exclusions/version alignment
+and final evidence follow as a small commit; create/merge PR through gh without bypassing
+checks. Phase 7 is planning only: provider file contract, six classifications, persisted
+exceptions and deliberately corrupted fixture; detect differences, never auto-fix money.

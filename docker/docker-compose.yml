@@ -28,6 +28,7 @@ services:
       # The API runs on the host, outside this Compose network.
       WEBHOOK_URL: "http://host.docker.internal:8080/v1/webhooks/mockbank"
       SETTLE_DELAY: "2s"
+      MOCKBANK_WEBHOOK_SECRET: "${MOCKBANK_WEBHOOK_SECRET:?set MOCKBANK_WEBHOOK_SECRET in .env}"
     ports:
       - "8081:8081"
     extra_hosts:

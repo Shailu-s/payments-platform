@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,13 +11,17 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 )
+
+const testWebhookSecret = "test-only-webhook-secret-never-use-in-production"
 
 // Exercise the HTTP contract in docs/mockbank-api.md, not just store internals.
 
 func newTestBank(t *testing.T, behaviour Behaviour, webhookURL string) http.Handler {
 	t.Helper()
-	return NewServer(NewStore(), behaviour, webhookURL).Handler()
+	return NewServer(NewStore(), behaviour, webhookURL, []byte(testWebhookSecret)).Handler()
 }
 
 func submit(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
@@ -209,6 +214,53 @@ func TestGetByClientReferenceRescuesAnUnknownOutcome(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/transfers?client_reference=tr_never_sent", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("unknown reference status = %d, want 404", rec.Code)
+	}
+}
+
+func TestWebhookSignsRetriesWithFreshTimestamp(t *testing.T) {
+	type delivery struct {
+		body      string
+		timestamp string
+		signature string
+		valid     bool
+	}
+	deliveries := make(chan delivery, 2)
+	var attempts atomic.Int64
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		timestamp := r.Header.Get(webhooks.TimestampHeader)
+		signature := r.Header.Get(webhooks.SignatureHeader)
+		valid := err == nil && webhooks.Verify([]byte(testWebhookSecret), timestamp, signature, body, time.Now())
+		deliveries <- delivery{body: string(body), timestamp: timestamp, signature: signature, valid: valid}
+		if !valid {
+			w.WriteHeader(http.StatusUnauthorized)
+		} else if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer receiver.Close()
+	h := newTestBank(t, wellBehaved{settleDelay: time.Millisecond}, receiver.URL)
+	submit(t, h, submitBody("tr_signed_retry", 50000))
+	read := func() delivery {
+		select {
+		case got := <-deliveries:
+			return got
+		case <-time.After(5 * time.Second):
+			t.Fatal("signed webhook did not arrive")
+			return delivery{}
+		}
+	}
+	first, second := read(), read()
+	if !first.valid || !second.valid {
+		t.Error("webhook attempt had an invalid signature")
+	}
+	if first.body != second.body {
+		t.Error("retry changed the event body instead of redelivering it")
+	}
+	if first.timestamp == second.timestamp || first.signature == second.signature {
+		t.Error("retry reused the previous attempt's timestamp/signature")
 	}
 }
 

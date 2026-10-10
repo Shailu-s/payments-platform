@@ -5,17 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/transfers"
-	"github.com/jackc/pgerrcode"
+	"github.com/Shailu-s/payments-platform/internal/webhooks"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Delivery is at least once and unordered; events may precede stored provider references.
-// This endpoint does not yet verify signatures or enforce a replay window.
+// Signed delivery timestamps bound replay age; event IDs prevent duplicate effects.
 type providerEvent struct {
 	EventID         string    `json:"event_id"`
 	ProviderRef     string    `json:"provider_ref"`
@@ -28,8 +28,23 @@ type providerEvent struct {
 }
 
 func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		status := http.StatusBadRequest
+		if errors.As(err, &maxErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeError(w, status, CodeInvalidRequest, "could not read webhook body")
+		return
+	}
+	if !webhooks.Verify(s.webhookSecret, r.Header.Get(webhooks.TimestampHeader),
+		r.Header.Get(webhooks.SignatureHeader), body, time.Now()) {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "invalid webhook signature or timestamp")
+		return
+	}
 	var event providerEvent
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&event); err != nil {
+	if err := json.Unmarshal(body, &event); err != nil {
 		// Malformed events cannot be fixed by redelivery.
 		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "event body is not valid json")
 		return
@@ -52,46 +67,55 @@ func (s *Server) handleProviderWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The unique event ID prevents concurrent duplicate deliveries acting twice.
-	// These are separate commits: a failed transition leaves the event recorded.
-	firstTime, err := s.recordEvent(r.Context(), event)
+	// The event ID and its financial effect commit together.
+	// A failed attempt must leave the event available for redelivery.
+	status, err := s.applyProviderEvent(r.Context(), event, transferID)
 	if err != nil {
 		writeInternalError(w, r, err)
 		return
 	}
-	if !firstTime {
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status": "already_processed", "event_id": event.EventID,
-		})
-		return
+	response := map[string]string{"status": status, "event_id": event.EventID}
+	if status == "processed" {
+		response["transfer_id"] = transferID
 	}
+	writeJSON(w, http.StatusOK, response)
+}
 
+func (s *Server) applyProviderEvent(ctx context.Context, event providerEvent, transferID string) (string, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin webhook %s: %w", event.EventID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	firstTime, err := recordEvent(ctx, tx, event)
+	if err != nil {
+		return "", err
+	}
+	if !firstTime {
+		return "already_processed", nil
+	}
+	status := "processed"
 	switch event.Status {
 	case transfers.StatusSettled:
-		if err := transfers.Settle(r.Context(), s.db, transferID); err != nil {
-			writeInternalError(w, r, err)
-			return
-		}
+		err = transfers.Settle(ctx, tx, transferID)
 	case transfers.StatusFailed:
 		reason := "provider reported failed"
 		if event.FailureReason != nil {
 			reason = *event.FailureReason
 		}
-		if err := transfers.Fail(r.Context(), s.db, transferID, reason); err != nil {
-			writeInternalError(w, r, err)
-			return
-		}
+		err = transfers.Fail(ctx, tx, transferID, reason)
 	default:
 		// Redelivery cannot make an unsupported status actionable.
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status": "ignored", "event_id": event.EventID,
-		})
-		return
+		status = "ignored"
 	}
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status": "processed", "event_id": event.EventID, "transfer_id": transferID,
-	})
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit webhook %s: %w", event.EventID, err)
+	}
+	return status, nil
 }
 
 func (s *Server) transferForEvent(ctx context.Context, event providerEvent) (string, error) {
@@ -122,7 +146,7 @@ func (s *Server) transferForEvent(ctx context.Context, event providerEvent) (str
 }
 
 // Insert first: checking for an event before inserting would race concurrent deliveries.
-func (s *Server) recordEvent(ctx context.Context, event providerEvent) (bool, error) {
+func recordEvent(ctx context.Context, tx pgx.Tx, event providerEvent) (bool, error) {
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return false, fmt.Errorf("encoding event: %w", err)
@@ -130,16 +154,12 @@ func (s *Server) recordEvent(ctx context.Context, event providerEvent) (bool, er
 
 	const q = `
 		INSERT INTO webhook_events (id, event_id, provider_ref, status, payload)
-		VALUES ($1, $2, $3, $4, $5)`
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (event_id) DO NOTHING`
 
-	_, err = s.db.Exec(ctx, q, newID("whe"), event.EventID, event.ProviderRef, event.Status, payload)
-	if err == nil {
-		return true, nil
+	tag, err := tx.Exec(ctx, q, newID("whe"), event.EventID, event.ProviderRef, event.Status, payload)
+	if err != nil {
+		return false, fmt.Errorf("record event %s: %w", event.EventID, err)
 	}
-
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
-		return false, nil
-	}
-	return false, fmt.Errorf("record event %s: %w", event.EventID, err)
+	return tag.RowsAffected() == 1, nil
 }
