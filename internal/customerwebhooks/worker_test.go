@@ -115,11 +115,11 @@ func TestDeliveryRetriesDurablyWithExponentialBackoff(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
 	var calls atomic.Int64
-	bodies := make(chan string, 3)
+	bodies := make(chan string, 6)
 	receiver := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		bodies <- string(body)
-		if calls.Add(1) <= 2 {
+		if calls.Add(1) <= 5 {
 			rw.WriteHeader(http.StatusServiceUnavailable)
 		} else {
 			rw.WriteHeader(http.StatusOK)
@@ -136,7 +136,7 @@ func TestDeliveryRetriesDurablyWithExponentialBackoff(t *testing.T) {
 	if err := w.Handle(ctx, terminalRecord("evt_retry", "settled")); err != nil {
 		t.Fatal(err)
 	}
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; attempt <= 6; attempt++ {
 		if n, err := w.RunOnce(ctx); err != nil || n != 1 {
 			t.Fatalf("attempt %d processed %d: %v", attempt, n, err)
 		}
@@ -144,9 +144,9 @@ func TestDeliveryRetriesDurablyWithExponentialBackoff(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if attempt == 3 {
-			if job.Status != StatusDelivered || job.AttemptCount != 3 {
-				t.Errorf("after recovery = %+v, want delivered/3", job)
+		if attempt == 6 {
+			if job.Status != StatusDelivered || job.AttemptCount != 6 {
+				t.Errorf("after recovery = %+v, want delivered/6", job)
 			}
 			break
 		}
@@ -164,11 +164,13 @@ func TestDeliveryRetriesDurablyWithExponentialBackoff(t *testing.T) {
 		}
 	}
 	first := <-bodies
-	if second, third := <-bodies, <-bodies; first != second || first != third {
-		t.Error("retry changed event ID or payload")
+	for i := 1; i < 6; i++ {
+		if body := <-bodies; body != first {
+			t.Error("retry changed event ID or payload")
+		}
 	}
-	if calls.Load() != 3 {
-		t.Errorf("HTTP attempts = %d, want 3", calls.Load())
+	if calls.Load() != 6 {
+		t.Errorf("HTTP attempts = %d, want 6", calls.Load())
 	}
 }
 

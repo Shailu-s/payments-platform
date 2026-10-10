@@ -839,3 +839,36 @@ in DB as the step required before Kafka acknowledgment. Explicit commit/push req
 Delivery engine/schema/proofs committed as 015941b; command/env wiring follows separately.
 No local migration, private-config edit, service restart or external endpoint call performed.
 The handwritten claim/retry piece and final local rollout/PR review remain pending.
+
+**2026-10-07 — local setup started; migration 11 applied, keys block startup.** Ran the
+additive make -s migrate-up without resetting existing application tables. User specifically
+approved MockBank recreation (in-memory sandbox state loss disclosed) and selected a local
+test receiver. Despite reporting keys set, a non-disclosing length check still finds both
+required signing keys insufficient in the repository's loaded .env. No bank rebuild/API
+startup performed yet. Port 8082 is occupied by another process; leave it untouched and
+use free port 18082 for our controlled receiver. Asking for private config completion;
+live verification, handwritten review and PR remain pending. No secrets displayed.
+
+**2026-10-10 — real local phase-6 flow verified; Docker build fixes await commit approval.**
+Private keys/URL now validate without disclosure; migration 11 already applied. Added
+.dockerignore before any COPY build step to exclude local secrets. MockBank build failed
+because its 1.25 builder disables automatic toolchain downloads while go.mod needs 1.26.0.
+User approved pinned golang:1.26.7-alpine and the specific container recreation; build and
+rebuild succeeded without changing that restriction. Only approved MockBank memory reset;
+PG/Kafka and existing application data preserved. API, relay, customer worker and controlled
+receiver ran: fresh $5 sandbox transfer settled once; signed customer event returned 503
+then 200, same ID, two requests/one effect, source and destination 500 cents each, exactly
+three scoped ledger transactions. Unsigned bank callback rejected 401. No real customer
+endpoint used. Build exclusions/version change and this LOG uncommitted; handwritten
+claim/retry review and phase-6 PR/merge remain before phase 7. Services remain running.
+
+**2026-10-10 — user approved final commit/push/PR and phase-6 merge.** Short on time,
+he explicitly requested merging phase 6 and a phase-7 plan. Handwritten claim/retry exercise
+is deferred learning, not marked done and not a merge blocker under this latest request.
+Re-reviewed all phase-6 commits, identity and live proof; build, full tests, vet and broad
+race suites passed. Strengthened the durable retry test to exactly five failures then
+sixth-attempt success, with unchanged ID/body and 1/2/4/8/16-second persisted dates; targeted
+race test and permanent-failure dead status both pass. Docker exclusions/version alignment
+and final evidence follow as a small commit; create/merge PR through gh without bypassing
+checks. Phase 7 is planning only: provider file contract, six classifications, persisted
+exceptions and deliberately corrupted fixture; detect differences, never auto-fix money.
