@@ -326,16 +326,19 @@ money was not moved earlier.
 
 ## Sandbox — operator endpoints
 
-Not part of the payment contract. Used by tests and by the chaos work later.
+Not part of the payment contract. Used by tests and operator investigation; reset discards
+retained payment and deduplication history.
 
 ```http
 POST /sandbox/reset           drop all state
 GET  /sandbox/transfers       list everything received
 ```
 
-Scenario injection (forcing timeouts, duplicate webhooks, wrong amounts) is
-specified separately and arrives after phase 7. The implementation keeps a
-single decision point so scenarios can be added without rewriting the handlers.
+The fast-tracked V1 has no scenario-injection endpoint. Controlled transport/event tests
+use Behaviour and test-only acknowledgement/callback gates; corrupted CSV fixtures
+separately exercise all six reconciliation classifications. `make demo-v1` demonstrates
+normal and accepted-but-timed-out payments, duplicate callbacks, customer retry and
+reconciliation without resetting the running provider or modifying application tables.
 
 ---
 

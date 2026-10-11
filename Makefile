@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench bench-metrics demo-v1
 
 up:
 	$(COMPOSE) up -d --wait
@@ -28,6 +28,9 @@ test:
 
 chaos-kill-consumer:
 	@bash scripts/chaos-kill-consumer.sh
+
+demo-v1:
+	@go test ./cmd/mock-bank -run '^TestV1PaymentSurvivesTimeoutAfterSuccess$$' -v -count=1
 
 # Requires `make run` in another terminal; resets the local database.
 demo:
@@ -59,6 +62,10 @@ bench:
 	@go test ./internal/api -run '^TestLockStrategyComparison$$' -v -count=3
 	@go test ./internal/ratelimit -run '^$$' -bench 'Benchmark(Allow|BaselineRoundTrip)$$' -benchmem -benchtime=1s -count=3
 	@$(MAKE) --no-print-directory bench-reconciliation
+	@$(MAKE) --no-print-directory bench-metrics
+
+bench-metrics:
+	@go test ./internal/api -run '^$$' -bench 'Benchmark(HTTPMetricsObservation|MetricsScrape1000Records)' -benchmem -benchtime=1s -count=3
 
 bench-reconciliation:
 	@go test ./internal/reconciliation -run '^$$' -bench 'Benchmark(Compare|ReadReport)' -benchmem -benchtime=1s -count=3
