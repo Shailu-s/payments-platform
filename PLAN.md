@@ -995,3 +995,65 @@ Publication: four dependency-ordered commits on `v1-closure`, targeting `main` f
 no merge or deployment is authorised. The source-level V1 closure is complete. Deferred
 handwritten retrieval is learning, not represented as completed, and live migration/binary
 rollout remains explicit operator work. The verification DB is retained for inspection.
+
+**2026-10-11 — V1 closure PR #8 merged at the user's explicit request.** Verified the
+reviewed head `381488c657e876a67f7922c6bd46484dcd7f1ce0`, clean mergeability and no configured
+GitHub checks, then merged without admin/bypass flags or branch deletion. GitHub main and
+local main now match `439ea09d6ea7dee8277c774d0216a053b98aaa1a`; local update was fast-forward
+only. All seven phases and the source-level V1 closure are merged. No new feature work,
+primary migration, secret change or live service restart. Migration 13 and updated binary
+rollout remain operator actions; no further V1 product feature is required. This merge log
+update remains local/uncommitted rather than adding an unapproved fifth publication commit.
+
+**2026-10-12 — local rollout complete; clean parallel sandbox ready for user manual testing.**
+User requested finishing rollout/log work, then his manual testing, then benchmarking and an
+editable Excalidraw plus code-linked architecture walkthrough. Future stages remain in that
+order; no benchmarking or diagram implementation performed during this rollout.
+
+Primary DB was still at migration 11. Non-disclosing checks verified the expected local DB,
+valid/distinct signing keys and local service endpoints. Applied additive migrations 12/13;
+six transfers and eighteen existing ledger entries were retained. User explicitly approved
+snapshotting/recreating only MockBank (one retained settled instruction and provider dedupe
+history lost) and resuming five existing unsent sandbox transfers. Saved the provider dump
+in ignored `bin/mockbank-pre-v1-rollout-20261011.json`. Postgres/Kafka were not reset.
+Started current API/relay/sender/poller/customer worker; all six transfers are now settled,
+with fourteen ledger transactions/twenty-eight entries. The five new settlement transactions
+all balance. Primary reconciliation records five MATCHED and one MISSING_EXTERNAL, the
+previously settled instruction lost from provider memory during the approved replacement.
+No automatic money correction or historical row rewrite.
+
+Five resumed customer notifications exhausted six transport attempts and became dead.
+A separately approved signed diagnostic POST to the old Python receiver on 18082 reproduced
+RemoteDisconnected/no HTTP response while GET still worked; endpoint scheme/port matched.
+Its old temporary source/logs were unavailable, so the internal receiver exception was not
+claimed identified. User approved replacing only receiver PID 47714; no jobs were reset or
+replayed. Ignored `bin/manual-receiver` now verifies HMAC, checks header/body event identity,
+deduplicates the signed event ID and exposes read-only receipts on loopback 18082. Its unit
+and race checks pass. It is a local testing sink, not new production API scope.
+
+A read-only invariant audit also found a pre-existing October 4 fixture: ltx_demo_funding
+credits 1,000,000 cents but debits 50,000, leaving 950,000 imbalance. The current demo script
+contains balanced amounts; the historical mutation's origin was not asserted. This defect
+was not introduced by the rollout, and the original history was not modified. User selected
+a fresh parallel manual sandbox instead of using the contaminated baseline.
+
+Created payments_manual_v1, applied all thirteen migrations, and started a dedicated
+payments-manual-kafka (apache/kafka:3.8.0, host 19092, three-partition transfers topic).
+Current API/bank/relay/sender/poller/customer worker run separately: API 18080, bank 18081,
+Kafka 19092, controlled receiver 18082. The previously rolled-out primary DB, bank and
+broker were retained unchanged while creating this parallel sandbox.
+Ignored `bin/manual-v1.sh` supplies non-secret sandbox-only overrides without changing .env;
+destructive legacy demo/down/redo targets are excluded. Ignored `bin/manual-seed` is restricted
+to the dedicated local DB and uses an advisory lock plus the checked ledger writer so seed
+retries do not add funding twice. Verified two seed calls leave one transaction/two entries,
+zero unbalanced transactions, zero transfers. Source acc_manual_company initially has
+100,000 USD cents; destination acc_manual_vendor zero. API/bank readiness and protected
+metrics 401 verified; both consumer groups assigned successfully. No payment was created
+in this clean sandbox by the agent. User now performs manual tests. Benchmarks and the
+actual-flow/function/SQL/failure-path Excalidraw walkthrough follow his results.
+
+Only this LOG changed in tracked source; backups/testing helpers are ignored runtime
+artifacts and must not be staged. User explicitly selected "Commit and push log", waiving
+explain-back for one PLAN.md-only commit/push to main. Historical dead deliveries remain
+intact for inspection. Manual testing is now handed to the user; benchmarking and the
+Excalidraw/code walkthrough are still pending his testing results.
