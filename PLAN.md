@@ -611,6 +611,8 @@ were added on 2026-09-19 before any code existed). That is the exact behaviour t
 `card-engine`. Phase count stayed at seven on purpose. **Nothing else gets added to V1 until
 phase 4 is running.**
 
+**Superseded 2026-10-13: the post-V1 plan now lives in [ROADMAP.md](ROADMAP.md) (debit card backend, then stablecoin top-up, then a credit limit).** Original list kept below for history.
+
 Later versions, strictly after V1 is complete and only if wanted:
 
 ```
