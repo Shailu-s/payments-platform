@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench bench-metrics demo-v1
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench bench-metrics bench-http bench-balance demo-v1
 
 up:
 	$(COMPOSE) up -d --wait
@@ -63,6 +63,13 @@ bench:
 	@go test ./internal/ratelimit -run '^$$' -bench 'Benchmark(Allow|BaselineRoundTrip)$$' -benchmem -benchtime=1s -count=3
 	@$(MAKE) --no-print-directory bench-reconciliation
 	@$(MAKE) --no-print-directory bench-metrics
+
+# Open-model HTTP sweep against a disposable payments_bench database. See BENCHMARKS.md.
+bench-http:
+	@bash scripts/bench-http.sh
+
+bench-balance:
+	@go test ./internal/ledger -run '^$$' -bench BenchmarkBalanceByHistory -benchtime=2s -count=1
 
 bench-metrics:
 	@go test ./internal/api -run '^$$' -bench 'Benchmark(HTTPMetricsObservation|MetricsScrape1000Records)' -benchmem -benchtime=1s -count=3

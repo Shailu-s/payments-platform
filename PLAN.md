@@ -10,6 +10,11 @@ on a portfolio commit).
 
 ## 🚨 Working method
 
+**Changed 2026-10-14: orchestrator plans and writes a brief, executor builds and opens the
+PR, orchestrator reviews and re-runs tests and benchmarks.** Shailendra approves each
+phase plan, reads the merge report and replies "merge" before any phase PR merges; the
+per-commit explain-back gate below is retired. Every phase re-runs the benchmarks in [BENCHMARKS.md](BENCHMARKS.md).
+
 **Changed 2026-10-05: Claude writes, Shailendra reviews and explains.**
 
 - Claude writes each piece into the repo in small, tested changes before it is shown.
@@ -1059,3 +1064,16 @@ artifacts and must not be staged. User explicitly selected "Commit and push log"
 explain-back for one PLAN.md-only commit/push to main. Historical dead deliveries remain
 intact for inspection. Manual testing is now handed to the user; benchmarking and the
 Excalidraw/code walkthrough are still pending his testing results.
+
+**2026-10-14 — V1 benchmarked; workflow changed to orchestrator/executor.** User asked to
+benchmark V1, plan for a scalable low-latency system, and switch to orchestrator → brief →
+executor → review/merge. Added an open-model k6 harness (`make bench-http`, disposable
+`payments_bench` DB only, 1,000 funded accounts, 3,000 keys) and `make bench-balance`.
+Baseline in BENCHMARKS.md: spread knee ~1,100 req/s (p99 9 ms at 500, collapse past
+1,100); one hot account ceiling ~390 req/s and retrograde as history grows, with all 10
+pool connections waiting on that row's lock (noisy-neighbour outage); `ledger.Balance`
+0.17 ms at 1k entries -> 27 ms at 1M. No server-side deadline or load shedding. Ledger
+stayed balanced after overload (0 unbalanced, 55,287 transfers). User approved: the
+hot-path phase before cards (stored balance + one-statement check-and-debit, shorter lock
+window, admission control, invariant check, replay-gap fix); executor as a subagent; phase
+PRs merge only after his "merge"; the harness PR may merge directly.
