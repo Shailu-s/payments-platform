@@ -96,8 +96,8 @@ func TestGetAccountReturnsADerivedBalance(t *testing.T) {
 	destination := createAccount(t, h, key, "settlement")
 
 	if _, err := ledger.Record(ctx, testPool, "test movement", []ledger.Entry{
-		{AccountID: source.ID, Direction: ledger.DirectionDebit, Amount: 50000},
-		{AccountID: destination.ID, Direction: ledger.DirectionCredit, Amount: 50000},
+		{AccountID: destination.ID, Direction: ledger.DirectionDebit, Amount: 50000},
+		{AccountID: source.ID, Direction: ledger.DirectionCredit, Amount: 50000},
 	}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -110,16 +110,16 @@ func TestGetAccountReturnsADerivedBalance(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Balance != -50000 {
-		t.Errorf("balance = %d, want -50000", got.Balance)
+	if got.Balance != 50000 {
+		t.Errorf("balance = %d, want 50000", got.Balance)
 	}
 
 	rec = do(t, h, "GET", "/v1/accounts/"+destination.ID, key, "")
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Balance != 50000 {
-		t.Errorf("balance = %d, want 50000", got.Balance)
+	if got.Balance != -50000 {
+		t.Errorf("balance = %d, want -50000", got.Balance)
 	}
 }
 

@@ -366,9 +366,10 @@ func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
 
-	// Funded from a second account rather than settlement, because settlement
-	// is about to be removed and a ledger entry against it would block that.
-	funder := createAccount(t, h, key, "asset")
+	// Funded from a second settlement-type account rather than the real one,
+	// because that is about to be removed and a ledger entry against it would
+	// block that. Only settlement-type accounts may go negative.
+	funder := createAccount(t, h, key, "settlement")
 	if _, err := ledger.Record(ctx, testPool, "funding", []ledger.Entry{
 		{AccountID: funder.ID, Direction: ledger.DirectionDebit, Amount: 1000000},
 		{AccountID: source.ID, Direction: ledger.DirectionCredit, Amount: 1000000},

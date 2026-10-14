@@ -50,7 +50,7 @@ func TestRecordRejectsOverflowingTotals(t *testing.T) {
 func TestRecordAcceptsMaximumRepresentableTotal(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
-	createAccount(t, "acc_max_a")
+	createSettlementAccount(t, "acc_max_a")
 	createAccount(t, "acc_max_b")
 	if _, err := Record(ctx, testPool, "maximum total", []Entry{
 		{AccountID: "acc_max_a", Direction: DirectionDebit, Amount: math.MaxInt64 - 1},

@@ -11,7 +11,7 @@ import (
 func TestLedgerHistoryRejectsUpdatesAndDeletes(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
-	createAccount(t, "acc_immutable_source")
+	createSettlementAccount(t, "acc_immutable_source")
 	createAccount(t, "acc_immutable_destination")
 	id, err := Record(ctx, testPool, "immutable payout", []Entry{
 		{AccountID: "acc_immutable_source", Direction: DirectionDebit, Amount: 50000},

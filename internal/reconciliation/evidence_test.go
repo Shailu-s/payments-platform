@@ -37,7 +37,7 @@ func TestProviderDiscrepanciesAreDetectedWithoutFinancialMutation(t *testing.T) 
 	seedPayments(t, pool, internal)
 	if _, err := ledger.Record(ctx, pool, "reconciliation test funding", []ledger.Entry{
 		{AccountID: "acc_src", Direction: ledger.DirectionCredit, Amount: 500000},
-		{AccountID: "acc_dst", Direction: ledger.DirectionDebit, Amount: 500000},
+		{AccountID: "acc_settlement_usd", Direction: ledger.DirectionDebit, Amount: 500000},
 	}); err != nil {
 		t.Fatal(err)
 	}

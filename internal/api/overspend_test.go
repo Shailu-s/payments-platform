@@ -120,8 +120,10 @@ func TestConcurrentTransfersCannotOverspend(t *testing.T) {
 	}
 }
 
-// Balanced transactions can still overdraw an account; the API's locked
-// balance check protects a different invariant from double-entry bookkeeping.
+// Balanced transactions can still overdraw an account: double-entry alone is
+// blind to it, because the overdraft is a perfectly balanced transaction. The
+// CHECK on account_balances is what refuses it, so it holds even for a caller
+// that writes to the ledger directly and skips the API.
 func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 	h, apiKey := newTestServer(t)
 	ctx := context.Background()
@@ -129,14 +131,17 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 	source := createAccount(t, h, apiKey, "asset")
 	fund(t, source.ID, 100000) // $1,000
 
-	// Bypass the API balance check.
-	for i := 0; i < 2; i++ {
-		if _, err := ledger.Record(ctx, testPool, "overspend", []ledger.Entry{
-			{AccountID: source.ID, Direction: ledger.DirectionDebit, Amount: 70000},
-			{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: 70000},
-		}); err != nil {
-			t.Fatalf("Record: %v", err)
-		}
+	overspend := []ledger.Entry{
+		{AccountID: source.ID, Direction: ledger.DirectionDebit, Amount: 70000},
+		{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: 70000},
+	}
+	if _, err := ledger.Record(ctx, testPool, "overspend", overspend); err != nil {
+		t.Fatalf("first $700: %v", err)
+	}
+	// Balanced, valid entries: only the stored balance knows there is $300 left.
+	_, err := ledger.Record(ctx, testPool, "overspend", overspend)
+	if !errors.Is(err, ledger.ErrInsufficientFunds) {
+		t.Fatalf("second $700 against $300: err = %v, want ledger.ErrInsufficientFunds", err)
 	}
 
 	var unbalanced int
@@ -153,28 +158,14 @@ func TestTheLedgerInvariantDoesNotCatchAnOverspend(t *testing.T) {
 		t.Fatalf("%d ledger transactions do not balance", unbalanced)
 	}
 
-	var total int64
-	if err := testPool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END), 0)
-		FROM ledger_entries`).Scan(&total); err != nil {
-		t.Fatalf("sum entries: %v", err)
-	}
-	if total != 0 {
-		t.Fatalf("all entries sum to %d, want 0", total)
-	}
-
 	balance, err := ledger.Balance(ctx, testPool, source.ID)
 	if err != nil {
 		t.Fatalf("Balance: %v", err)
 	}
-	if balance != -40000 {
-		t.Fatalf("source balance is %d, want -40000", balance)
+	if balance != 30000 {
+		t.Fatalf("source balance is %d, want 30000: the refused debit must leave nothing behind", balance)
 	}
 
-	t.Logf("every transaction balances, every entry sums to 0, and the account "+
-		"is %d overdrawn: the invariant is blind to this", -balance)
-
-	// The money did not vanish — settlement is holding what the account never had.
 	settlement, err := ledger.Balance(ctx, testPool, settlementAccountID)
 	if err != nil {
 		t.Fatalf("settlement balance: %v", err)
