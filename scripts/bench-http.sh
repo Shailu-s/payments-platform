@@ -3,6 +3,10 @@
 # Never touches the application database: the target must be named payments_bench*.
 #
 #   MODES="spread hot" RATES="100 250 500 1000" DURATION=30s scripts/bench-http.sh
+#
+# MODE mixed drives the hot account at each RATE while spread traffic runs at
+# SPREAD_RATE alongside it, and reports the two as mixed-hot and mixed-spread.
+# HOT_HISTORY gives the hot account that many pre-existing entries.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,6 +18,8 @@ RATES="${RATES:-100 250 500 1000 1500}"
 DURATION="${DURATION:-30s}"
 ACCOUNTS="${ACCOUNTS:-1000}"
 KEYS="${KEYS:-3000}"
+SPREAD_RATE="${SPREAD_RATE:-300}"
+HOT_HISTORY="${HOT_HISTORY:-0}"
 LABEL="${LABEL:-$(git rev-parse --short HEAD)}"
 
 db_name="${BENCH_DATABASE_URL##*/}"; db_name="${db_name%%\?*}"
@@ -34,7 +40,16 @@ reset_db() {
   psql "$ADMIN_URL" -qAt -c "DROP DATABASE IF EXISTS $db_name WITH (FORCE)" -c "CREATE DATABASE $db_name"
   migrate -path db/migrations -database "$BENCH_DATABASE_URL" up >/dev/null
   BENCH_DATABASE_URL="$BENCH_DATABASE_URL" "$out/bin/benchseed" \
-    -accounts "$ACCOUNTS" -keys "$KEYS" -out "$out/fixture.json"
+    -accounts "$ACCOUNTS" -keys "$KEYS" -history "$HOT_HISTORY" -out "$out/fixture.json"
+}
+
+# run_k6 ROW_MODE MODE RATE KEY_OFFSET STEP writes one row to $out/step-ROW_MODE.json.
+# STEP keeps idempotency keys unique when a fixed-rate stream runs in every step.
+run_k6() {
+  rm -f "$out/step-$1.json"
+  MODE="$2" ROW_MODE="$1" RATE="$3" KEY_OFFSET="$4" DURATION="$DURATION" RUN_ID="$LABEL-$1-$5" \
+    FIXTURE="$out/fixture.json" API_URL="http://$API_ADDR" OUT="$out/step-$1.json" \
+    k6 run --quiet --no-color "bench/k6/transfers.js" > "$out/k6-$1-$5.log" 2>&1
 }
 
 api_pid=""
@@ -57,12 +72,22 @@ for mode in $MODES; do
   reset_db
   start_api
   for rate in $RATES; do
-    rm -f "$out/step.json"
-    MODE="$mode" RATE="$rate" DURATION="$DURATION" RUN_ID="$LABEL-$mode-$rate" \
-      FIXTURE="$out/fixture.json" API_URL="http://$API_ADDR" OUT="$out/step.json" \
-      k6 run --quiet --no-color "bench/k6/transfers.js" > "$out/k6-$mode-$rate.log" 2>&1
+    if [ "$mode" = mixed ]; then
+      rows="mixed-hot mixed-spread"
+      run_k6 mixed-hot hot "$rate" 0 "$rate" &
+      hot_pid=$!
+      run_k6 mixed-spread spread "$SPREAD_RATE" $((KEYS / 2)) "$rate"
+      wait "$hot_pid"
+    else
+      rows="$mode"
+      run_k6 "$mode" "$mode" "$rate" 0 "$rate"
+    fi
     entries=$(psql "$BENCH_DATABASE_URL" -qAt -c "SELECT count(*) FROM ledger_entries")
-    jq -c --argjson e "$entries" '. + {ledger_entries_after: $e}' "$out/step.json" | tee -a "$results"
+    drift=$(BENCH_DATABASE_URL="$BENCH_DATABASE_URL" "$out/bin/benchseed" -verify)
+    for row in $rows; do
+      jq -c --argjson e "$entries" --argjson d "$drift" \
+        '. + {ledger_entries_after: $e, balance_drift: $d}' "$out/step-$row.json" | tee -a "$results"
+    done
     sleep 2
   done
   stop_api
