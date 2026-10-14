@@ -8,6 +8,9 @@
 
 CLAUDE.md
 PROGRESS.md
+# benchmark fixtures hold plaintext API keys
+/bench/out/
+
 # test and coverage
 *.test
 *.out
