@@ -61,14 +61,26 @@ immutable history, no overspend) cover them for free.
 Each phase ends with its failure tests passing, its PR merged, and him explaining it back,
 the same as V1. He types one interview-critical piece per phase by hand (marked ✍️).
 
-### Phase 8: cards and card accounts
+### Phase 8: a fast, isolated spending path
+Measured first in [BENCHMARKS.md](BENCHMARKS.md): one hot account topped out near 390 req/s,
+got slower as its history grew, and starved every other account of pool connections.
+Authorization (phase 11) is the same path with a deadline, so it was fixed before cards.
+- A stored balance per account, maintained by the ledger writer and refused below zero by a
+  database CHECK; settlement accounts keep a derived balance.
+- Transfer creation claims the idempotency key first and takes the balance lock last.
+- Fail fast: a per-account in-flight cap, a lock timeout and a request deadline answer
+  `503 account_busy` instead of queueing.
+- **Proves:** spending cost does not grow with history, and one busy account cannot take
+  the others down.
+
+### Phase 9: cards and card accounts
 - Issue a card for an account: card ID, last four digits, status (active, frozen, closed),
   per-transaction and daily limits. No real card numbers, ever (see the scope fence).
 - Each cardholder gets an `available` and a `held` ledger account.
 - Freeze and unfreeze. A frozen card declines everything.
 - **Proves:** the account model that every later phase uses.
 
-### Phase 9: the card network simulator (`mock-network`)
+### Phase 10: the card network simulator (`mock-network`)
 The card network's version of V1's MockBank. It sends what a real network sends:
 - authorization requests with a deadline, sometimes duplicated, sometimes retried after a
   timeout;
@@ -78,7 +90,7 @@ The card network's version of V1's MockBank. It sends what a real network sends:
 - refunds days or weeks later.
 - **Proves:** that the backend copes with a messy counterparty, deterministically, in tests.
 
-### Phase 10: authorization ✍️
+### Phase 11: authorization ✍️
 - Decide yes or no: card active, enough available balance, within limits, merchant category
   not blocked. On yes, move the amount from `available` to `held` in the same transaction.
 - **Idempotent on the network's authorization ID:** a retried request gets the same answer and
@@ -87,16 +99,16 @@ The card network's version of V1's MockBank. It sends what a real network sends:
   ✍️ He writes this check by hand; it is the question every card interviewer asks.
 - If we cannot answer within the deadline, the network decides for us ("stand-in"). Record
   that decision when it arrives and honour it.
-- **Proves:** correctness under a deadline. Measured in phase 15.
+- **Proves:** correctness under a deadline. Measured in phase 16.
 
-### Phase 11: reversals, expiry and incremental holds
+### Phase 12: reversals, expiry and incremental holds
 - A reversal releases the hold exactly once, even if it arrives twice or before the
   authorization.
 - A hold that never clears expires after a set number of days and the money is released.
 - Hotels and car rentals add to an existing hold (incremental authorization).
 - **Proves:** money is never stuck and never released twice.
 
-### Phase 12: clearing
+### Phase 13: clearing
 - Read the daily clearing file. Match each line to its hold by the network's IDs.
 - Final amount higher than the hold (tips, within a set tolerance): charge the difference.
   Lower (partial shipment): release the rest. No matching hold at all (offline purchase):
@@ -104,12 +116,12 @@ The card network's version of V1's MockBank. It sends what a real network sends:
 - Re-reading the same file changes nothing.
 - **Proves:** the hold-then-settle flow that separates a card backend from a transfer API.
 
-### Phase 13: refunds
+### Phase 14: refunds
 - A refund is a new credit back to `available`, never an edit of the original charge.
 - Matched to the original purchase when possible; accepted and flagged when not.
 - **Proves:** immutable history with money flowing back.
 
-### Phase 14: network settlement and reconciliation
+### Phase 15: network settlement and reconciliation
 - Each day, total what we owe the network and record the payment.
 - Reconcile three ways: our holds and charges, the clearing file, and what we paid.
   V1's six outcome classes extend to card cases (cleared but never authorized, authorized but
@@ -117,7 +129,7 @@ The card network's version of V1's MockBank. It sends what a real network sends:
 - Detect and report, never fix automatically, the same rule as V1.
 - **Proves:** we can explain every cent to the network and to an auditor.
 
-### Phase 15: benchmark and evidence
+### Phase 16: benchmark and evidence
 - Authorizations per second on a laptop, with p50 and p99 decision time, at fixed rates
   (coordinated-omission safe, the same method as the matching engine).
 - Target to measure against, not a promise: p99 under 100 ms. Card processors aim well under
@@ -186,12 +198,12 @@ two more weeks. If an interview lands mid-way, the finished phases are still a s
 
 | Question | Phase |
 |---|---|
-| Two taps at the same moment with $50 in the account. What happens? | 10 |
-| The network times out and retries the same authorization. | 10 |
-| A reversal arrives before the authorization. | 11 |
-| Why does the final amount differ from the hold, and how do you post it? | 12 |
-| A charge arrives with no authorization. Do you accept it? | 12 |
-| How do you prove to the network that your books are right? | 14 |
-| What is your authorization latency, and how did you measure it? | 15 |
+| Two taps at the same moment with $50 in the account. What happens? | 11 |
+| The network times out and retries the same authorization. | 11 |
+| A reversal arrives before the authorization. | 12 |
+| Why does the final amount differ from the hold, and how do you post it? | 13 |
+| A charge arrives with no authorization. Do you accept it? | 13 |
+| How do you prove to the network that your books are right? | 15 |
+| What is your authorization latency, and how did you measure it? | 16 |
 | How does a crypto card approve a tap if the chain takes minutes? | V3 |
 | What stops a user withdrawing USDC while a hold is open? | V3 |

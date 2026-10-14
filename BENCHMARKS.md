@@ -116,8 +116,135 @@ money did not.
 | 8 | **Horizontal**: stateless API replicas, then read replicas for GETs/reconciliation, then shard accounts by id | scale past one box | only after 1–4: today the database, not the API, is the bottleneck, so more API replicas just add more waiters |
 
 Order matters: 1–3 are one phase (the hot path), 4–5 the next, 6–8 only when a measured
-number demands them. Card authorization (ROADMAP phase 10, p99 < 100 ms target) is the
+number demands them. Card authorization (ROADMAP phase 11, p99 < 100 ms target) is the
 same hot path with `available → held`, so it should be built on 1–3, not on V1's `SUM`.
+
+## Phase 08: stored balance, lock last, fail fast (`71781bb`, 2026-10-14)
+
+Re-run on the same machine and settings as the baseline (pool 10, 30 s steps), but **on
+battery, with the editor and browser open (load average ~10 on 10 cores during runs)**: the
+`main` binary measured in the same session was slower than the recorded V1 baseline (spread
+knee below 1,000 instead of ~1,100, hot ceiling ~330 instead of ~390). So each table puts
+this branch next to `main` **measured in the same session** (`28d6988`, with this phase's k6
+script for `status_counts`); compare columns, not against the V1 tables above.
+
+```sh
+make bench-balance
+MODES="spread hot" RATES="100 250 500 1000 1500 2000" make bench-http
+MODES=hot RATES="500 1000 1500 2000 3000" HOT_HISTORY=1000000 LABEL=p08-hot-1m make bench-http
+MODES=mixed RATES="500 1000 2000" SPREAD_RATE=300 LABEL=p08-mixed make bench-http
+```
+
+`balance_drift` (`benchseed -verify` → `ledger.VerifyBalances` after every step) was **0 on
+every row of every run** in this section, including overloaded steps.
+
+### Balance read cost (`make bench-balance`)
+
+| entries on the account | `ledger.Balance` (derived) | `ledger.StoredBalance` |
+|---:|---:|---:|
+| 1,000 | 0.18 ms | 0.11 ms |
+| 10,000 | 0.77 ms | 0.11 ms |
+| 100,000 | 7.0 ms | 0.12 ms |
+| 1,000,000 | 28.7 ms | 0.12 ms |
+
+The stored read is one network round trip at any history size; the spending path never sums.
+
+### Spread across 1,000 accounts
+
+| target rps | main achieved | main p50 / p99 ms | p08 achieved | p08 p50 / p99 ms | p08 non-202 |
+|---:|---:|---:|---:|---:|---|
+| 100 | 100 | 3.52 / 12.55 | 100 | 3.08 / 13.06 | 0 |
+| 250 | 250 | 2.31 / 14.36 | 250 | 2.04 / 8.25 | 0 |
+| 500 | 500 | 1.76 / 13.25 | 500 | 1.46 / 31.74 | 0 |
+| 1,000 | 725 (6,475 dropped) | 1,768 / 4,173 | 1,000 | 1.50 / 96.44 | 0 |
+| 1,500 | 632 (21,945 dropped) | 4,196 / 10,302 | 1,371 (2,117 dropped) | 365 / 2,023 | 0 |
+| 2,000 | 309 (46,012 dropped) | 11,570 / 21,625 | 873 (29,625 dropped) | 4,464 / 5,435 | 4,733×500, 5,426×503 |
+
+Two earlier p08 runs the same morning gave 18.2 and 16.7 ms p99 at the 500 step (main 13.25):
+the p99 at 500 is noisy here and **worse than main in every run** (+26 % to +140 %), while
+p50 is better and the knee moved from <1,000 to ~1,400. At 2,000 the server answers within
+its 5 s deadline instead of after 20 s, but the 500s are the deadline expiring in the auth,
+rate-limit and account lookups while waiting for a pool connection (only the transfer path
+maps a timeout to 503).
+
+### One hot account
+
+| target rps | main 202s / dropped | main p99 ms | p08 202s (per s) | p08 503 | p08 p50 / p99 ms |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 3,000 / 0 | 352 | 3,000 (100) | 0 | 3.23 / 11.66 |
+| 250 | 7,501 / 0 | 546 | 7,500 (250) | 0 | 2.08 / 10.42 |
+| 500 | 12,080 / 2,921 | 7,186 | 15,001 (500) | 0 | 1.45 / 17.76 |
+| 1,000 | 9,545 / 20,456 | 21,139 | 29,946 (998) | 55 | 1.95 / 105.12 |
+| 1,500 | 5,048 / 35,427 | 35,612 | 36,357 (1,212) | 8,644 | 101 / 159 |
+| 2,000 | 2,587 / 49,995 | 53,959 | 21,497 (717) | 38,503 | 106 / 386 |
+
+Main's non-202s at 1,500/2,000 were client timeouts (status 0) after 35–55 s. p08 drops no
+arrival from 100 to 2,000, every non-202 is `503 account_busy`, and the slowest response in
+the whole hot sweep was 569 ms.
+
+### One hot account with 1,000,000 prior entries
+
+| target rps | 202s (per s) | 503 | dropped | p50 / p99 ms |
+|---:|---:|---:|---:|---:|
+| 500 | 15,000 (500) | 0 | 0 | 1.46 / 25.0 |
+| 1,000 | 29,772 (992) | 229 | 0 | 1.55 / 123 |
+| 1,500 | 29,030 (968) | 15,971 | 0 | 103 / 634 |
+| 2,000 | 13,624 (454) | 32,346 | 14,030 | 108 / 3,739 |
+| 3,000 | 2,501 (83) | 52,192 | 35,309 | 1,272 / 3,728 |
+
+Up to the ceiling the million entries change nothing (998 vs 992 accepted/s at 1,000). Above
+it, accepted throughput falls with offered load in both runs (and more here, at 12 % battery):
+see "what the numbers say" below. An earlier run that started straight after the bulk seed
+measured autovacuum and checkpoint I/O instead, so the seed now vacuums and checkpoints first.
+
+### Mixed: hot account at RATE plus spread at 300 req/s
+
+| hot target | main hot 202s | main spread p99 ms (dropped) | p08 hot 202s (per s) / 503 | p08 spread p50 / p99 ms | p08 spread errors |
+|---:|---:|---:|---:|---:|---:|
+| 500 | 10,023 | 8,974 (2,899) | 15,001 (500) / 0 | 1.52 / 11.09 | 0 |
+| 1,000 | 7,755 | 23,470 (6,260) | 24,709 (824) / 5,292 | 5.36 / 52.69 | 0 |
+| 2,000 | 2,089 | 40,167 (6,960 + 900 timeouts) | 5,822 (194) / 54,179 | 138 / 538 | 0 |
+
+On `main` one hot account takes spread traffic down with it (9–40 s p99, dropped arrivals,
+timeouts). On p08 spread traffic is never refused and never dropped, but at 2x the hot
+ceiling its p99 is 538 ms, not under 20 ms.
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| Hot ceiling (highest step all 202, 0 dropped) | ≥ 1,200 req/s | **Missed as defined**: 500 is the last all-202 step. Accepted throughput 998/s at 1,000 (55 shed) and 1,212/s at 1,500; 3–4x same-session main (~330) |
+| Hot with 1M entries | within 10 % of 0 history | **Met** up to the ceiling (992 vs 998/s at 1,000) |
+| Mixed: spread p99 with hot ≥ 2x ceiling | < 20 ms, 0 spread errors | **Missed** on latency (538 ms), met on errors (0) |
+| Spread p99 at 500 | ≤ +20 % of 9.08 ms | **Missed**: 16.7–31.7 ms over three runs; main 13.25 ms same session |
+| Spread knee | ≥ ~1,100 req/s | **Met**: ~1,400 (main same session < 1,000) |
+| Overload behaviour | 503/429, not 500; none slower than `requestTimeout` | **Met on the hot account** (all 503, max 569 ms). **Missed under spread overload**: 500s from auth/lookup deadlines, max 6.0 s at 2,000 |
+| Balance drift after every run | 0 | **Met** |
+
+### What the numbers say
+
+1. **History no longer matters.** The stored balance read is 0.12 ms at 1M entries and the
+   hot account accepts the same rate at 1M entries as at none.
+2. **The per-account ceiling is now round trips, not the database.** A single-row
+   `UPDATE` + commit inside the Postgres container runs at ~9,500/s (`pgbench`, 1 client),
+   so the row lock is held ~0.1 ms by the database itself. The API holds it from the
+   balance `UPDATE` until its `COMMIT` returns: about 1.5 host-to-container round trips
+   plus the WAL flush, ~1 ms here. Removing `ledger.Record`'s savepoint (its `RELEASE`
+   ran while the lock was held) took the 1,000 step from 86 % to 99.8 % accepted and the
+   1,500 step from 565 to 1,212 accepted/s in back-to-back runs.
+3. **Above the ceiling, refusals still cost the pool.** Every refused request has already
+   done the API-key lookup and the rate-limit upsert, and the gate admits it after the
+   account lookup, so at 2,000 req/s ~1,300 refusals/s still make three pooled round trips
+   each, and the four admitted hot creations hold four of the ten connections. That is
+   why accepted hot throughput falls past the ceiling (1,212/s at 1,500, 717/s at 2,000)
+   and why spread p99 rises to 538 ms in the mixed run: spread requests queue for the
+   pool behind work that will be refused. `pg_stat_activity` sampled during the mixed
+   1,000 step showed most backends `idle`/`ClientRead` and a few `Lock:transactionid`
+   (the balance row) and `LWLock:WALWrite`, not a database-side pile-up.
+4. **Next levers**, in order: take the API-key lookup and rate limit off the money
+   database (option 4, its own phase), so a refusal costs no pooled round trip; a
+   bounded wait for a pool connection; then a bigger pool. Hot-account sharding or
+   batching (option 6) only once the per-account ceiling itself is the limit.
 
 ## Regression rule
 
