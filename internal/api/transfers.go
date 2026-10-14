@@ -16,6 +16,9 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 	"github.com/Shailu-s/payments-platform/internal/outbox"
 	"github.com/Shailu-s/payments-platform/internal/transfers"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ErrInsufficientFunds means the source account cannot cover the transfer.
@@ -110,9 +113,22 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transfer, status, err := s.createTransfer(r.Context(), req, key.ID, idempotencyKey)
-	if errors.Is(err, ErrInsufficientFunds) {
+	switch {
+	case errors.Is(err, ErrInsufficientFunds):
 		writeError(w, http.StatusUnprocessableEntity, CodeInsufficientFunds,
 			"the source account does not have enough money for this transfer")
+		return
+	case errors.Is(err, ErrAccountBusy) || isLockTimeout(err):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, CodeAccountBusy,
+			"the source account is busy with other payments: retry with the same "+
+				"Idempotency-Key, which cannot pay twice")
+		return
+	case errors.Is(err, context.DeadlineExceeded):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, CodeRequestTimeout,
+			"the request timed out before the payment was answered: retry with the "+
+				"same Idempotency-Key to get its outcome")
 		return
 	}
 	if err != nil {
@@ -160,6 +176,13 @@ func (s *Server) createTransfer(ctx context.Context, req createTransferRequest, 
 // the row lock that serialises spending from the account; everything before
 // it runs without blocking other payments from the same account.
 func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, apiKeyID, idempotencyKey, fingerprint string) (transfers.Transfer, error) {
+	// Before taking a pool connection: a hot account waits here, not in the pool.
+	release, err := s.gate.acquire(ctx, req.SourceAccount)
+	if err != nil {
+		return transfers.Transfer{}, fmt.Errorf("source %s: %w", req.SourceAccount, err)
+	}
+	defer release()
+
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return transfers.Transfer{}, fmt.Errorf("begin: %w", err)
@@ -197,14 +220,20 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	if err != nil {
 		return transfers.Transfer{}, fmt.Errorf("marshal transfer event %s: %w", transfer.ID, err)
 	}
-	if err := outbox.Insert(ctx, tx, outbox.Event{
+	// The lock timeout starts after the key is claimed: a duplicate may wait
+	// for the original to finish, and the original's own waits are bounded.
+	// From here on, a lock held too long means the account is busy.
+	batch := &pgx.Batch{}
+	batch.Queue(setSpendingLockTimeout)
+	outbox.Queue(batch, outbox.Event{
 		ID:          newID("evt"),
 		AggregateID: transfer.ID,
 		EventType:   "transfer.created",
 		Topic:       "transfers",
 		Payload:     payload,
-	}); err != nil {
-		return transfers.Transfer{}, err
+	})
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return transfers.Transfer{}, fmt.Errorf("insert outbox event for %s: %w", transfer.ID, err)
 	}
 
 	// Settlement, not the destination: the provider has not paid anyone yet.
@@ -220,6 +249,15 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 		return transfers.Transfer{}, fmt.Errorf("commit transfer %s: %w", transfer.ID, err)
 	}
 	return transfer, nil
+}
+
+// Shorter than any client timeout: waiting longer for one account's lock only
+// holds a pool connection that other accounts need.
+const setSpendingLockTimeout = `SET LOCAL lock_timeout = '250ms'`
+
+func isLockTimeout(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.LockNotAvailable
 }
 
 // replayTransfer answers a request whose idempotency key was already used.

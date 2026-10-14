@@ -45,6 +45,15 @@ func APIKeyFrom(ctx context.Context) (auth.Key, bool) {
 	return key, ok
 }
 
+// withDeadline bounds the request; the auth and rate limit lookups inherit it.
+func withDeadline(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := contextWithTimeout(r, requestTimeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Preserve proxy correlation, but reject values that could forge log entries.

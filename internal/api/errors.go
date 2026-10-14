@@ -30,6 +30,11 @@ const (
 	CodeInsufficientFunds = "insufficient_funds"
 	CodeNotImplemented    = "not_implemented"
 	CodeInternal          = "internal_error"
+
+	// CodeAccountBusy is a refusal under load; the same request can be retried.
+	CodeAccountBusy = "account_busy"
+	// CodeRequestTimeout means the request ran out of time before an answer.
+	CodeRequestTimeout = "request_timeout"
 )
 
 // Once headers are written, encoding errors can only be logged, not answered again.

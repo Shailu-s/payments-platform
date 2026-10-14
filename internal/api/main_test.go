@@ -61,7 +61,16 @@ func newTestServer(t *testing.T) (http.Handler, string) {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	return (&Server{db: testPool, webhookSecret: []byte(testWebhookSecret)}).Handler(), plaintext
+	return newServerOn(testPool).Handler(), plaintext
+}
+
+// newServerOn is the production server on a test pool, without the rate limiter.
+func newServerOn(db DB) *Server {
+	return &Server{
+		db:            db,
+		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
+		webhookSecret: []byte(testWebhookSecret),
+	}
 }
 
 // do sends a request through the whole middleware chain.
