@@ -173,9 +173,13 @@ func seedHistory(ctx context.Context, pool *pgxpool.Pool, accountID string, n in
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("seed history: commit: %w", err)
 	}
-	// Plan the run's queries against the seeded size, not an empty table.
-	if _, err := pool.Exec(ctx, `ANALYZE ledger_entries`); err != nil {
-		return fmt.Errorf("seed history: analyze: %w", err)
+	// Settle the bulk insert before the run: plan against the seeded size, and
+	// leave no autovacuum or checkpoint of a million fresh rows to land on the
+	// first steps.
+	for _, maintenance := range []string{`VACUUM (ANALYZE) ledger_entries`, `CHECKPOINT`} {
+		if _, err := pool.Exec(ctx, maintenance); err != nil {
+			return fmt.Errorf("seed history: %s: %w", maintenance, err)
+		}
 	}
 	slog.Info("seeded history", "account", accountID, "entries", n)
 	return nil
