@@ -19,7 +19,8 @@ import (
 )
 
 // ErrInsufficientFunds means the source account cannot cover the transfer.
-var ErrInsufficientFunds = errors.New("insufficient funds")
+// The database decides it: the debit fails the stored balance's CHECK.
+var ErrInsufficientFunds = ledger.ErrInsufficientFunds
 
 // Every transfer credits the settlement account first. The destination is
 // credited by a second ledger transaction once the provider confirms.
@@ -149,12 +150,15 @@ func (s *Server) createTransfer(ctx context.Context, req createTransferRequest, 
 	return s.replayTransfer(ctx, idempotencyKey, fingerprint)
 }
 
-// insertTransfer writes the transfer, its ledger entries and its outbox event
+// insertTransfer writes the transfer, its outbox event and its ledger entries
 // in one transaction: none of them may exist without the others.
 //
-// It inserts before looking for an existing transfer with the same key. Looking
-// first lets concurrent requests all see nothing and all insert; inserting
-// first lets the unique index pick one winner.
+// The order is load-bearing. The transfer goes first, so the unique index on
+// the idempotency key picks one winner before anything else happens, and a
+// retry of a payment that spent the last of the funds replays it instead of
+// being refused. The ledger write goes last, because its balance update takes
+// the row lock that serialises spending from the account; everything before
+// it runs without blocking other payments from the same account.
 func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, apiKeyID, idempotencyKey, fingerprint string) (transfers.Transfer, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -162,12 +166,9 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	}
 	defer tx.Rollback(ctx)
 
-	// Inside the transaction, under a lock: a balance read before BEGIN can be
-	// spent by a concurrent transfer before this one writes.
-	if err := s.checkBalance(ctx, tx, req.SourceAccount, req.Amount); err != nil {
-		return transfers.Transfer{}, err
-	}
-
+	// Chosen up front so the transfer row can be linked when it is inserted;
+	// the deferred foreign key is checked at commit.
+	ledgerTxnID := ledger.NewTxnID()
 	transfer, err := transfers.Insert(ctx, tx, transfers.Transfer{
 		ID:                 newID("tr"),
 		SourceAccount:      req.SourceAccount,
@@ -175,6 +176,7 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 		Amount:             req.Amount,
 		Currency:           req.Currency,
 		Status:             transfers.StatusProcessing,
+		LedgerTxnID:        &ledgerTxnID,
 		APIKeyID:           apiKeyID,
 		IdempotencyKey:     &idempotencyKey,
 		RequestFingerprint: &fingerprint,
@@ -182,20 +184,6 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	if err != nil {
 		return transfers.Transfer{}, err
 	}
-
-	// Settlement, not the destination: the provider has not paid anyone yet.
-	ledgerTxnID, err := ledger.Record(ctx, tx, "transfer "+transfer.ID, []ledger.Entry{
-		{AccountID: req.SourceAccount, Direction: ledger.DirectionDebit, Amount: req.Amount},
-		{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: req.Amount},
-	})
-	if err != nil {
-		return transfers.Transfer{}, err
-	}
-
-	if err := transfers.SetLedgerTxn(ctx, tx, transfer.ID, ledgerTxnID); err != nil {
-		return transfers.Transfer{}, err
-	}
-	transfer.LedgerTxnID = &ledgerTxnID
 
 	// Written to the outbox on tx rather than published to Kafka: a publish
 	// after the commit is lost if the process dies in between.
@@ -209,13 +197,21 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	if err != nil {
 		return transfers.Transfer{}, fmt.Errorf("marshal transfer event %s: %w", transfer.ID, err)
 	}
-
 	if err := outbox.Insert(ctx, tx, outbox.Event{
 		ID:          newID("evt"),
 		AggregateID: transfer.ID,
 		EventType:   "transfer.created",
 		Topic:       "transfers",
 		Payload:     payload,
+	}); err != nil {
+		return transfers.Transfer{}, err
+	}
+
+	// Settlement, not the destination: the provider has not paid anyone yet.
+	// An overdraft fails here with ErrInsufficientFunds and rolls back the rest.
+	if err := ledger.RecordWithID(ctx, tx, ledgerTxnID, "transfer "+transfer.ID, []ledger.Entry{
+		{AccountID: req.SourceAccount, Direction: ledger.DirectionDebit, Amount: req.Amount},
+		{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: req.Amount},
 	}); err != nil {
 		return transfers.Transfer{}, err
 	}
@@ -323,9 +319,9 @@ func validateTransferRequest(req *createTransferRequest) (string, bool) {
 }
 
 // validateAccounts confirms both accounts exist and match the requested
-// currency, in one round trip.
+// currency, and that the source can be spent from, in one round trip.
 func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest) (message, code string, ok bool) {
-	const q = `SELECT id, currency FROM accounts WHERE id = ANY($1)`
+	const q = `SELECT id, currency, type FROM accounts WHERE id = ANY($1)`
 
 	rows, err := s.db.Query(ctx, q, []string{req.SourceAccount, req.DestinationAccount})
 	if err != nil {
@@ -334,12 +330,14 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 	defer rows.Close()
 
 	currencies := map[string]string{}
+	types := map[string]string{}
 	for rows.Next() {
-		var id, currency string
-		if err := rows.Scan(&id, &currency); err != nil {
+		var id, currency, accountType string
+		if err := rows.Scan(&id, &currency, &accountType); err != nil {
 			return fmt.Sprintf("scan account: %v", err), CodeInternal, false
 		}
 		currencies[id] = currency
+		types[id] = accountType
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Sprintf("load accounts: %v", err), CodeInternal, false
@@ -356,6 +354,12 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 			return fmt.Sprintf("account %s holds %s, not %s", id, currency, req.Currency),
 				CodeInvalidRequest, false
 		}
+	}
+	// A settlement account has no stored balance, so nothing would stop it
+	// from being overspent.
+	if types[req.SourceAccount] == "settlement" {
+		return fmt.Sprintf("account %s is a settlement account and cannot be a transfer source",
+			req.SourceAccount), CodeInvalidRequest, false
 	}
 	return "", "", true
 }

@@ -162,6 +162,23 @@ func TestCreateTransferRejectsBadInput(t *testing.T) {
 	}
 }
 
+// Settlement has no stored balance, so nothing would refuse its overdraft.
+func TestSettlementAccountCannotBeATransferSource(t *testing.T) {
+	h, key := newTestServer(t)
+	destination := createAccount(t, h, key, "liability")
+
+	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":500,"currency":"USD"}`,
+		settlementAccountID, destination.ID)
+	rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeError(t, rec).Code; got != CodeInvalidRequest {
+		t.Errorf("error code = %q, want %q", got, CodeInvalidRequest)
+	}
+	assertNothingWritten(t, context.Background())
+}
+
 // Money is an integer in minor units. A fractional amount must be refused
 // rather than silently truncated, which would move the wrong sum.
 func TestCreateTransferRejectsAFractionalAmount(t *testing.T) {

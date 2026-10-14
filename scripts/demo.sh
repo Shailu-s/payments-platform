@@ -171,7 +171,8 @@ expect "the same key with a different body is refused" \
   "$(post_transfer_code "$IDEM" "$(body "$SRC" "$DST" 99)")" "422"
 
 step "7. Guarantee 3 — money cannot be overspent"
-why "The balance is read under a row lock in the transaction that spends it, so two requests cannot both spend the same money."
+why "The debit is applied to the stored balance, whose CHECK (balance >= 0) refuses an overdraft inside the"
+why "database. Its row lock makes a second spend wait for the first, so two requests cannot both spend the same money."
 
 BEFORE=$(psql_q "SELECT count(*) FROM transfers")
 expect "a transfer larger than the balance" \
