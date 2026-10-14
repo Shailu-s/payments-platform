@@ -67,10 +67,15 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	// Balance returns zero for unknown IDs, so existence needs a separate lookup.
-	const q = `SELECT currency, type, created_at FROM accounts WHERE id = $1`
+	// One lookup answers existence and, for tracked accounts, the balance.
+	const q = `
+		SELECT a.currency, a.type, a.created_at, b.balance
+		FROM accounts a
+		LEFT JOIN account_balances b ON b.account_id = a.id
+		WHERE a.id = $1`
 	var acc accountResponse
-	err := s.db.QueryRow(r.Context(), q, id).Scan(&acc.Currency, &acc.Type, &acc.CreatedAt)
+	var stored *int64
+	err := s.db.QueryRow(r.Context(), q, id).Scan(&acc.Currency, &acc.Type, &acc.CreatedAt, &stored)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, CodeNotFound, "no such account: "+id)
 		return
@@ -80,14 +85,19 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	balance, err := ledger.Balance(r.Context(), s.db, id)
-	if err != nil {
-		writeInternalError(w, r, err)
-		return
+	if stored != nil {
+		acc.Balance = *stored
+	} else {
+		// Settlement accounts keep no stored balance; theirs is derived.
+		balance, err := ledger.Balance(r.Context(), s.db, id)
+		if err != nil {
+			writeInternalError(w, r, err)
+			return
+		}
+		acc.Balance = balance
 	}
 
 	acc.ID = id
-	acc.Balance = balance
 	writeJSON(w, http.StatusOK, acc)
 }
 

@@ -88,7 +88,7 @@ func TestCreateAccountRejectsUnknownFieldsRatherThanIgnoringThem(t *testing.T) {
 	}
 }
 
-func TestGetAccountReturnsADerivedBalance(t *testing.T) {
+func TestGetAccountReturnsEachAccountsBalance(t *testing.T) {
 	h, key := newTestServer(t)
 	ctx := context.Background()
 
@@ -120,6 +120,60 @@ func TestGetAccountReturnsADerivedBalance(t *testing.T) {
 	}
 	if got.Balance != -50000 {
 		t.Errorf("balance = %d, want -50000", got.Balance)
+	}
+}
+
+// The stored balance is what GET serves, so it must agree with the entries
+// after real movements; settlement still reports the sum of its entries.
+func TestGetAccountBalanceMatchesTheLedger(t *testing.T) {
+	h, key := newTestServer(t)
+	ctx := context.Background()
+
+	source := createAccount(t, h, key, "asset")
+	destination := createAccount(t, h, key, "liability")
+	fund(t, source.ID, 100000)
+	for _, amount := range []int64{12345, 600, 7} {
+		createTransfer(t, h, key, source.ID, destination.ID, amount)
+	}
+
+	getBalance := func(id string) int64 {
+		t.Helper()
+		rec := do(t, h, "GET", "/v1/accounts/"+id, key, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200: %s", id, rec.Code, rec.Body.String())
+		}
+		var got accountResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return got.Balance
+	}
+
+	for _, id := range []string{source.ID, destination.ID, settlementAccountID} {
+		derived, err := ledger.Balance(ctx, testPool, id)
+		if err != nil {
+			t.Fatalf("Balance(%s): %v", id, err)
+		}
+		if got := getBalance(id); got != derived {
+			t.Errorf("GET %s balance = %d, derived from entries = %d", id, got, derived)
+		}
+	}
+	if got := getBalance(source.ID); got != 100000-12345-600-7 {
+		t.Errorf("source balance = %d, want %d", got, 100000-12345-600-7)
+	}
+	if got := getBalance(settlementAccountID); got != 12345+600+7-100000 {
+		t.Errorf("settlement balance = %d, want %d", got, 12345+600+7-100000)
+	}
+
+	// Pin the read path: a deliberately drifted row shows that GET serves the
+	// stored number rather than summing history.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE account_balances SET balance = balance + 1 WHERE account_id = $1`, source.ID); err != nil {
+		t.Fatalf("drift: %v", err)
+	}
+	if got := getBalance(source.ID); got != 100000-12345-600-7+1 {
+		t.Errorf("source balance = %d after drifting the stored row, want the stored %d",
+			got, 100000-12345-600-7+1)
 	}
 }
 
