@@ -69,7 +69,7 @@ bench-http:
 	@bash scripts/bench-http.sh
 
 bench-balance:
-	@go test ./internal/ledger -run '^$$' -bench BenchmarkBalanceByHistory -benchtime=2s -count=1
+	@go test ./internal/ledger -run '^$$' -bench 'Benchmark(Stored)?BalanceByHistory' -benchtime=2s -count=1
 
 bench-metrics:
 	@go test ./internal/api -run '^$$' -bench 'Benchmark(HTTPMetricsObservation|MetricsScrape1000Records)' -benchmem -benchtime=1s -count=3

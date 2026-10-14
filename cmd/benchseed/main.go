@@ -180,4 +180,3 @@ func seedHistory(ctx context.Context, pool *pgxpool.Pool, accountID string, n in
 	slog.Info("seeded history", "account", accountID, "entries", n)
 	return nil
 }
-
