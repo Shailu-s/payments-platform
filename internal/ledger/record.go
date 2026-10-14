@@ -19,7 +19,7 @@ const (
 	DirectionCredit = "credit"
 )
 
-// Beginner supports atomic ledger writes, including a savepoint on a pgx.Tx.
+// Beginner supports atomic ledger writes: a pool, or the caller's pgx.Tx.
 type Beginner interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
@@ -64,6 +64,9 @@ func NewTxnID() string {
 // The balance updates are queued last: the balance row lock is what serialises
 // spending from an account, so it is taken as late as possible and held only
 // until the caller commits.
+//
+// Given the caller's pgx.Tx it writes in that transaction without a savepoint,
+// so a failed write leaves the caller's transaction aborted: roll it back.
 func RecordWithID(ctx context.Context, db Beginner, txnID, reference string, entries []Entry) error {
 	// Reject invalid entries before reserving a database connection.
 	if len(entries) < 2 {
@@ -93,13 +96,29 @@ func RecordWithID(ctx context.Context, db Beginner, txnID, reference string, ent
 		return fmt.Errorf("record %q: debits %d, credits %d: %w", reference, debits, credits, ErrUnbalanced)
 	}
 
+	// A savepoint would add SAVEPOINT and RELEASE round trips, the second while
+	// the balance lock is held, and every caller rolls back on error anyway.
+	if tx, ok := db.(pgx.Tx); ok {
+		return write(ctx, tx, txnID, reference, entries)
+	}
+
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("record %q: begin: %w", reference, err)
 	}
 	// Release the transaction on every error path; harmless after commit.
 	defer tx.Rollback(ctx)
+	if err := write(ctx, tx, txnID, reference, entries); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("record %q: commit: %w", reference, err)
+	}
+	return nil
+}
 
+// write sends the transaction, its entries and the balance updates as one batch.
+func write(ctx context.Context, tx pgx.Tx, txnID, reference string, entries []Entry) error {
 	const insertTxn = `INSERT INTO ledger_transactions (id, reference) VALUES ($1, $2)`
 	const insertEntry = `
 		INSERT INTO ledger_entries (id, txn_id, account_id, direction, amount)
@@ -120,10 +139,6 @@ func RecordWithID(ctx context.Context, db Beginner, txnID, reference string, ent
 			return fmt.Errorf("record %q: %w: %w", reference, ErrInsufficientFunds, err)
 		}
 		return fmt.Errorf("record %q: write: %w", reference, err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("record %q: commit: %w", reference, err)
 	}
 	return nil
 }
