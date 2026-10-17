@@ -23,6 +23,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /clearing", s.handleClearing)
+	mux.HandleFunc("GET /settlement", s.handleSettlement)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -74,6 +75,21 @@ func (s *Server) handleClearing(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if _, err := w.Write(file); err != nil {
 		slog.Error("write clearing file", "error", err)
+	}
+}
+
+func (s *Server) handleSettlement(w http.ResponseWriter, r *http.Request) {
+	date := r.URL.Query().Get("date")
+	statement, err := s.network.SettlementStatement(date)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "date is required as YYYY-MM-DD")
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="settlement-`+date+`.csv"`)
+	w.Header().Set("Cache-Control", "no-store")
+	if _, err := w.Write(statement); err != nil {
+		slog.Error("write settlement statement", "error", err)
 	}
 }
 
