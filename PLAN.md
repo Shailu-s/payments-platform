@@ -1276,3 +1276,25 @@ non-200, 0 drift, p50 within 0.16 ms of main, p99 order-dependent in both direct
 10,000 lines 3.5–5.2 ms; Reconcile 10,000 55–65 ms, 29 MB. Tests in per-package schemas on
 the default database; benchmarks against `payments_bench` and `payments_bench_cardrecon`
 (dropped).
+
+**2026-10-17 — Phase 16 (benchmark and evidence, V2 closure) built on `phase-16-evidence`;
+PR open, not merged.** Executor followed `briefs/phase-16-benchmark-evidence.md`. Commits:
+warm-up in `scripts/bench-http.sh` (`WARMUP`, recorded per row); `TestDuplicateAuthorizationsUnderLoad`
+and `TestReversalBeforeAuthorizationUnderLoad` (internal/api/chaos_test.go);
+`TestAPIKilledMidAuthorizationLeavesNoPartialHold` (cmd/api/kill_test.go: the test binary
+re-executes itself as the real `cmd/api` main, SIGKILLed under 16 simulator workers, then
+restarted on the same address); `make bench-day` (`scripts/bench-day.sh`, `cmd/benchday`,
+`bench/k6/day.js`, `payments_bench_day` only); BENCHMARKS.md phase 16; README rewritten
+around the card story; ROADMAP progress (phases 9–15 marked merged) and phase log. Failing
+first: primary key dropped → 20 rows/holds/events per auth_id; `ApplyPending` skipped → 0
+of 400 reversals released; advisory lock removed → 1 of 400 lost in 1 of 3 `-race` runs
+(0 of 10 plain runs); hold in its own transaction before the row → 2 and 7 holds without a
+row after the kill. Benchmarks (AC, video call running on the machine, disclosed):
+auth-spread p99 9.4 ms at 500, 68.2 ms at 1,000 (median of 3), knee ~1,000/s; hot card
+~500 approvals/s clean; card day tap p99 6 → 43 ms during clearing + expiry, books
+reconciled, 0 drift. Deviations: transfers run twice single (not 3×); earlier battery runs
+recorded separately, not in the medians. Open risks: goodput collapse past the knee (1 s
+deadline instead of early shedding); a card-read timeout before the transaction answers
+500 instead of 503. Tests in per-package schemas on the default database; benchmarks
+against `payments_bench` and `payments_bench_day`.
+
