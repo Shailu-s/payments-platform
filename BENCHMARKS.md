@@ -523,6 +523,67 @@ hash lookup plus one grouped read of the file's 10,000 `clearing_id`s.
    scale it; they are safe (lines dedupe on `clearing_id`, holds serialise on their row)
    but not built.
 
+## Phase 14: refunds (2026-10-17)
+
+Refunds post inside the offline clearing import; no authorization or transfer statement
+changed. Migration 20 adds a defaulted column to `card_authorizations` that an approval
+neither reads nor writes. Same machine, pool 10, 30 s steps, `caffeinate -i`, only the
+Postgres container running (Kafka stopped). `main` (`17321f3`) measured in the same
+session: run 1 branch then main, run 2 main then branch, run 3 branch then main.
+`balance_drift` 0 and `declined_after` 0 on every step.
+
+```sh
+MODES="auth-spread" RATES="500 1000" make bench-http                # 3 runs each, both
+TEST_DATABASE_URL=…/payments_bench_clearing make bench-clearing     # BenchmarkImport{Clearing,Refunds}, 3 runs
+```
+
+### Authorizations (p50 / p99 ms, every step 0 non-200, 0 dropped)
+
+| step | run | main | p14 |
+|---|---|---:|---:|
+| auth-spread 500 | 1 | 1.61 / 7.50 | 1.59 / 10.13 |
+| auth-spread 500 | 2 | 1.57 / 3.83 | 1.63 / 4.16 |
+| auth-spread 500 | 3 | 1.51 / 4.19 | 1.49 / 4.32 |
+| auth-spread 1,000 | 1 | 0.79 / 11.97 | 0.76 / 18.17 |
+| auth-spread 1,000 | 2 | 0.76 / 16.10 | 0.84 / 57.26 |
+| auth-spread 1,000 | 3 | 0.84 / 6.67 | 0.84 / 11.41 |
+
+### Clearing import (`make bench-clearing`)
+
+10,000 refund lines, each matched to a cleared purchase, on ten cards, one importer, then
+the same bytes again. The purchase benchmark is re-run alongside for comparison.
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| import 10,000 refunds | 8.07 s (1,239/s) | 7.97 s (1,255/s) | 7.95 s (1,258/s) |
+| re-import (replay) | 16.2 ms | 16.7 ms | 24.5 ms |
+| import 10,000 purchases (p14) | 8.01 s (1,249/s) | 7.75 s (1,290/s) | 7.61 s (1,313/s) |
+
+A refund line is BEGIN; one batch (record insert, `auth_id` lock, authorization row);
+the card lookup; one batch (authorization `refunded_amount`, record, outbox event); the
+ledger batch (one balance row: the payable has none); COMMIT. Same round trips as a
+purchase without a tip, so the same ~0.8 ms commit-bound line.
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| auth-spread p99 at 500 and 1,000 req/s | < 100 ms | **Met**: 4.2–10.1 ms at 500, 11.4–57.3 ms at 1,000, 0 non-200 |
+| Balance drift after every step | 0 | **Met** |
+| No worse than same-session main beyond noise | | **Met on p50** (within 0.08 ms on every pairing). p99 at 500 within +0.3 ms on runs 2–3; run 1 +35 % (10.1 vs 7.5 ms) |
+| Refund import throughput | vs phase 13's ~1,230 lines/s | **~1,250 lines/s**, replay ~16–25 ms |
+
+### What the numbers say
+
+1. **The hot path did not change**, and p50 shows it: equal within 0.08 ms everywhere.
+   The 1,000 req/s p99 swings both ways run to run (main 6.7–16.1 ms, branch 11.4–57.3 ms;
+   run 2's 57 ms is one tail). Reported, not explained away; no authorization statement
+   was touched and the new column is not in any approval query.
+2. **A refund costs what a purchase costs.** Both are one short transaction per line bound
+   by commit latency; the refund skips the balance-read batch but adds the card lookup.
+   Refunds touch one balance row (the cardholder's available), so a refund holds that
+   account's lock for one line, never a batch.
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two

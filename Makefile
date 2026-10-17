@@ -84,7 +84,7 @@ bench-expiry:
 	@go test ./internal/holds -run '^$$' -bench BenchmarkExpireBatch -benchtime=1x -count=3
 
 bench-clearing:
-	@go test ./internal/clearing -run '^$$' -bench BenchmarkImportClearing -benchtime=1x -count=3
+	@go test ./internal/clearing -run '^$$' -bench 'BenchmarkImport(Clearing|Refunds)' -benchtime=1x -count=3
 
 bench-metrics:
 	@go test ./internal/api -run '^$$' -bench 'Benchmark(HTTPMetricsObservation|MetricsScrape1000Records)' -benchmem -benchtime=1s -count=3

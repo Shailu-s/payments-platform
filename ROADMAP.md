@@ -17,7 +17,7 @@ method, the rules and the session LOG stay in PLAN.md.
 | 11 authorization | in review | #13 | 20 concurrent $30 taps on $50 -> 1 approved, 19 insufficient_funds; 20 duplicates of one auth_id -> 1 row, 1 hold; auth-spread p99 3.2 ms at 500/s, 34-57 ms at 1,000/s |
 | 12 reversals, expiry, incremental holds | in review | #14 | 20 copies of one reversal -> 1 release; 10 x $20 reversals on a $50 hold -> $50 released; reversal racing its authorization (20 pairs) -> 0 stuck (1 stuck without the auth_id lock); 20 concurrent increments under a $100 chain limit -> exactly 8; expiry 1,400 holds/s |
 | 13 clearing | in review | #15 | same file twice -> 0 changes; 4 concurrent importers of one file -> each line posted once; crash at line 3 of 5, rerun -> 5 posted once; clearing racing reversals and expiry on 40 holds -> 0 both released and charged; shortfall never overdraws; import 10,000 lines ~1,300/s, replay ~16 ms |
-| 14 refunds | not started | | |
+| 14 refunds | in review | | refund = new transaction (payable -> available), charge's entries unchanged; refunds past the purchase credited and flagged; same refund line twice / 4 concurrent importers -> credited once; 4 concurrent PostDeferred runs -> each deferred line once; import 10,000 refunds ~1,250/s |
 | 15 network settlement and reconciliation | not started | | |
 | 16 benchmark and evidence | not started | | |
 
@@ -291,3 +291,19 @@ inspects. Proof: `TestClearingSameFileTwiceChangesNothing`,
 `TestClearingConcurrentImportsOfOneFile`, `TestClearingCrashMidFileRerunPostsEachLineOnce`,
 `TestClearingRacingReversalAndExpiry`, `TestShortfallNeverOverdraws`,
 `TestNetworkScenariosClearEndToEnd`. Number: see BENCHMARKS.md phase 13.
+
+**2026-10-17 — Phase 14, refunds (in review).** Migration 20: `refunded_amount` on
+`card_authorizations`, `credited_amount` on `clearing_records`, clearing files deduplicated
+on `(file_date, sha256)` (PR #15 follow-up: a header-only file is the same bytes every quiet
+day), a partial index on deferred records. `clearing.Import` now posts refund lines in the
+purchase pattern: record claimed first, `auth_id` lock and authorization row, then one
+balanced transaction last (debit `acc_network_payable_usd`, credit the card's available
+account) and `card.refund.posted`. Matched to a cleared purchase: `refunded_amount` grows,
+past `cleared_amount` flagged `refund_exceeds_purchase`; otherwise `unmatched_refund`;
+unknown card rejected; card status ignored; holds and daily counter untouched.
+`clearing.PostDeferred` / `cmd/clearing -post-deferred` posts refunds phase 13 imports
+deferred, claimed with `UPDATE … WHERE status = 'deferred'`. Proof:
+`TestRefundCreditsAvailableWithoutTouchingTheCharge`, `TestPartialAndRepeatedRefunds`,
+`TestUnmatchedRefundIsPostedAndFlagged`, `TestRefundLineImportedTwiceCreditsOnce`,
+`TestPostDeferredIsIdempotent`, `TestHeaderOnlyFilesForDifferentDatesAreDistinct`,
+`TestLateRefundScenarioEndToEnd`. Number: see BENCHMARKS.md phase 14.
