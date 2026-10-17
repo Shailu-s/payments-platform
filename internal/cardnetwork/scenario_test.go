@@ -98,25 +98,35 @@ func TestEachScenarioProducesItsMessages(t *testing.T) {
 }
 
 func TestSameSeedSameBytes(t *testing.T) {
-	play := func() ([]received, []byte) {
+	play := func() ([]received, []byte, []byte) {
 		issuer := newFakeIssuer(t, nil)
 		n := newTestNetwork(t, issuer.srv.URL, NewFakeClock(testStart))
+		var dates []string
 		for i, name := range Scenarios {
-			_, err := n.RunScenario(context.Background(), ScenarioRequest{
+			res, err := n.RunScenario(context.Background(), ScenarioRequest{
 				Scenario: name, CardID: "card_test", Amount: 4_000 + int64(i), Seed: seed(uint64(100 + i)),
 			})
 			if err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
+			dates = append(dates, res.ClearingDates...)
 		}
 		journal, err := json.Marshal(n.Journal())
 		if err != nil {
 			t.Fatal(err)
 		}
-		return issuer.requests(), journal
+		var clearing []byte
+		for _, d := range dates {
+			file, err := n.ClearingFile(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clearing = append(clearing, file...)
+		}
+		return issuer.requests(), journal, clearing
 	}
-	firstReqs, firstJournal := play()
-	secondReqs, secondJournal := play()
+	firstReqs, firstJournal, firstClearing := play()
+	secondReqs, secondJournal, secondClearing := play()
 
 	if len(firstReqs) != len(secondReqs) {
 		t.Fatalf("%d messages vs %d", len(firstReqs), len(secondReqs))
@@ -129,6 +139,9 @@ func TestSameSeedSameBytes(t *testing.T) {
 	}
 	if string(firstJournal) != string(secondJournal) {
 		t.Fatal("journals differ")
+	}
+	if len(firstClearing) == 0 || string(firstClearing) != string(secondClearing) {
+		t.Fatalf("clearing files differ:\n%s\n%s", firstClearing, secondClearing)
 	}
 }
 

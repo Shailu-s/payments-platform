@@ -61,7 +61,9 @@ type ScenarioResult struct {
 	Scenario       string       `json:"scenario"`
 	Seed           uint64       `json:"seed"`
 	Authorizations []AuthResult `json:"authorizations"`
-	Journal        []Entry      `json:"journal"`
+	// ClearingDates are the UTC dates on which this run's lines clear.
+	ClearingDates []string `json:"clearing_dates"`
+	Journal       []Entry  `json:"journal"`
 }
 
 // clearingPlan is a scripted clearing line. Lines tied to an authorization are
@@ -131,7 +133,12 @@ func (n *Network) RunScenario(ctx context.Context, req ScenarioRequest) (Scenari
 		return ScenarioResult{}, err
 	}
 
-	result := ScenarioResult{Scenario: req.Scenario, Seed: seed, Authorizations: r.results}
+	result := ScenarioResult{
+		Scenario:       req.Scenario,
+		Seed:           seed,
+		Authorizations: r.results,
+		ClearingDates:  n.clearingDates(r.plans),
+	}
 	for _, e := range n.Journal() {
 		if slices.Contains(r.messageIDs, e.ID) {
 			result.Journal = append(result.Journal, e)
@@ -147,6 +154,7 @@ type run struct {
 	req        ScenarioRequest
 	merchant   Merchant
 	messageIDs []string
+	plans      []clearingPlan
 	results    []AuthResult
 }
 
@@ -181,6 +189,7 @@ func (r *run) claim(ids []string, plans []clearingPlan) error {
 			r.messageIDs = append(r.messageIDs, adviceID(id))
 		}
 	}
+	r.plans = plans
 	r.n.mu.Lock()
 	r.n.clearing = append(r.n.clearing, plans...)
 	r.n.mu.Unlock()
@@ -194,10 +203,16 @@ func (r *run) purchase(authID string, at time.Time, num, den int64) clearingPlan
 		CardID:     r.req.CardID,
 		Kind:       ClearingPurchase,
 		MerchantID: r.merchant.ID,
-		ClearedAt:  at.Add(clearingDelay),
+		ClearedAt:  clearingTime(at),
 		Num:        num,
 		Den:        den,
 	}
+}
+
+// clearingTime is truncated to the second the file prints, so the file's order is
+// visible in the file itself.
+func clearingTime(sent time.Time) time.Time {
+	return sent.Add(clearingDelay).Truncate(time.Second)
 }
 
 func (r *run) send(a Authorization, plan authPlan) error {
@@ -279,7 +294,7 @@ func (r *run) offlinePurchase() error {
 		CardID:     r.req.CardID,
 		Kind:       ClearingPurchase,
 		MerchantID: r.merchant.ID,
-		ClearedAt:  r.n.clock.Now().Add(clearingDelay),
+		ClearedAt:  clearingTime(r.n.clock.Now()),
 		Amount:     r.req.Amount,
 	}
 	return r.claim(nil, []clearingPlan{line})
