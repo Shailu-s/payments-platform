@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Shailu-s/payments-platform/internal/cards"
 	"github.com/Shailu-s/payments-platform/internal/ratelimit"
 
 	"github.com/jackc/pgx/v5"
@@ -91,6 +92,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/transfers", s.handleCreateTransfer)
 	mux.HandleFunc("GET /v1/transfers/{id}", s.handleGetTransfer)
 	mux.HandleFunc("GET /v1/transfers", s.handleListTransfers)
+
+	mux.HandleFunc("POST /v1/cards", s.handleIssueCard)
+	mux.HandleFunc("GET /v1/cards/{id}", s.handleGetCard)
+	mux.HandleFunc("POST /v1/cards/{id}/freeze", s.handleCardTransition(cards.Freeze))
+	mux.HandleFunc("POST /v1/cards/{id}/unfreeze", s.handleCardTransition(cards.Unfreeze))
+	mux.HandleFunc("POST /v1/cards/{id}/close", s.handleCardTransition(cards.Close))
+
 	mux.HandleFunc("GET /v1/reconciliation/runs", s.handleListReconciliationRuns)
 	mux.HandleFunc("GET /v1/reconciliation/runs/{id}", s.handleGetReconciliationRun)
 	mux.HandleFunc("GET /v1/reconciliation/runs/{id}/findings", s.handleReconciliationFindings)
