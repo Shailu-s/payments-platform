@@ -246,6 +246,42 @@ ceiling its p99 is 538 ms, not under 20 ms.
    bounded wait for a pool connection; then a bigger pool. Hot-account sharding or
    batching (option 6) only once the per-account ceiling itself is the limit.
 
+## Phase 09: cards and card accounts (`28de6e5`, 2026-10-17)
+
+Not a hot-path phase: the transfer path is unchanged; the phase adds migration 16 and the
+card endpoints. Regression check only, same machine, pool 10, 30 s steps, **on battery
+(43 % → 38 %), load average 3–6**. `main` (`91c1722`) was measured in the same session,
+alternating with this branch. `balance_drift` was 0 on every step of every run.
+
+```sh
+MODES="spread hot" RATES="500 1000" make bench-http      # run 1, both branches
+MODES=hot RATES="500 1000" make bench-http               # run 2, both branches
+MODES=hot RATES="1000" make bench-http                   # run 3, both branches
+```
+
+### Spread across 1,000 accounts (run 1)
+
+| target rps | main achieved | main p50 / p99 ms | p09 achieved | p09 p50 / p99 ms | non-202 (main / p09) |
+|---:|---:|---:|---:|---:|---:|
+| 500 | 500 | 1.45 / 18.92 | 500 | 1.41 / 6.16 | 0 / 0 |
+| 1,000 | 1,000 | 1.16 / 47.67 | 1,000 | 1.18 / 41.43 | 0 / 0 |
+
+### One hot account
+
+| target rps | run | main 202s / 503 | main p50 / p99 ms | p09 202s / 503 | p09 p50 / p99 ms |
+|---:|---:|---:|---:|---:|---:|
+| 500 | 1 | 15,001 / 0 | 1.50 / 9.22 | 15,001 / 0 | 1.45 / 37.0 |
+| 500 | 2 | 15,001 / 0 | 1.48 / 29.47 | 15,001 / 0 | 1.46 / 8.51 |
+| 1,000 | 1 | 30,001 / 0 | 1.11 / 59.76 | 29,898 / 102 | 1.21 / 89.94 |
+| 1,000 | 2 | 30,001 / 0 | 1.16 / 74.73 | 29,878 / 123 | 1.14 / 95.99 |
+| 1,000 | 3 | 29,755 / 246 | 1.13 / 116.62 | 30,001 / 0 | 1.14 / 52.5 |
+
+No regression. Spread p99 at 500 is 6.16 ms (main 18.92 ms, same session; rule: ≤ +20 %).
+The hot 1,000 step sits at the per-account ceiling, so whether a run sheds 0 or a few
+hundred requests (≤ 0.8 %) flips between runs on either branch: run 3 reversed runs 1–2.
+Hot p99 at 500 swings 8.5–37 ms between runs of the same binary. No 1,500+ steps were run,
+so this section makes no ceiling claim beyond "both branches accept ~1,000/s".
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two

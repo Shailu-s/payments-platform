@@ -7,6 +7,22 @@ away; every new piece sits on top of it.
 This file replaces the "Later versions" list at the end of PLAN.md's scope fence. The working
 method, the rules and the session LOG stay in PLAN.md.
 
+## Progress
+
+| Phase | Status | PR | Key number / proof |
+|---|---|---|---|
+| 8 fast spending path | merged 2026-10-17 | #10 | hot account ~330 -> 1,212 req/s accepted (same-session main vs p08, BENCHMARKS.md); balance read 0.12 ms at 1M entries |
+| 9 cards | in review | #11 | 20 concurrent first cards -> 1 held account, 0 orphans; 20 same-key issues -> 1 card; freeze racing close never reopens a closed card |
+| 10 network simulator | not started | | |
+| 11 authorization | not started | | |
+| 12 reversals, expiry, incremental holds | not started | | |
+| 13 clearing | not started | | |
+| 14 refunds | not started | | |
+| 15 network settlement and reconciliation | not started | | |
+| 16 benchmark and evidence | not started | | |
+
+Dated entries per phase are in the [phase log](#phase-log) at the bottom.
+
 ---
 
 ## 1. The one-sentence answer
@@ -207,3 +223,19 @@ two more weeks. If an interview lands mid-way, the finished phases are still a s
 | What is your authorization latency, and how did you measure it? | 16 |
 | How does a crypto card approve a tap if the chain takes minutes? | V3 |
 | What stops a user withdrawing USDC while a hold is open? | V3 |
+
+## Phase log
+
+**2026-10-17 — Phase 8, fast spending path (PR #10, merged).** Stored balance per account
+with a `CHECK (balance >= 0)`, idempotency key claimed first and balance lock taken last,
+fail-fast admission (`503 account_busy`). Proof: overdraft refused by the database,
+`VerifyBalances` 0 drift after every benchmark step. Number: balance read 0.12 ms at 1M
+entries; hot account 1,212 accepted/s vs ~330 on same-session main.
+
+**2026-10-17 — Phase 9, cards and card accounts (PR #11, in review).** Cards (status,
+limits, cosmetic last4, no card numbers) and one held account per funding account,
+created race-free in the statement that wins `card_accounts`. Transitions are single
+guarded UPDATEs, each change audited through the outbox. Proof:
+`TestConcurrentFirstCardsShareOneHeldAccount`, `TestIssueCardIsIdempotent`,
+`TestConcurrentFreezeAndCloseEndClosed`. Number: no regression (spread p99 at 500 6.2 ms vs
+main 18.9 ms same session).

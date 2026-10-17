@@ -14,10 +14,10 @@ requires explicit migrations and deployment of the new binaries.
 | Guarantee | Named automated proof |
 | --- | --- |
 | Every committed ledger transaction balances. | [TestRecordMovesMoneyAndBalances](internal/ledger/record_test.go), [TestRecordRejectsOverflowingTotals](internal/ledger/overflow_test.go) |
-| One transfer per API key + idempotency key, including concurrent retries. | [TestIdempotentRequestsCreateOneTransfer](internal/api/idempotency_test.go), [TestRetryAfterFundsAreExhaustedReplaysTheOriginal](internal/api/idempotency_test.go) |
+| One transfer (or card) per API key + idempotency key, including concurrent retries. | [TestIdempotentRequestsCreateOneTransfer](internal/api/idempotency_test.go), [TestRetryAfterFundsAreExhaustedReplaysTheOriginal](internal/api/idempotency_test.go), [TestIssueCardIsIdempotent](internal/api/cards_test.go) |
 | Concurrent requests cannot overspend an account. | [TestConcurrentTransfersCannotOverspend](internal/api/overspend_test.go), [TestLedgerRefusesOverdraft](internal/ledger/stored_balance_test.go), [TestSecondSpendWaitsForTheFirstAndSeesItsDebit](internal/api/overspend_test.go), [TestStoredBalanceTracksEveryMovement](internal/ledger/stored_balance_test.go) |
 | Duplicate provider events have one financial effect. | [TestConcurrentDuplicateWebhooksHaveOneEffect](internal/api/webhooks_test.go), [TestWebhookRetriesAfterFailedTransaction](internal/api/webhooks_test.go) |
-| Every financial transfer transition retains audit evidence. | [TestEveryFinancialTransitionRetainsAuditEvidence](internal/api/audit_test.go), [TestTerminalOutboxFailureRollsBackFinancialEffect](internal/api/terminal_events_test.go) |
+| Every financial transfer transition and every card change retains audit evidence. | [TestEveryFinancialTransitionRetainsAuditEvidence](internal/api/audit_test.go), [TestTerminalOutboxFailureRollsBackFinancialEffect](internal/api/terminal_events_test.go), [TestEveryCardChangeIsAuditedInItsTransaction](internal/api/cards_transitions_test.go) |
 | Ledger history rejects UPDATE/DELETE; corrections append new entries. | [TestLedgerHistoryRejectsUpdatesAndDeletes](internal/ledger/immutable_test.go) |
 | Kafka redelivery does not duplicate payment effects or durable notification jobs. | [TestSenderSIGKILLRedeliversWithoutDuplicatePayment](internal/consumer/crash_test.go), [TestKafkaRedeliveryCreatesOneDurableJob](internal/customerwebhooks/worker_test.go) |
 | Reconciliation detects all six defined outcomes in validated complete snapshots. | [TestProviderDiscrepanciesAreDetectedWithoutFinancialMutation](internal/reconciliation/evidence_test.go) |
@@ -74,8 +74,9 @@ make demo-v1
 ```
 
 Postgres uses host port **5433**, MockBank **8081**, Kafka **9092**. `make migrate-up` applies
-all migrations, including reconciliation (12), ledger immutability (13), stored balances (14)
-and the deferred transfer-to-ledger link (15), without resetting application tables.
+all migrations, including reconciliation (12), ledger immutability (13), stored balances (14),
+the deferred transfer-to-ledger link (15) and cards (16), without resetting application tables.
+Compose's `kafka-init` creates the `transfers` and `cards` topics.
 Migration 14 backfills each non-settlement account's balance from its entries and **fails if
 any of them is already negative** (an overdrawn funding account, for example): fix or
 re-type that account deliberately; the migration does not clamp. The API's connection pool
@@ -266,6 +267,42 @@ The Postgres rate limiter measured 0.171–0.253 ms per allowed request versus 0
 for `SELECT 1`; sequential samples, not paired latency measurements. Reproduce the recorded
 experiments plus the new metrics benchmarks with `make bench` in a disposable database.
 
+## Cards (V2, phase 09)
+
+The account model for card spending. No authorization, holds or limit enforcement yet
+(phase 11), and **no card numbers, CVVs or PINs, ever**: a card is an id (`card_<hex>`) and
+four random cosmetic digits.
+
+```text
+POST /v1/cards                 Idempotency-Key required
+     {"account_id": "acc_...", "per_transaction_limit": 50000, "daily_limit": 200000}
+     -> 201 card   (same key + same body -> 201 same card; different body -> 422)
+GET  /v1/cards/{id}            -> 200 | 404
+POST /v1/cards/{id}/freeze     active -> frozen
+POST /v1/cards/{id}/unfreeze   frozen -> active
+POST /v1/cards/{id}/close      active | frozen -> closed (terminal)
+```
+
+- The funding account is the cardholder's **available** balance. Its first card also
+  creates a **held** account (an ordinary asset account with a stored balance), shared by
+  all its cards; phase 11 moves authorized amounts from available to held. Two concurrent
+  first cards create exactly one held account: the held account is inserted by the same
+  statement that wins the `card_accounts` row, so the loser creates nothing
+  ([TestConcurrentFirstCardsShareOneHeldAccount](internal/api/cards_test.go)).
+- The funding account must exist, be USD, and be neither a settlement account nor a held
+  account (400).
+- Each transition is one guarded `UPDATE ... WHERE status = ANY(allowed)`, never a read then
+  a write, so a freeze racing a close cannot reopen a closed card
+  ([TestConcurrentFreezeAndCloseEndClosed](internal/api/cards_transitions_test.go)).
+  Repeating a transition already applied answers 200 with no new event; a forbidden one
+  (for example unfreezing a closed card) answers `409 invalid_card_state`.
+- Issue and every transition write `card.issued`, `card.frozen`, `card.unfrozen` or
+  `card.closed` to the outbox (topic `cards`) in the same transaction; an outbox failure
+  rolls the change back.
+
+The cost is one extra account and balance row per funding account, and card idempotency
+keys kept forever, as for transfers.
+
 ## Honest V1 limits
 
 - Authentication, not tenancy/authorisation: a valid API key can operate on any account.
@@ -293,6 +330,9 @@ experiments plus the new metrics benchmarks with `make bench` in a disposable da
 - One configured customer endpoint, signed retries and a dead status; no manual replay API
   or delivery history. Customers must deduplicate `event_id` from the signed JSON envelope
   after lost acknowledgements, not trust the event-ID header alone.
+- A card's held account is an ordinary asset account: `POST /v1/transfers` does not yet
+  refuse it as a source or destination. Card limits are stored, not enforced, until
+  authorization (phase 11). There is no card listing endpoint.
 - No automatic money repair, durable reconciliation scheduler, production DB roles, or
   production monitoring/deployment claim. Apply migrations and deploy new binaries explicitly.
 

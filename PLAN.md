@@ -1099,3 +1099,20 @@ for the misses: refused requests still spend pooled round trips on auth/rate lim
 the gate (next phase). Owner action: migration 14 fails on `payments`
 (`acc_demo_funding` -50,000) and `payments_manual_v1` (`acc_manual_funding` -100,000) until
 those funding accounts are fixed deliberately.
+
+**2026-10-17 — Phase 09 (cards and card accounts) built on `phase-09-cards`; PR open, not
+merged.** Executor followed `briefs/phase-09-cards.md`. Migration 16 adds `card_accounts`
+(one held account per funding account, `held_account_id` UNIQUE) and `cards` (status
+active/frozen/closed, limits with `daily >= per_transaction`, cosmetic random last4, unique
+idempotency key). `internal/cards`: `Issue` inserts the held account in the same statement
+that wins `INSERT ... ON CONFLICT DO NOTHING` on `card_accounts` (data-modifying CTE; the FK
+is checked at end of statement), so concurrent first cards share one held account and the
+loser creates nothing; `Transition` is one guarded `UPDATE ... WHERE status = ANY(allowed)`,
+falling back to a read for 404 / 200 no-op / 409 `invalid_card_state`. Issue and every
+real transition write `card.*` to the outbox (topic `cards`, added to `kafka-init`) in the
+same transaction. Failing first, shown by temporary swaps: a check-then-insert held account
+gave each concurrent first card its own held account; a read-then-write freeze reopened a
+closed card. Benchmarks (battery, same session as `main`, three alternating runs): spread
+p99 at 500 6.2 ms vs main 18.9 ms; hot 1,000 sheds 0–246 on either branch (at the
+ceiling, noisy); 0 drift. Open: held accounts are ordinary asset accounts and transfers do
+not refuse them yet; limits stored, enforced in phase 11.
