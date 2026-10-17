@@ -14,8 +14,8 @@ requires explicit migrations and deployment of the new binaries.
 | Guarantee | Named automated proof |
 | --- | --- |
 | Every committed ledger transaction balances. | [TestRecordMovesMoneyAndBalances](internal/ledger/record_test.go), [TestRecordRejectsOverflowingTotals](internal/ledger/overflow_test.go) |
-| One transfer (or card) per API key + idempotency key, including concurrent retries. | [TestIdempotentRequestsCreateOneTransfer](internal/api/idempotency_test.go), [TestRetryAfterFundsAreExhaustedReplaysTheOriginal](internal/api/idempotency_test.go), [TestIssueCardIsIdempotent](internal/api/cards_test.go) |
-| Concurrent requests cannot overspend an account. | [TestConcurrentTransfersCannotOverspend](internal/api/overspend_test.go), [TestLedgerRefusesOverdraft](internal/ledger/stored_balance_test.go), [TestSecondSpendWaitsForTheFirstAndSeesItsDebit](internal/api/overspend_test.go), [TestStoredBalanceTracksEveryMovement](internal/ledger/stored_balance_test.go) |
+| One transfer (or card) per API key + idempotency key, including concurrent retries. | [TestIdempotentRequestsCreateOneTransfer](internal/api/idempotency_test.go), [TestRetryAfterFundsAreExhaustedReplaysTheOriginal](internal/api/idempotency_test.go), [TestIssueCardIsIdempotent](internal/api/cards_test.go); one answer and one hold per network `auth_id`: [TestSameAuthIDAlwaysGetsTheSameAnswer](internal/api/network_test.go) |
+| Concurrent requests cannot overspend an account. | [TestConcurrentTransfersCannotOverspend](internal/api/overspend_test.go), [TestLedgerRefusesOverdraft](internal/ledger/stored_balance_test.go), [TestSecondSpendWaitsForTheFirstAndSeesItsDebit](internal/api/overspend_test.go), [TestStoredBalanceTracksEveryMovement](internal/ledger/stored_balance_test.go), [TestTwoTapsAtOnceCannotOverspend](internal/api/network_test.go) |
 | Duplicate provider events have one financial effect. | [TestConcurrentDuplicateWebhooksHaveOneEffect](internal/api/webhooks_test.go), [TestWebhookRetriesAfterFailedTransaction](internal/api/webhooks_test.go) |
 | Every financial transfer transition and every card change retains audit evidence. | [TestEveryFinancialTransitionRetainsAuditEvidence](internal/api/audit_test.go), [TestTerminalOutboxFailureRollsBackFinancialEffect](internal/api/terminal_events_test.go), [TestEveryCardChangeIsAuditedInItsTransaction](internal/api/cards_transitions_test.go) |
 | Ledger history rejects UPDATE/DELETE; corrections append new entries. | [TestLedgerHistoryRejectsUpdatesAndDeletes](internal/ledger/immutable_test.go) |
@@ -58,7 +58,8 @@ test -f .env || cp .env.example .env
 ```
 
 Set `DATABASE_URL` for the local database; configure distinct random signing keys of at least
-32 bytes in `MOCKBANK_WEBHOOK_SECRET` and `CUSTOMER_WEBHOOK_SECRET`, plus a controlled
+32 bytes in `MOCKBANK_WEBHOOK_SECRET`, `CUSTOMER_WEBHOOK_SECRET` and `NETWORK_SECRET` (the
+card network's, shared with `mock-network`), plus a controlled
 `CUSTOMER_WEBHOOK_URL`. Keys belong only in the ignored `.env`; never commit or log them.
 Every runtime command reads required environment settings and fails rather than silently
 choosing another endpoint. Make loads `.env`; it does not export those values into your
@@ -269,13 +270,14 @@ experiments plus the new metrics benchmarks with `make bench` in a disposable da
 
 ## Cards (V2, phase 09)
 
-The account model for card spending. No authorization, holds or limit enforcement yet
-(phase 11), and **no card numbers, CVVs or PINs, ever**: a card is an id (`card_<hex>`) and
+The account model for card spending (authorization and limit enforcement: phase 11
+below), and **no card numbers, CVVs or PINs, ever**: a card is an id (`card_<hex>`) and
 four random cosmetic digits.
 
 ```text
 POST /v1/cards                 Idempotency-Key required
-     {"account_id": "acc_...", "per_transaction_limit": 50000, "daily_limit": 200000}
+     {"account_id": "acc_...", "per_transaction_limit": 50000, "daily_limit": 200000,
+      "blocked_mccs": ["7995"]}                    (optional, 4-digit merchant category codes)
      -> 201 card   (same key + same body -> 201 same card; different body -> 422)
 GET  /v1/cards/{id}            -> 200 | 404
 POST /v1/cards/{id}/freeze     active -> frozen
@@ -307,8 +309,8 @@ keys kept forever, as for transfers.
 
 We are the card issuer; the card network decides our inputs. `mock-network` plays that
 network, the way MockBank plays the bank, and is written to a contract:
-[docs/mock-network-api.md](docs/mock-network-api.md). No issuer endpoint exists yet
-(phase 11); the tests use a fake issuer.
+[docs/mock-network-api.md](docs/mock-network-api.md). Its own tests use a fake issuer; the
+API's tests drive it against the real issuer endpoints (phase 11).
 
 - It sends signed authorizations, reversals and advices to `ISSUER_URL`
   (`X-Network-Timestamp` / `X-Network-Signature`, the MockBank HMAC scheme with
@@ -333,6 +335,49 @@ make mock-network ARGS="scenario -name stand_in -card card_x -amount 5000 -seed 
 `internal/cardnetwork` is a library so later phases drive it in-process with a fake clock.
 The cost is the MockBank credibility gap again (we wrote both sides, so only the failure
 modes we thought of are tested) and an in-memory journal that a restart loses.
+
+## Card authorization (V2, phase 11)
+
+The network asks "may `card_X` spend $50 at Corner Coffee?" and waits 2 s per attempt. The
+API is the issuer side of [docs/mock-network-api.md](docs/mock-network-api.md):
+
+```text
+POST /network/authorizations   signed by the network (NETWORK_SECRET), no API key -> 200 answer | 503 no answer
+POST /network/advices          a stand-in approval to honour                      -> 200 | 5xx (redelivered)
+```
+
+- **Approve** = move the amount from the card's funding (available) account to its held
+  account in one ledger transaction. Declines move nothing and are stored too: unknown card,
+  card not active, not USD, over the per-transaction limit, blocked merchant category
+  (`blocked_mccs` on `POST /v1/cards`), incremental (phase 12), over the daily limit, or
+  insufficient funds.
+- **Same `auth_id`, same answer.** `card_authorizations.auth_id` is the primary key and is
+  inserted first; a duplicate waits for the original to commit and answers the stored row.
+  Every answer is the stored row
+  ([TestSameAuthIDAlwaysGetsTheSameAnswer](internal/api/network_test.go)).
+- **Two taps cannot overspend.** The hold is written last; the `account_balances` CHECK
+  refuses an overdraft and rolls back the row, the event and the daily spend. A second short
+  statement then stores the decline (`insufficient_funds`), or answers whatever a concurrent
+  duplicate stored ([TestTwoTapsAtOnceCannotOverspend](internal/api/network_test.go)).
+- **Daily limit** is a counter row per card and UTC day, checked and incremented in one
+  conditional upsert, never read then written
+  ([TestConcurrentTapsRespectTheDailyLimit](internal/api/network_test.go)).
+- **Deadline:** each request gets 1 s. A busy account (4 in flight per account in this
+  process, 250 ms lock timeout) or a missed deadline answers `503`, which the network counts
+  as no answer: it retries once with the same `auth_id`, then stands in.
+- **Stand-in is honoured.** An advice (deduplicated on `advice_id` in `network_messages`, in
+  the same transaction as its effect) approves the authorization whatever we answered, even
+  for a frozen card or past its limits, and holds `min(amount, available)`. What could not
+  be held is stored as `hold_shortfall`, for reconciliation (phase 15): never an overdraft
+  ([TestStandInAdviceIsHonoured](internal/api/network_test.go)).
+- The simulator drives the real handler end to end and the network's journal agrees with
+  our rows ([TestNetworkScenariosAgainstTheIssuer](internal/api/network_scenarios_test.go)).
+- A held account cannot be a transfer source or destination (400).
+
+Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 11). The cost is a second hot row per card
+(the daily counter, locked until commit), a second short transaction on the
+insufficient-funds path, and stand-in shortfalls that are real credit exposure we only
+detect, never fix.
 
 ## Honest V1 limits
 
@@ -361,9 +406,10 @@ modes we thought of are tested) and an in-memory journal that a restart loses.
 - One configured customer endpoint, signed retries and a dead status; no manual replay API
   or delivery history. Customers must deduplicate `event_id` from the signed JSON envelope
   after lost acknowledgements, not trust the event-ID header alone.
-- A card's held account is an ordinary asset account: `POST /v1/transfers` does not yet
-  refuse it as a source or destination. Card limits are stored, not enforced, until
-  authorization (phase 11). There is no card listing endpoint.
+- Authorizations hold money but nothing releases it yet: reversals, expiry, incremental
+  holds (phase 12) and clearing (phase 13) are not built, so held money stays held.
+  Incremental authorizations are declined. A stand-in shortfall is recorded, not chased.
+  There is no card or authorization listing endpoint.
 - No automatic money repair, durable reconciliation scheduler, production DB roles, or
   production monitoring/deployment claim. Apply migrations and deploy new binaries explicitly.
 

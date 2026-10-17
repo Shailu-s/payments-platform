@@ -14,7 +14,7 @@ method, the rules and the session LOG stay in PLAN.md.
 | 8 fast spending path | merged 2026-10-17 | #10 | hot account ~330 -> 1,212 req/s accepted (same-session main vs p08, BENCHMARKS.md); balance read 0.12 ms at 1M entries |
 | 9 cards | in review | #11 | 20 concurrent first cards -> 1 held account, 0 orphans; 20 same-key issues -> 1 card; freeze racing close never reopens a closed card |
 | 10 network simulator | in review | #12 | 10 seeded scenarios, same seed -> byte-identical messages and clearing file; stand-in after two deadlines, advices/reversals retried six times then given up |
-| 11 authorization | not started | | |
+| 11 authorization | in review | (this PR) | 20 concurrent $30 taps on $50 -> 1 approved, 19 insufficient_funds; 20 duplicates of one auth_id -> 1 row, 1 hold; auth-spread p99 3.2 ms at 500/s, 34-57 ms at 1,000/s |
 | 12 reversals, expiry, incremental holds | not started | | |
 | 13 clearing | not started | | |
 | 14 refunds | not started | | |
@@ -249,3 +249,15 @@ backoff; ten seeded scenarios; a clearing file built from the network's journal.
 `TestEachScenarioProducesItsMessages`, `TestSameSeedSameBytes`,
 `TestClearingFileReflectsTheJournal`. Number: none; no API path changed (regression run
 deferred to phase 11).
+
+**2026-10-17 — Phase 11, card authorization (in review).** `POST /network/authorizations`
+and `POST /network/advices`, signed with `NETWORK_SECRET`, 1 s deadline, answer = the
+stored row. The `auth_id` primary key is inserted first; then the outbox event, the daily
+counter (one conditional upsert) and the hold last (`available -> held`, balance CHECK).
+An overdraft or daily-limit failure rolls the whole transaction back and a second
+statement stores the decline, unless a concurrent duplicate already stored an answer.
+Advices are deduplicated in `network_messages` and hold `min(amount, available)`, recording
+the rest as `hold_shortfall`. Held accounts are refused as transfer endpoints. Proof:
+`TestSameAuthIDAlwaysGetsTheSameAnswer`, `TestTwoTapsAtOnceCannotOverspend`,
+`TestConcurrentTapsRespectTheDailyLimit`, `TestStandInAdviceIsHonoured`,
+`TestNetworkScenariosAgainstTheIssuer`. Number: see BENCHMARKS.md phase 11.
