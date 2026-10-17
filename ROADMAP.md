@@ -16,7 +16,7 @@ method, the rules and the session LOG stay in PLAN.md.
 | 10 network simulator | in review | #12 | 10 seeded scenarios, same seed -> byte-identical messages and clearing file; stand-in after two deadlines, advices/reversals retried six times then given up |
 | 11 authorization | in review | #13 | 20 concurrent $30 taps on $50 -> 1 approved, 19 insufficient_funds; 20 duplicates of one auth_id -> 1 row, 1 hold; auth-spread p99 3.2 ms at 500/s, 34-57 ms at 1,000/s |
 | 12 reversals, expiry, incremental holds | in review | #14 | 20 copies of one reversal -> 1 release; 10 x $20 reversals on a $50 hold -> $50 released; reversal racing its authorization (20 pairs) -> 0 stuck (1 stuck without the auth_id lock); 20 concurrent increments under a $100 chain limit -> exactly 8; expiry 1,400 holds/s |
-| 13 clearing | not started | | |
+| 13 clearing | in review | #15 | same file twice -> 0 changes; 4 concurrent importers of one file -> each line posted once; crash at line 3 of 5, rerun -> 5 posted once; clearing racing reversals and expiry on 40 holds -> 0 both released and charged; shortfall never overdraws; import 10,000 lines ~1,300/s, replay ~16 ms |
 | 14 refunds | not started | | |
 | 15 network settlement and reconciliation | not started | | |
 | 16 benchmark and evidence | not started | | |
@@ -275,3 +275,19 @@ chain total on it. Proof: `TestReversalReleasesTheHoldOnce`,
 `TestReversalBeforeAuthorizationIsAppliedOnArrival`, `TestReversalRacingExpiryReleasesOnce`,
 `TestExpiryReleasesOldHoldsOnce`, `TestConcurrentIncrementalsRespectFundsAndLimits`. Number:
 see BENCHMARKS.md phase 12.
+
+**2026-10-17 — Phase 13, clearing (PR #15, in review).** Migration 19: `clearing_files` (raw bytes,
+SHA-256 unique), `clearing_records` (`clearing_id` primary key, status, charged from held /
+available, released, shortfall, flag, ledger link), `cleared_amount` / `cleared_at` on
+`card_authorizations`, and the `acc_network_payable_usd` settlement account.
+`clearing.Import` validates the whole file first, stores it once by hash, then posts each
+line in its own transaction: record inserted first (`ON CONFLICT DO NOTHING`), `auth_id`
+advisory lock and authorization row in the same round trip, balances locked in id order
+only when the available account pays, one balanced ledger transaction last. Exact,
+partial (rest released, daily counter freed) and tip lines; over-tolerance, after-expiry,
+after-reversal, duplicate, unauthorized, unknown-card and shortfall lines flagged; refunds
+deferred to phase 14. `cmd/clearing` imports from disk or `GET /clearing?date=`, lists and
+inspects. Proof: `TestClearingSameFileTwiceChangesNothing`,
+`TestClearingConcurrentImportsOfOneFile`, `TestClearingCrashMidFileRerunPostsEachLineOnce`,
+`TestClearingRacingReversalAndExpiry`, `TestShortfallNeverOverdraws`,
+`TestNetworkScenariosClearEndToEnd`. Number: see BENCHMARKS.md phase 13.

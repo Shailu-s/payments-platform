@@ -1191,3 +1191,36 @@ the original's row lock 11 increments passed an 8-increment chain limit. Benchma
 13 → 9 %): auth-spread p99 2.7–15.6 ms at 500, 4.2–10.5 ms at 1,000, 0 non-200; spread p99
 at 500 within the rule; expiry 1,400 holds/s; 0 drift. Tests ran in per-package schemas on
 the default database; benchmarks against `payments_bench` (dropped).
+
+**2026-10-17 — Phase 13 (clearing) built on `phase-13-clearing`; PR open, not merged.**
+Executor followed `briefs/phase-13-clearing.md`. Migration 19: `acc_network_payable_usd`
+(settlement, no balance row), `clearing_files` (raw bytes, SHA-256 unique), `clearing_records`
+(`clearing_id` primary key, status, charged from held / available, released, shortfall,
+comma-separated flag, deferred ledger link), `cleared_amount` / `cleared_at` on
+`card_authorizations`; the test harness restores the payable account after truncation.
+`clearing.Import`: parse and validate the whole file (header, ids, positive integer
+amounts, USD, UTC `cleared_at` on the file's date, no duplicate `clearing_id`), store it
+once by hash, then one transaction per line: record inserted first `ON CONFLICT DO
+NOTHING`, `auth_id` advisory lock and authorization row `FOR UPDATE` in the same batch
+(an incremental `auth_id` resolves to its initial row), balances locked in id order only
+when the available account pays, daily counter freed on partial clears, one balanced ledger
+transaction last, `card.clearing.posted` event. Lock-timeout/deadlock errors retry the line
+up to 5 times. `cmd/clearing`: `-file` / `-download URL` with `-date`, `-list`, `-inspect
+[-flag]`. Deviations: (1) a replay of the same bytes still posts lines that have no record
+yet (counted by `clearing_id`), so a crash mid-file is finished by rerunning the same file,
+as the brief's crash test requires; a complete replay processes nothing; (2) two extra flags,
+`nothing_held` (approved, never released or cleared, yet holding 0, e.g. a fully short
+stand-in) and `card_mismatch` (line's card differs from the authorization's; the
+authorization's accounts are charged); a declined authorization that clears is
+`unauthorized_clearing`; (3) `Import` takes a `Config{OverTolerancePct}`; (4) an extra index
+`clearing_records (file_id, cleared_at, clearing_id)` for `-inspect`. Failing first
+(mutations): the authorization read without `FOR UPDATE` let clearing and a reversal both
+take one hold (held_amount CHECK fired in `TestClearingRacingReversalAndExpiry`); `min` removed
+from the shortfall overdrew (`account_balances_non_negative` in `TestShortfallNeverOverdraws`);
+without the per-line dedupe and the complete-replay check, re-importing posted every line
+again (`TestClearingSameFileTwiceChangesNothing`: 2 duplicate_clearing charges) and four
+concurrent importers posted 80 of 20 lines. Benchmarks: auth-spread p99 3.7–6.9 ms at
+500/1,000, 0 non-200; spread 500 p99 vs main −55 %, +32 %, +157 %, +0.3 % over four pairings
+with no transfer code changed (laptop noise, reported in BENCHMARKS.md); import ~1,230
+lines/s, replay ~16–25 ms; 0 drift. Tests in per-package schemas on the default database;
+benchmarks against `payments_bench` and `payments_bench_clearing` (dropped).
