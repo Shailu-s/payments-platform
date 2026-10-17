@@ -70,6 +70,7 @@ func newServerOn(db DB) *Server {
 		db:            db,
 		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
 		webhookSecret: []byte(testWebhookSecret),
+		networkSecret: []byte(testNetworkSecret),
 	}
 }
 

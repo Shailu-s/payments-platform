@@ -357,9 +357,14 @@ func validateTransferRequest(req *createTransferRequest) (string, bool) {
 }
 
 // validateAccounts confirms both accounts exist and match the requested
-// currency, and that the source can be spent from, in one round trip.
+// currency, that the source can be spent from, and that neither is a card
+// held account, in one round trip.
 func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest) (message, code string, ok bool) {
-	const q = `SELECT id, currency, type FROM accounts WHERE id = ANY($1)`
+	const q = `
+		SELECT a.id, a.currency, a.type, ca.held_account_id IS NOT NULL
+		FROM accounts a
+		LEFT JOIN card_accounts ca ON ca.held_account_id = a.id
+		WHERE a.id = ANY($1)`
 
 	rows, err := s.db.Query(ctx, q, []string{req.SourceAccount, req.DestinationAccount})
 	if err != nil {
@@ -369,13 +374,16 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 
 	currencies := map[string]string{}
 	types := map[string]string{}
+	held := map[string]bool{}
 	for rows.Next() {
 		var id, currency, accountType string
-		if err := rows.Scan(&id, &currency, &accountType); err != nil {
+		var isHeld bool
+		if err := rows.Scan(&id, &currency, &accountType, &isHeld); err != nil {
 			return fmt.Sprintf("scan account: %v", err), CodeInternal, false
 		}
 		currencies[id] = currency
 		types[id] = accountType
+		held[id] = isHeld
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Sprintf("load accounts: %v", err), CodeInternal, false
@@ -390,6 +398,12 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 		}
 		if currency != req.Currency {
 			return fmt.Sprintf("account %s holds %s, not %s", id, currency, req.Currency),
+				CodeInvalidRequest, false
+		}
+		// Its balance is money set aside for card authorizations: only
+		// authorizations and their clearing may move it.
+		if held[id] {
+			return fmt.Sprintf("account %s is a card held account and cannot be a transfer endpoint", id),
 				CodeInvalidRequest, false
 		}
 	}

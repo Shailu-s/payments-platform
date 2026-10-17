@@ -52,7 +52,7 @@ func TestMetricsReflectsDatabaseBacklogsAndLatestReconciliation(t *testing.T) {
 
 func TestMetricsScrapesDoNotConsumePaymentQuota(t *testing.T) {
 	_, key := newTestServer(t)
-	s := NewServer(testPool, []byte(testWebhookSecret))
+	s := NewServer(testPool, []byte(testWebhookSecret), nil)
 	s.limiter = ratelimit.New(testPool, 1, time.Hour)
 	h := s.Handler()
 	for i := 0; i < 3; i++ {

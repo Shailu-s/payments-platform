@@ -425,3 +425,36 @@ func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 		t.Errorf("%d orphaned ledger transactions, want 0", txnCount)
 	}
 }
+
+// A held account's balance belongs to authorizations that have not cleared.
+// A transfer out of it spends a cardholder's hold; a transfer into it creates
+// a hold no authorization owns.
+func TestTransfersRefuseHeldAccounts(t *testing.T) {
+	h, key := newTestServer(t)
+	funding := createAccount(t, h, key, "asset")
+	other := createAccount(t, h, key, "asset")
+	fund(t, funding.ID, 10000)
+	fund(t, other.ID, 10000)
+	held := issueCard(t, h, key, "held-card", funding.ID).HeldAccountID
+	fund(t, held, 5000)
+
+	body := func(source, destination string) string {
+		return fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":100,"currency":"USD"}`,
+			source, destination)
+	}
+	cases := []struct{ name, body string }{
+		{"held account as source", body(held, other.ID)},
+		{"held account as destination", body(other.ID, held)},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doWithKey(h, "POST", "/v1/transfers", key, fmt.Sprintf("held-%d", i), tc.body)
+			if rec.Code != http.StatusBadRequest || decodeError(t, rec).Code != CodeInvalidRequest {
+				t.Errorf("= %d: %s, want 400 %s", rec.Code, rec.Body.String(), CodeInvalidRequest)
+			}
+		})
+	}
+	if got := countRows(t, "transfers"); got != 0 {
+		t.Errorf("transfers = %d, want 0", got)
+	}
+}

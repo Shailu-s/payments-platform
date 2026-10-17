@@ -45,7 +45,7 @@ func TestSignedMockBankWebhookSettlesOnlyWithMatchingKey(t *testing.T) {
 			if err := auth.Insert(ctx, pool, key); err != nil {
 				t.Fatal(err)
 			}
-			handler := api.NewServer(pool, []byte(testWebhookSecret)).Handler()
+			handler := api.NewServer(pool, []byte(testWebhookSecret), nil).Handler()
 			receiver := httptest.NewServer(handler)
 			defer receiver.Close()
 			bankSecret := []byte(testWebhookSecret)

@@ -1134,3 +1134,32 @@ re-running a seed that reuses ids is refused (`409 id_reused`). Compose service 
 profile `network` with `${NETWORK_SECRET:-}`, because `:?` breaks `make up` for everyone
 without the secret. No benchmark run (no API path changed). Tests ran against a disposable
 `payments_p10_test` database via `TEST_DATABASE_URL`.
+
+**2026-10-17 — Phase 11 (card authorization) built on `phase-11-authorization`; PR open,
+not merged.** Executor followed `briefs/phase-11-authorization.md`. Migration 17 adds
+`card_authorizations` (`auth_id` PK, decision, `stand_in`, `hold_shortfall`, deferred
+`ledger_txn_id`), `card_daily_spend` (card, UTC day), `network_messages` and
+`cards.blocked_mccs` (optional on `POST /v1/cards`, sorted/deduplicated; added to the card
+fingerprint only when non-empty so pre-phase-11 retries still match). `POST
+/network/authorizations` (signature first, `NETWORK_SECRET` now required by `cmd/api`, 1 s
+deadline, always the stored row): card read, gate on the funding account, then one
+transaction whose first batch is row insert → `SET LOCAL lock_timeout` → outbox event →
+conditional daily upsert, then the hold (`available -> held`) last. Duplicates wait on the
+PK and replay the stored row; overdraft (CHECK) or daily-limit failure rolls back and one
+`INSERT … ON CONFLICT DO NOTHING` CTE (with its outbox event) stores the decline or yields
+to a concurrent duplicate's answer. `POST /network/advices`: `network_messages` dedupe,
+claim-or-lock the row, daily spend unconditional, both balance rows locked in id order,
+hold `min(amount, available)`, rest in `hold_shortfall`. `validateAccounts` refuses held
+accounts as either endpoint in the same query. Deviations, all within the decided
+behaviour: the card is read before the transaction (an unlocked read inside it is no
+stronger) so the gate precedes the connection; daily-limit declines use the
+second-statement path like insufficient funds instead of an UPDATE in transaction A, so the
+approved event can share the first batch and the counter lock is held one round trip less.
+Failing first: held-account transfers (202 → 400), concurrent taps without funds handling
+(500s), daily counter without its WHERE (20 of 20 approved past a $100 limit), advices
+before the route (404). Benchmarks (battery 28 → 17 %, same session as main): auth-spread
+p99 3.2 ms at 500/s, 57/34 ms at 1,000/s, 101 ms at 1,500/s, 0 non-200; auth-hot ~1,500
+answered/s with 0.3 % fast 503s; 0 drift. Missed: transfer spread p99 at 500 is +1.0–1.5 ms
+over main in three alternating runs (+16–37 %), not isolated. Tests ran against a
+disposable `payments_test_p11` database, benchmarks against `payments_bench_p11`; both
+dropped.

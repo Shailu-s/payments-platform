@@ -39,7 +39,7 @@ services:
       context: ..
       dockerfile: docker/mock-network.Dockerfile
     container_name: payments-mock-network
-    # Opt-in until phase 11 adds the issuer endpoints it calls:
+    # Opt-in, since it needs NETWORK_SECRET (the API must have the same one):
     # docker compose -f docker/docker-compose.yml --profile network up -d mock-network
     profiles: ["network"]
     environment:

@@ -40,6 +40,7 @@ type Card struct {
 	Status              string
 	PerTransactionLimit int64
 	DailyLimit          int64
+	BlockedMCCs         []string
 	APIKeyID            string
 	IdempotencyKey      string
 	RequestFingerprint  string
@@ -58,7 +59,7 @@ type Beginner interface {
 }
 
 const columns = `c.id, c.account_id, ca.held_account_id, c.last4, c.status,
-	c.per_transaction_limit, c.daily_limit, c.api_key_id, c.idempotency_key,
+	c.per_transaction_limit, c.daily_limit, c.blocked_mccs, c.api_key_id, c.idempotency_key,
 	c.request_fingerprint, c.created_at, c.updated_at`
 
 // Issue creates an active card for c.AccountID, and the account's held
@@ -85,11 +86,15 @@ func Issue(ctx context.Context, db Beginner, c Card) (Card, error) {
 	// concurrent retries; the losers wait here for it to commit.
 	const q = `
 		INSERT INTO cards (id, account_id, last4, status, per_transaction_limit,
-			daily_limit, api_key_id, idempotency_key, request_fingerprint)
-		VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8)
+			daily_limit, blocked_mccs, api_key_id, idempotency_key, request_fingerprint)
+		VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9)
 		RETURNING created_at, updated_at`
+	if c.BlockedMCCs == nil {
+		// nil would be sent as NULL, which the column refuses.
+		c.BlockedMCCs = []string{}
+	}
 	err = tx.QueryRow(ctx, q, c.ID, c.AccountID, last4, c.PerTransactionLimit,
-		c.DailyLimit, c.APIKeyID, c.IdempotencyKey, c.RequestFingerprint,
+		c.DailyLimit, c.BlockedMCCs, c.APIKeyID, c.IdempotencyKey, c.RequestFingerprint,
 	).Scan(&c.CreatedAt, &c.UpdatedAt)
 	if isUniqueViolation(err) {
 		return Card{}, ErrDuplicateKey
@@ -184,7 +189,7 @@ type scannable interface {
 func scan(row scannable) (Card, error) {
 	var c Card
 	err := row.Scan(&c.ID, &c.AccountID, &c.HeldAccountID, &c.Last4, &c.Status,
-		&c.PerTransactionLimit, &c.DailyLimit, &c.APIKeyID, &c.IdempotencyKey,
+		&c.PerTransactionLimit, &c.DailyLimit, &c.BlockedMCCs, &c.APIKeyID, &c.IdempotencyKey,
 		&c.RequestFingerprint, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
