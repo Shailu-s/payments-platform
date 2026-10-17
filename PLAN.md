@@ -1224,3 +1224,29 @@ concurrent importers posted 80 of 20 lines. Benchmarks: auth-spread p99 3.7–6.
 with no transfer code changed (laptop noise, reported in BENCHMARKS.md); import ~1,230
 lines/s, replay ~16–25 ms; 0 drift. Tests in per-package schemas on the default database;
 benchmarks against `payments_bench` and `payments_bench_clearing` (dropped).
+
+**2026-10-17 — Phase 14 (refunds) built on `phase-14-refunds`; PR open, not merged.**
+Executor followed `briefs/phase-14-refunds.md`. Migration 20: `refunded_amount` on
+`card_authorizations`, `credited_amount` on `clearing_records`, `clearing_files` unique on
+`(file_date, sha256)` instead of `sha256` (PR #15 follow-up), and a partial index on
+deferred records. `Import` posts refund lines in the purchase pattern (record claimed,
+`auth_id` lock + authorization row `FOR UPDATE`, incremental resolved to its initial row,
+card lookup, then one batch for `refunded_amount`, the record and `card.refund.posted`, the
+ledger last: debit `acc_network_payable_usd`, credit the line's card's available account).
+Matched = auth found with `cleared_amount > 0`; refunds past `cleared_amount` flagged
+`refund_exceeds_purchase`; no/unknown/never-cleared auth `unmatched_refund`; unknown card
+rejected; card status ignored; holds and daily spend untouched. `clearing.PostDeferred` /
+`cmd/clearing -post-deferred` pages deferred records by `clearing_id` and claims each with
+`UPDATE … SET status = 'posted' WHERE clearing_id = $1 AND status = 'deferred'` in the
+line's transaction (shared `post` with the import's insert claim). Deviations: (1) a
+matched refund on a different card than its authorization credits the line's card and is
+flagged `card_mismatch`; (2) a refund line with an `auth_id` now takes the auth lock and
+row lock (phase 13 skipped them for refunds); (3) `Summary` and `Record` gain `credited`;
+(4) the deferred partial index; (5) `PostDeferred` rejects a negative tolerance like
+`Import`. Failing first: header-only file for the next date returned the first date's file;
+every refund test saw `deferred` records and unchanged balances before the posting code;
+`PostDeferred` stub left 22 deferred lines. Benchmarks: auth-spread p99 4.2–10.1 ms at 500,
+11.4–57.3 ms at 1,000, 0 non-200, 0 drift, p50 within 0.08 ms of main; refund import
+~1,250 lines/s, replay ~16–25 ms. Tests in per-package schemas on the default database
+(Kafka started for the Kafka suites, then stopped); benchmarks against `payments_bench` and
+`payments_bench_clearing` (dropped).

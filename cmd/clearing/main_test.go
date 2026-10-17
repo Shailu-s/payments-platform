@@ -56,8 +56,8 @@ func TestCommandDownloadsImportsListsAndInspects(t *testing.T) {
 		t.Fatal(err)
 	}
 	var imported clearing.Summary
-	if err := json.Unmarshal(output.Bytes(), &imported); err != nil || imported.Statuses[clearing.StatusRejected] != 1 ||
-		imported.Statuses[clearing.StatusDeferred] != 1 || imported.Replayed {
+	if err := json.Unmarshal(output.Bytes(), &imported); err != nil || imported.Statuses[clearing.StatusRejected] != 2 ||
+		imported.Replayed {
 		t.Fatalf("import output=%s err=%v", output.String(), err)
 	}
 
@@ -92,9 +92,19 @@ func TestCommandDownloadsImportsListsAndInspects(t *testing.T) {
 		Summary clearing.Summary  `json:"summary"`
 		Records []clearing.Record `json:"records"`
 	}
-	if err := json.Unmarshal(output.Bytes(), &detail); err != nil || len(detail.Records) != 1 ||
-		detail.Records[0].ClearingID != "clr_cli_1" || detail.Summary.Flags[clearing.FlagUnknownCard] != 1 {
+	if err := json.Unmarshal(output.Bytes(), &detail); err != nil || len(detail.Records) != 2 ||
+		detail.Records[0].ClearingID != "clr_cli_1" || detail.Summary.Flags[clearing.FlagUnknownCard] != 2 {
 		t.Fatalf("inspect=%s err=%v", output.String(), err)
+	}
+
+	// Imports post refunds now, so nothing is left deferred.
+	output.Reset()
+	if err := run(ctx, []string{"-post-deferred"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var deferred clearing.DeferredSummary
+	if err := json.Unmarshal(output.Bytes(), &deferred); err != nil || deferred.Processed != 0 {
+		t.Fatalf("post-deferred=%s err=%v", output.String(), err)
 	}
 }
 
@@ -109,6 +119,8 @@ func TestInvalidCommandModesFailBeforeConnecting(t *testing.T) {
 		{"-list", "-flag", "shortfall"},
 		{"-inspect", "clf_x", "-flag", "invented"},
 		{"-list", "-limit", "0"},
+		{"-post-deferred", "-list"},
+		{"-post-deferred", "-date", "2026-10-18"},
 	} {
 		if err := run(context.Background(), args, &bytes.Buffer{}); err == nil {
 			t.Fatalf("invalid args accepted: %v", args)

@@ -438,15 +438,18 @@ make clearing ARGS="-download $NETWORK_URL -date 2026-10-18"   GET /clearing?dat
 make clearing ARGS="-file clearing-2026-10-18.csv -date 2026-10-18"
 make clearing ARGS="-list"                                     imported files
 make clearing ARGS="-inspect clf_… -flag shortfall"            a file's summary and lines
+make clearing ARGS="-post-deferred"                             post refunds older imports deferred
 ```
 
 - **Validate, then store once** ([internal/clearing](internal/clearing/import.go)): the whole
   file is parsed first (exact header, positive integer amounts, USD, UTC timestamps on the
   file's date, no `clearing_id` twice); one bad line rejects the file and writes nothing
   ([TestInvalidFileWritesNothing](internal/clearing/import_test.go)). The raw bytes are kept
-  with their SHA-256; the same bytes again find the stored file and, if every line has a
-  record, process nothing
-  ([TestClearingSameFileTwiceChangesNothing](internal/clearing/import_test.go)).
+  with their SHA-256; the same bytes for the same date find the stored file and, if every
+  line has a record, process nothing
+  ([TestClearingSameFileTwiceChangesNothing](internal/clearing/import_test.go)). A file is
+  keyed on `(file_date, sha256)`: a header-only file is the same bytes every quiet day
+  ([TestHeaderOnlyFilesForDifferentDatesAreDistinct](internal/clearing/import_test.go)).
 - **One short transaction per line**, keyed by the network's `clearing_id`: the record is
   inserted first, so a second importer of the same line waits and skips; then the
   `auth_id` lock and the authorization row, the daily counter, the balances, and the ledger
@@ -465,20 +468,53 @@ make clearing ARGS="-inspect clf_… -flag shortfall"            a file's summar
   | no or unknown `auth_id` (offline) | available `F` → payable | `unauthorized_clearing` |
   | unknown card | nothing, status `rejected` | `unknown_card` |
   | not enough available | `min(want, balance)`, rest recorded as `shortfall` | `shortfall` |
-  | refund | nothing yet, status `deferred` (phase 14) | |
+  | refund | see [Refunds](#refunds-v2-phase-14) | |
 
   ([TestClearingExactPartialAndTip](internal/clearing/post_test.go),
   [TestShortfallNeverOverdraws](internal/clearing/post_test.go),
   [TestClearingRacingReversalAndExpiry](internal/clearing/post_test.go): clearing, reversals
   and the expirer racing for 40 holds never both release and charge one.)
 - **End to end:** every simulator scenario against the real issuer handler, its clearing
-  files imported twice: 9 purchases posted, the late refund deferred, nothing left held,
-  0 drift ([TestNetworkScenariosClearEndToEnd](internal/clearing/network_test.go)).
+  files imported twice: 9 purchases posted, the late refund credited back, nothing left
+  held, 0 drift ([TestNetworkScenariosClearEndToEnd](internal/clearing/network_test.go)).
 
 Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 13). The cost is that a crash leaves a
 file partly posted until it is run again, that one importer posts ~1,300 lines/s serially,
 and that charging the network's amount when it exceeds the hold, or when nothing was held,
 is exposure we flag rather than refuse.
+
+## Refunds (V2, phase 14)
+
+A customer returns shoes three weeks later; the network's clearing file carries a `refund`
+line. A refund is **new money back**, a new ledger transaction, never an edit of the charge.
+
+- **Same line pattern as purchases** ([internal/clearing/refund.go](internal/clearing/refund.go)):
+  record claimed first by `clearing_id`, the `auth_id` lock and authorization row, then
+  one balanced transaction last: debit `acc_network_payable_usd` (we owe the network less),
+  credit the card's available account; `card.refund.posted` in the outbox. Holds and the
+  daily counter are not touched; a closed card's account is still credited.
+
+  | refund line | money | flag |
+  |---|---|---|
+  | names a cleared purchase, total refunded ≤ cleared | payable → available, `refunded_amount += F` | |
+  | takes refunds past what the purchase cleared | the same, still credited | `refund_exceeds_purchase` |
+  | no `auth_id`, unknown `auth_id`, or never cleared | payable → available | `unmatched_refund` |
+  | names another card's purchase | the line's card is credited | `card_mismatch` |
+  | unknown card | nothing, status `rejected` | `unknown_card` |
+
+  ([TestRefundCreditsAvailableWithoutTouchingTheCharge](internal/clearing/refund_test.go),
+  [TestPartialAndRepeatedRefunds](internal/clearing/refund_test.go),
+  [TestUnmatchedRefundIsPostedAndFlagged](internal/clearing/refund_test.go),
+  [TestRefundLineImportedTwiceCreditsOnce](internal/clearing/refund_test.go),
+  [TestLateRefundScenarioEndToEnd](internal/clearing/network_test.go).)
+- **Refunds deferred by phase 13 imports:** `clearing.PostDeferred` (`-post-deferred`)
+  claims each with `UPDATE … WHERE status = 'deferred'` in the line's own transaction, so
+  concurrent or repeated runs credit it once
+  ([TestPostDeferredIsIdempotent](internal/clearing/deferred_test.go)).
+
+Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 14). The cost is that we credit what the
+network sends even past the purchase (flagged exposure, not refused), and refund matching is
+only as good as the network's `auth_id`.
 
 ## Honest V1 limits
 
@@ -508,8 +544,8 @@ is exposure we flag rather than refuse.
   or delivery history. Customers must deduplicate `event_id` from the signed JSON envelope
   after lost acknowledgements, not trust the event-ID header alone.
 - Holds are released by reversals and expiry (phase 12) and turned into charges by
-  clearing (phase 13). Refund lines are stored, not posted (phase 14); nothing pays the
-  network payable yet (phase 15). Stand-in and clearing shortfalls are recorded, not
+  clearing (phase 13); refunds credit them back (phase 14). Nothing pays the network
+  payable yet (phase 15). Stand-in and clearing shortfalls are recorded, not
   chased. There is no card or authorization listing endpoint.
 - No automatic money repair, durable reconciliation scheduler, production DB roles, or
   production monitoring/deployment claim. Apply migrations and deploy new binaries explicitly.

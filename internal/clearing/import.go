@@ -62,15 +62,17 @@ type Summary struct {
 	ChargedFromAvailable int64          `json:"charged_from_available"`
 	Released             int64          `json:"released"`
 	Shortfall            int64          `json:"shortfall"`
+	// Credited is what refund lines gave back to accounts.
+	Credited int64 `json:"credited"`
 }
 
 // Import records a clearing file and posts each of its lines once.
 //
-// The same bytes again change nothing: the file is found by its hash and, if
-// every line already has a record, nothing is processed. Each line commits in
-// its own short transaction, so a crash leaves the file partly posted; running
-// it again posts the rest, because a line's clearing_id is claimed in the same
-// transaction as its money.
+// The same bytes for the same date change nothing: the file is found by its
+// date and hash and, if every line already has a record, nothing is
+// processed. Each line commits in its own short transaction, so a crash leaves
+// the file partly posted; running it again posts the rest, because a line's
+// clearing_id is claimed in the same transaction as its money.
 func Import(ctx context.Context, db DB, raw []byte, fileDate time.Time, cfg Config) (Summary, error) {
 	if cfg.OverTolerancePct < 0 {
 		return Summary{}, errors.New("over tolerance must not be negative")
@@ -102,7 +104,7 @@ func Import(ctx context.Context, db DB, raw []byte, fileDate time.Time, cfg Conf
 
 	processed := 0
 	for _, l := range lines {
-		ok, err := postWithRetry(ctx, db, file.ID, l, cfg)
+		ok, err := postWithRetry(ctx, func() (bool, error) { return postLine(ctx, db, file.ID, l, cfg) })
 		if err != nil {
 			return Summary{}, fmt.Errorf("clearing %s: %w", l.ClearingID, err)
 		}
@@ -118,18 +120,18 @@ func Import(ctx context.Context, db DB, raw []byte, fileDate time.Time, cfg Conf
 	slog.Info("clearing file imported", "file_id", file.ID, "date", file.FileDate, "lines", file.LineCount,
 		"processed", processed, "statuses", summary.Statuses, "flags", summary.Flags,
 		"charged_from_held", summary.ChargedFromHeld, "charged_from_available", summary.ChargedFromAvailable,
-		"shortfall", summary.Shortfall)
+		"shortfall", summary.Shortfall, "credited", summary.Credited)
 	return summary, nil
 }
 
-// insertFile stores the file unless its bytes are already stored, and returns
-// the stored file. A concurrent insert of the same bytes waits for the first
-// to commit and then finds it.
+// insertFile stores the file unless its bytes are already stored for its date,
+// and returns the stored file. A concurrent insert of the same file waits for
+// the first to commit and then finds it.
 func insertFile(ctx context.Context, db DB, f File, raw []byte) (File, bool, error) {
 	const insert = `
 		INSERT INTO clearing_files (id, file_date, sha256, raw, line_count)
 		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (sha256) DO NOTHING
+		ON CONFLICT (file_date, sha256) DO NOTHING
 		RETURNING ` + fileColumns
 	stored, err := scanFile(db.QueryRow(ctx, insert, f.ID, f.FileDate, f.SHA256, raw, f.LineCount))
 	if err == nil {
@@ -138,7 +140,8 @@ func insertFile(ctx context.Context, db DB, f File, raw []byte) (File, bool, err
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return File{}, false, fmt.Errorf("save clearing file: %w", err)
 	}
-	stored, err = scanFile(db.QueryRow(ctx, `SELECT `+fileColumns+` FROM clearing_files WHERE sha256 = $1`, f.SHA256))
+	stored, err = scanFile(db.QueryRow(ctx, `SELECT `+fileColumns+` FROM clearing_files
+		WHERE file_date = $1 AND sha256 = $2`, f.FileDate, f.SHA256))
 	if err != nil {
 		return File{}, false, fmt.Errorf("find clearing file %s: %w", f.SHA256, err)
 	}
@@ -149,9 +152,9 @@ func insertFile(ctx context.Context, db DB, f File, raw []byte) (File, bool, err
 // another import of the same line; neither holds its lock for long.
 const maxAttempts = 5
 
-func postWithRetry(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bool, error) {
+func postWithRetry(ctx context.Context, post func() (bool, error)) (bool, error) {
 	for attempt := 1; ; attempt++ {
-		ok, err := postLine(ctx, db, fileID, l, cfg)
+		ok, err := post()
 		if err == nil || attempt == maxAttempts || !retryable(err) {
 			return ok, err
 		}
@@ -174,7 +177,8 @@ func retryable(err error) bool {
 func summarise(ctx context.Context, db DB, f File, ids []string) (Summary, error) {
 	const q = `
 		SELECT file_id = $2, status, COALESCE(flag, ''), count(*), sum(amount)::bigint, sum(charged_from_held)::bigint,
-			sum(charged_from_available)::bigint, sum(released_amount)::bigint, sum(shortfall)::bigint
+			sum(charged_from_available)::bigint, sum(released_amount)::bigint, sum(shortfall)::bigint,
+			sum(credited_amount)::bigint
 		FROM clearing_records WHERE clearing_id = ANY($1)
 		GROUP BY 1, 2, 3`
 	rows, err := db.Query(ctx, q, ids, f.ID)
@@ -188,8 +192,8 @@ func summarise(ctx context.Context, db DB, f File, ids []string) (Summary, error
 		var own bool
 		var status, flag string
 		var n int
-		var amount, held, available, released, shortfall int64
-		if err := rows.Scan(&own, &status, &flag, &n, &amount, &held, &available, &released, &shortfall); err != nil {
+		var amount, held, available, released, shortfall, credited int64
+		if err := rows.Scan(&own, &status, &flag, &n, &amount, &held, &available, &released, &shortfall, &credited); err != nil {
 			return Summary{}, fmt.Errorf("summarise clearing file %s: %w", f.ID, err)
 		}
 		recorded += n
@@ -207,6 +211,7 @@ func summarise(ctx context.Context, db DB, f File, ids []string) (Summary, error
 		s.ChargedFromAvailable += available
 		s.Released += released
 		s.Shortfall += shortfall
+		s.Credited += credited
 	}
 	if err := rows.Err(); err != nil {
 		return Summary{}, fmt.Errorf("summarise clearing file %s: %w", f.ID, err)

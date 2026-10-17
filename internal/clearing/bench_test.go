@@ -59,6 +59,54 @@ func BenchmarkImportClearing(b *testing.B) {
 	}
 }
 
+// BenchmarkImportRefunds imports a 10,000-line file of refunds, each matched
+// to a cleared purchase, spread over ten cards, then imports it again.
+func BenchmarkImportRefunds(b *testing.B) {
+	const (
+		cardsN  = 10
+		perCard = 1000
+		amount  = 1000
+	)
+	ctx := context.Background()
+	for range b.N {
+		b.StopTimer()
+		resetDB(b)
+		var lines []Line
+		for c := range cardsN {
+			card := newCard(b, perCard*amount)
+			prefix := fmt.Sprintf("auth_bench_%d_", c)
+			seedHolds(b, card, prefix, perCard, amount)
+			// As if each hold had cleared; the refund path reads only the authorization.
+			if _, err := testPool.Exec(ctx, `
+				UPDATE card_authorizations SET cleared_amount = held_amount, held_amount = 0, cleared_at = now()
+				WHERE card_id = $1`, card.ID); err != nil {
+				b.Fatal(err)
+			}
+			for i := range perCard {
+				lines = append(lines, refund(fmt.Sprintf("clr_bench_%d_%d", c, i), fmt.Sprint(prefix, i), card.ID, amount))
+			}
+		}
+		raw := fileOf(lines...)
+		b.StartTimer()
+
+		started := time.Now()
+		s, err := Import(ctx, testPool, raw, testDate, testConfig)
+		elapsed := time.Since(started)
+		if err != nil || s.Statuses[StatusPosted] != len(lines) || len(s.Flags) != 0 || s.Credited != amount*int64(len(lines)) {
+			b.Fatalf("import = %+v, %v", s, err)
+		}
+		started = time.Now()
+		again, err := Import(ctx, testPool, raw, testDate, testConfig)
+		replay := time.Since(started)
+		if err != nil || !again.Replayed || again.Processed != 0 {
+			b.Fatalf("re-import = %+v, %v", again, err)
+		}
+		b.ReportMetric(float64(len(lines))/elapsed.Seconds(), "lines/s")
+		b.ReportMetric(elapsed.Seconds(), "s/10k")
+		b.ReportMetric(float64(replay.Microseconds())/1000, "replay-ms")
+	}
+}
+
 // seedHolds writes n approved holds of amount on card, with one ledger move
 // for their total, as if n taps had been approved.
 func seedHolds(tb testing.TB, card cards.Card, prefix string, n int, amount int64) {
