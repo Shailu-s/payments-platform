@@ -23,6 +23,9 @@ limiter from capping the load), starts the real `cmd/api` binary, and drives
 - `hot`: every request spends from the same source account.
 - Only the admission path runs: relay, sender and MockBank are not started, so the outbox
   backlog grows. This measures the synchronous API, not end-to-end settlement.
+- Each mode first runs a discarded warm-up (`WARMUP`, default 15 s) at its first rate,
+  since phase 16: the first measured step of a fresh API process had the worst tail
+  (phase 15). Rows record the `warmup` used.
 - Raw per-step JSON lands in `bench/out/<label>/results.jsonl` (ignored; holds API keys).
 
 ## Environment
