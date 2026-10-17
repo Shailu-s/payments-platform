@@ -282,6 +282,12 @@ hundred requests (≤ 0.8 %) flips between runs on either branch: run 3 reversed
 Hot p99 at 500 swings 8.5–37 ms between runs of the same binary. No 1,500+ steps were run,
 so this section makes no ceiling claim beyond "both branches accept ~1,000/s".
 
+## Phase 10: card network simulator (2026-10-17)
+
+No benchmark run: phase 10 adds `cmd/mock-network` and `internal/cardnetwork`, a test
+counterparty, and changes no API path. The regression run is deferred to phase 11, which
+adds the authorization hot path.
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two

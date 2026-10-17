@@ -1116,3 +1116,21 @@ closed card. Benchmarks (battery, same session as `main`, three alternating runs
 p99 at 500 6.2 ms vs main 18.9 ms; hot 1,000 sheds 0–246 on either branch (at the
 ceiling, noisy); 0 drift. Open: held accounts are ordinary asset accounts and transfers do
 not refuse them yet; limits stored, enforced in phase 11.
+
+**2026-10-17 — Phase 10 (card network simulator) built on `phase-10-mock-network`; PR
+open, not merged.** Executor followed `briefs/phase-10-mock-network.md`. Contract first
+(`docs/mock-network-api.md`), then `internal/cardnetwork` (messages, `webhooks` HMAC with
+`X-Network-*` headers, injectable `Clock`/`FakeClock`, in-memory journal, deadline + one
+same-`auth_id` retry + stand-in with advice, reversals/advices retried on any non-2xx at
+1/2/4/8/16 s then given up), ten seeded scenarios, and a clearing builder that resolves
+scripted lines against the journal (declined and fully reversed authorizations drop out,
+incremental chains clear their total on the initial `auth_id`). `cmd/mock-network` serves
+`/sandbox/scenarios`, `/sandbox/journal`, `/sandbox/reset`, `/clearing?date=` and has a
+`scenario` subcommand that writes clearing files to disk. Decisions within the brief:
+timeouts in `timeout_then_retry`/`stand_in` are produced by discarding the issuer's answer
+("lost on the way back"), since the network cannot make a real issuer slow; genuine slow
+issuers are covered by the real per-attempt deadline. Advice ids derive from the auth id;
+re-running a seed that reuses ids is refused (`409 id_reused`). Compose service is behind
+profile `network` with `${NETWORK_SECRET:-}`, because `:?` breaks `make up` for everyone
+without the secret. No benchmark run (no API path changed). Tests ran against a disposable
+`payments_p10_test` database via `TEST_DATABASE_URL`.

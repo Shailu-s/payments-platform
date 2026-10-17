@@ -13,7 +13,7 @@ method, the rules and the session LOG stay in PLAN.md.
 |---|---|---|---|
 | 8 fast spending path | merged 2026-10-17 | #10 | hot account ~330 -> 1,212 req/s accepted (same-session main vs p08, BENCHMARKS.md); balance read 0.12 ms at 1M entries |
 | 9 cards | in review | #11 | 20 concurrent first cards -> 1 held account, 0 orphans; 20 same-key issues -> 1 card; freeze racing close never reopens a closed card |
-| 10 network simulator | not started | | |
+| 10 network simulator | in review | | 10 seeded scenarios, same seed -> byte-identical messages and clearing file; stand-in after two deadlines, advices/reversals retried six times then given up |
 | 11 authorization | not started | | |
 | 12 reversals, expiry, incremental holds | not started | | |
 | 13 clearing | not started | | |
@@ -239,3 +239,13 @@ guarded UPDATEs, each change audited through the outbox. Proof:
 `TestConcurrentFirstCardsShareOneHeldAccount`, `TestIssueCardIsIdempotent`,
 `TestConcurrentFreezeAndCloseEndClosed`. Number: no regression (spread p99 at 500 6.2 ms vs
 main 18.9 ms same session).
+
+**2026-10-17 — Phase 10, card network simulator (in review).** `mock-network` and the
+`internal/cardnetwork` library, written to `docs/mock-network-api.md`: signed
+authorizations with a deadline, one same-`auth_id` retry, stand-in with an advice;
+reversals that may precede their authorization; reversals/advices retried with bounded
+backoff; ten seeded scenarios; a clearing file built from the network's journal. Proof:
+`TestSlowIssuerGetsOneRetryWithTheSameAuthID`, `TestStandInApprovesAfterTwoTimeoutsAndSendsAnAdvice`,
+`TestEachScenarioProducesItsMessages`, `TestSameSeedSameBytes`,
+`TestClearingFileReflectsTheJournal`. Number: none; no API path changed (regression run
+deferred to phase 11).
