@@ -237,6 +237,78 @@ func get(ctx context.Context, db Querier, q, authID string) (Authorization, erro
 	return a, nil
 }
 
+// ClaimForAdvice inserts a, a stand-in approval with no hold yet, or, if the
+// auth_id already has a row, locks and returns that row instead. Either way the
+// caller holds the row until commit, so a late authorization for the same
+// auth_id waits for the advice rather than racing it.
+func ClaimForAdvice(ctx context.Context, tx pgx.Tx, a Authorization) (Authorization, bool, error) {
+	q := insertSQL + ` ON CONFLICT (auth_id) DO NOTHING RETURNING ` + columns
+	stored, err := scan(tx.QueryRow(ctx, q, insertArgs(a)...))
+	if err == nil {
+		return stored, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Authorization{}, false, fmt.Errorf("claim authorization %s: %w", a.AuthID, err)
+	}
+	// The conflict waited for the other writer to commit, so this sees it.
+	stored, err = GetForUpdate(ctx, tx, a.AuthID)
+	return stored, false, err
+}
+
+// ApproveStandIn records that the network approved a on our behalf, with the
+// hold actually placed: a.HoldShortfall is what could not be held.
+func ApproveStandIn(ctx context.Context, tx pgx.Tx, a Authorization) (Authorization, error) {
+	const q = `
+		UPDATE card_authorizations
+		SET decision = 'approved', approved_amount = amount, decline_reason = NULL,
+			stand_in = true, hold_shortfall = $2, ledger_txn_id = $3,
+			account_id = $4, held_account_id = $5, updated_at = now()
+		WHERE auth_id = $1
+		RETURNING ` + columns
+	stored, err := scan(tx.QueryRow(ctx, q, a.AuthID, a.HoldShortfall, a.LedgerTxnID, a.AccountID, a.HeldAccountID))
+	if err != nil {
+		return Authorization{}, fmt.Errorf("approve stand-in %s: %w", a.AuthID, err)
+	}
+	return stored, nil
+}
+
+// MarkStandIn records an advice for an authorization we had already approved
+// and held: nothing moves.
+func MarkStandIn(ctx context.Context, tx pgx.Tx, authID string) (Authorization, error) {
+	q := `UPDATE card_authorizations SET stand_in = true, updated_at = now()
+		WHERE auth_id = $1 RETURNING ` + columns
+	stored, err := scan(tx.QueryRow(ctx, q, authID))
+	if err != nil {
+		return Authorization{}, fmt.Errorf("mark stand-in %s: %w", authID, err)
+	}
+	return stored, nil
+}
+
+// AddDailySpend adds amount to the card's spend for today (UTC) with no limit:
+// a stand-in approval was already given to the merchant.
+func AddDailySpend(ctx context.Context, tx pgx.Tx, cardID string, amount int64) error {
+	const q = `
+		INSERT INTO card_daily_spend (card_id, day, amount)
+		VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $2)
+		ON CONFLICT (card_id, day) DO UPDATE SET amount = card_daily_spend.amount + EXCLUDED.amount`
+	if _, err := tx.Exec(ctx, q, cardID, amount); err != nil {
+		return fmt.Errorf("daily spend for %s: %w", cardID, err)
+	}
+	return nil
+}
+
+// RecordAdvice claims a network message id; false means it was already applied.
+func RecordAdvice(ctx context.Context, tx pgx.Tx, adviceID, authID string) (bool, error) {
+	const q = `
+		INSERT INTO network_messages (message_id, kind, auth_id) VALUES ($1, 'advice', $2)
+		ON CONFLICT (message_id) DO NOTHING`
+	tag, err := tx.Exec(ctx, q, adviceID, authID)
+	if err != nil {
+		return false, fmt.Errorf("record advice %s: %w", adviceID, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // ErrDailyLimit means the approval would take the card past its daily limit.
 var ErrDailyLimit = errors.New("daily limit exceeded")
 

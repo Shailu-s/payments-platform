@@ -301,3 +301,182 @@ func (s *Server) awaitAuthorization(ctx context.Context, authID string) (authori
 	}
 	return authorizations.Authorization{}, err
 }
+
+// An advice is not a question: the network already told the merchant yes.
+type networkAdvice struct {
+	AdviceID string          `json:"advice_id"`
+	AuthID   string          `json:"auth_id"`
+	CardID   string          `json:"card_id"`
+	Amount   int64           `json:"amount"`
+	Merchant networkMerchant `json:"merchant"`
+	Decision string          `json:"decision"`
+	Reason   string          `json:"reason"`
+}
+
+// handleNetworkAdvice honours a stand-in approval. Any non-2xx is redelivered
+// by the network with backoff, so a failure here is retried, not lost.
+func (s *Server) handleNetworkAdvice(w http.ResponseWriter, r *http.Request) {
+	body, ok := s.readNetworkRequest(w, r)
+	if !ok {
+		return
+	}
+	var msg networkAdvice
+	if err := json.Unmarshal(body, &msg); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "advice body is not valid json")
+		return
+	}
+	switch {
+	case msg.AdviceID == "" || msg.AuthID == "" || msg.CardID == "":
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "advice_id, auth_id and card_id are required")
+		return
+	case msg.Amount <= 0:
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "amount must be positive minor units")
+		return
+	case msg.Decision != authorizations.DecisionApproved:
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, "only approved advices are sent")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), networkDeadline)
+	defer cancel()
+
+	status, err := s.applyAdvice(ctx, msg)
+	if err != nil {
+		writeNetworkError(ctx, w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status, "advice_id": msg.AdviceID})
+}
+
+// applyAdvice makes our record agree with the network's: the authorization is
+// approved and held, whatever we answered, if anything. The advice id and its
+// effect commit together, so a redelivered advice changes nothing.
+func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, error) {
+	var card *cards.Card
+	found, err := cards.Get(ctx, s.db, msg.CardID)
+	switch {
+	case err == nil:
+		card = &found
+	case !errors.Is(err, cards.ErrNotFound):
+		return "", err
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin advice %s: %w", msg.AdviceID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	first, err := authorizations.RecordAdvice(ctx, tx, msg.AdviceID, msg.AuthID)
+	if err != nil {
+		return "", err
+	}
+	if !first {
+		return "already_processed", nil
+	}
+	if _, err := tx.Exec(ctx, setSpendingLockTimeout); err != nil {
+		return "", fmt.Errorf("advice %s: %w", msg.AdviceID, err)
+	}
+
+	claim := authorizations.New(card, authorizations.Request{
+		AuthID:       msg.AuthID,
+		CardID:       msg.CardID,
+		Amount:       msg.Amount,
+		Currency:     authorizations.Currency,
+		MerchantID:   msg.Merchant.ID,
+		MerchantName: msg.Merchant.Name,
+		MCC:          msg.Merchant.MCC,
+		Kind:         authorizations.KindInitial,
+	}, "")
+	claim.StandIn = true
+	stored, inserted, err := authorizations.ClaimForAdvice(ctx, tx, claim)
+	if err != nil {
+		return "", err
+	}
+
+	var a authorizations.Authorization
+	if !inserted && stored.Decision == authorizations.DecisionApproved {
+		// Our approval reached the network too late; the hold is already there.
+		a, err = authorizations.MarkStandIn(ctx, tx, stored.AuthID)
+	} else {
+		if card != nil {
+			stored.AccountID, stored.HeldAccountID = &card.AccountID, &card.HeldAccountID
+		}
+		if err = s.placeStandInHold(ctx, tx, &stored, card); err == nil {
+			a, err = authorizations.ApproveStandIn(ctx, tx, stored)
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+
+	payload, err := authorizations.EventPayload(a)
+	if err != nil {
+		return "", err
+	}
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		ID:          newID("evt"),
+		AggregateID: a.AuthID,
+		EventType:   authorizations.EventStandIn,
+		Topic:       authorizations.Topic,
+		Payload:     payload,
+	}); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit advice %s: %w", msg.AdviceID, err)
+	}
+	return "processed", nil
+}
+
+// placeStandInHold holds as much of a.Amount as the funding account has and
+// records the rest as a.HoldShortfall. Card status and limits do not apply:
+// the merchant was already told yes. It never overdraws and never invents
+// money; a shortfall is credit exposure for reconciliation to surface.
+func (s *Server) placeStandInHold(ctx context.Context, tx pgx.Tx, a *authorizations.Authorization, card *cards.Card) error {
+	a.HoldShortfall, a.LedgerTxnID = a.Amount, nil
+	if card == nil {
+		return nil
+	}
+	if err := authorizations.AddDailySpend(ctx, tx, card.ID, a.Amount); err != nil {
+		return err
+	}
+
+	// Both balance rows, in id order: the order ledger.RecordWithID locks
+	// them in, so this cannot deadlock with a concurrent tap on the account.
+	const lock = `
+		SELECT account_id, balance FROM account_balances
+		WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE`
+	rows, err := tx.Query(ctx, lock, []string{card.AccountID, card.HeldAccountID})
+	if err != nil {
+		return fmt.Errorf("lock balances for %s: %w", a.AuthID, err)
+	}
+	var available int64
+	for rows.Next() {
+		var id string
+		var balance int64
+		if err := rows.Scan(&id, &balance); err != nil {
+			rows.Close()
+			return fmt.Errorf("lock balances for %s: %w", a.AuthID, err)
+		}
+		if id == card.AccountID {
+			available = balance
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("lock balances for %s: %w", a.AuthID, err)
+	}
+
+	held := min(a.Amount, available)
+	a.HoldShortfall = a.Amount - held
+	if held == 0 {
+		return nil
+	}
+	txnID := ledger.NewTxnID()
+	a.LedgerTxnID = &txnID
+	return ledger.RecordWithID(ctx, tx, txnID, "authorization "+a.AuthID, []ledger.Entry{
+		{AccountID: card.AccountID, Direction: ledger.DirectionDebit, Amount: held},
+		{AccountID: card.HeldAccountID, Direction: ledger.DirectionCredit, Amount: held},
+	})
+}

@@ -378,7 +378,7 @@ func TestUnsignedOrTamperedNetworkRequestsAreRejected(t *testing.T) {
 		{"stale timestamp", stale, sign(testNetworkSecret, stale, body), body},
 		{"mockbank headers", now, "", body},
 	}
-	for _, path := range []string{cardnetwork.PathAuthorizations} {
+	for _, path := range []string{cardnetwork.PathAuthorizations, cardnetwork.PathAdvices} {
 		for _, tc := range cases {
 			t.Run(path+" "+tc.name, func(t *testing.T) {
 				req := httptest.NewRequest("POST", path, strings.NewReader(tc.body))
@@ -465,4 +465,207 @@ func TestTwoTapsAtOnceCannotOverspend(t *testing.T) {
 		t.Errorf("declined events = %d, want %d", got, n-1)
 	}
 	assertNoDrift(t)
+}
+
+func adviceBody(adviceID, authID, cardID string, amount int64) string {
+	return fmt.Sprintf(`{"advice_id":%q,"auth_id":%q,"card_id":%q,"amount":%d,`+
+		`"merchant":{"id":"mer_coffee","name":"Corner Coffee","mcc":"5814"},`+
+		`"decision":"approved","reason":"stand_in","sent_at":"2026-10-17T10:00:04Z"}`,
+		adviceID, authID, cardID, amount)
+}
+
+func advise(t *testing.T, h http.Handler, adviceID, authID, cardID string, amount int64) string {
+	t.Helper()
+	rec := signedNetwork(h, cardnetwork.PathAdvices, adviceBody(adviceID, authID, cardID, amount))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("advice %s = %d: %s", adviceID, rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	return body["status"]
+}
+
+type storedAuth struct {
+	decision      string
+	approved      int64
+	standIn       bool
+	shortfall     int64
+	hasLedgerTxn  bool
+	declineReason *string
+}
+
+func loadAuth(t *testing.T, authID string) storedAuth {
+	t.Helper()
+	var a storedAuth
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT decision, approved_amount, stand_in, hold_shortfall, ledger_txn_id IS NOT NULL, decline_reason
+		FROM card_authorizations WHERE auth_id = $1`, authID).
+		Scan(&a.decision, &a.approved, &a.standIn, &a.shortfall, &a.hasLedgerTxn, &a.declineReason); err != nil {
+		t.Fatalf("load %s: %v", authID, err)
+	}
+	return a
+}
+
+// An advice is the network's decision, not a question: the merchant was told
+// yes, so the hold is placed whatever we answered, if we answered at all.
+func TestStandInAdviceIsHonoured(t *testing.T) {
+	t.Run("after a decline", func(t *testing.T) {
+		h, apiKey := newTestServer(t)
+		c := newCard(t, h, apiKey, 10000, 5000, 20000)
+		// Declined by us (over the per-transaction limit), approved by stand-in.
+		if got := authorizeTap(t, h, tap{authID: "auth_flip", cardID: c.card.ID, amount: 6000}); got.Decision != "declined" {
+			t.Fatalf("answer = %+v, want declined", got)
+		}
+		if got := advise(t, h, "adv_flip", "auth_flip", c.card.ID, 6000); got != "processed" {
+			t.Errorf("advice status = %q, want processed", got)
+		}
+
+		a := loadAuth(t, "auth_flip")
+		if a.decision != "approved" || a.approved != 6000 || !a.standIn || a.shortfall != 0 || a.declineReason != nil {
+			t.Errorf("stored = %+v, want approved 6000 by stand-in, no shortfall, no reason", a)
+		}
+		if storedBalance(t, c.funding) != 4000 || storedBalance(t, c.card.HeldAccountID) != 6000 {
+			t.Errorf("available %d, held %d, want 4000 and 6000",
+				storedBalance(t, c.funding), storedBalance(t, c.card.HeldAccountID))
+		}
+		// The network asks again: it gets the network's decision, now ours too.
+		if got := authorizeTap(t, h, tap{authID: "auth_flip", cardID: c.card.ID, amount: 6000}); got.Decision != "approved" || got.ApprovedAmount != 6000 {
+			t.Errorf("answer after the advice = %+v, want approved 6000", got)
+		}
+		assertNoDrift(t)
+	})
+
+	t.Run("with no authorization seen", func(t *testing.T) {
+		h, apiKey := newTestServer(t)
+		c := newCard(t, h, apiKey, 10000, 5000, 20000)
+		advise(t, h, "adv_unseen", "auth_unseen", c.card.ID, 4000)
+
+		a := loadAuth(t, "auth_unseen")
+		if a.decision != "approved" || a.approved != 4000 || !a.standIn || !a.hasLedgerTxn {
+			t.Errorf("stored = %+v, want an approved, held stand-in", a)
+		}
+		if got := storedBalance(t, c.card.HeldAccountID); got != 4000 {
+			t.Errorf("held = %d, want 4000", got)
+		}
+		assertNoDrift(t)
+	})
+
+	t.Run("for a frozen card and past its limits", func(t *testing.T) {
+		h, apiKey := newTestServer(t)
+		c := newCard(t, h, apiKey, 10000, 1000, 1000)
+		if rec := do(t, h, "POST", "/v1/cards/"+c.card.ID+"/freeze", apiKey, ""); rec.Code != http.StatusOK {
+			t.Fatalf("freeze = %d", rec.Code)
+		}
+		advise(t, h, "adv_frozen", "auth_frozen", c.card.ID, 3000)
+
+		if a := loadAuth(t, "auth_frozen"); a.decision != "approved" || a.shortfall != 0 {
+			t.Errorf("stored = %+v, want approved and fully held", a)
+		}
+		if got := storedBalance(t, c.card.HeldAccountID); got != 3000 {
+			t.Errorf("held = %d, want 3000", got)
+		}
+		var spent int64
+		if err := testPool.QueryRow(context.Background(),
+			`SELECT amount FROM card_daily_spend WHERE card_id = $1`, c.card.ID).Scan(&spent); err != nil || spent != 3000 {
+			t.Errorf("daily spend = %d (%v), want 3000: counted even past the limit", spent, err)
+		}
+		assertNoDrift(t)
+	})
+
+	t.Run("after our approval", func(t *testing.T) {
+		h, apiKey := newTestServer(t)
+		c := newCard(t, h, apiKey, 10000, 5000, 20000)
+		authorizeTap(t, h, tap{authID: "auth_late", cardID: c.card.ID, amount: 2000})
+		advise(t, h, "adv_late", "auth_late", c.card.ID, 2000)
+
+		if a := loadAuth(t, "auth_late"); a.decision != "approved" || !a.standIn {
+			t.Errorf("stored = %+v, want approved, marked stand-in", a)
+		}
+		if got := holds(t); got != 1 {
+			t.Errorf("holds = %d, want 1: the approval already held it", got)
+		}
+		if got := storedBalance(t, c.card.HeldAccountID); got != 2000 {
+			t.Errorf("held = %d, want 2000", got)
+		}
+	})
+
+	t.Run("duplicate advice is a no-op", func(t *testing.T) {
+		h, apiKey := newTestServer(t)
+		c := newCard(t, h, apiKey, 10000, 5000, 20000)
+
+		const n = 10
+		statuses := make([]string, n)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				rec := signedNetwork(h, cardnetwork.PathAdvices, adviceBody("adv_twice", "auth_twice", c.card.ID, 2500))
+				var body map[string]string
+				_ = json.Unmarshal(rec.Body.Bytes(), &body)
+				statuses[i] = fmt.Sprintf("%d %s", rec.Code, body["status"])
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		processed := 0
+		for i, s := range statuses {
+			switch s {
+			case "200 processed":
+				processed++
+			case "200 already_processed":
+			default:
+				t.Errorf("delivery %d = %s", i, s)
+			}
+		}
+		if processed != 1 {
+			t.Errorf("processed %d times, want 1", processed)
+		}
+		if got := holds(t); got != 1 {
+			t.Errorf("holds = %d, want 1", got)
+		}
+		if got := storedBalance(t, c.card.HeldAccountID); got != 2500 {
+			t.Errorf("held = %d, want 2500", got)
+		}
+		if got := countWhere(t, `SELECT count(*) FROM outbox_events WHERE event_type = 'card.authorization.stand_in'`); got != 1 {
+			t.Errorf("stand-in events = %d, want 1", got)
+		}
+		assertNoDrift(t)
+	})
+
+	t.Run("short of funds holds what there is", func(t *testing.T) {
+		h, apiKey := newTestServer(t)
+		c := newCard(t, h, apiKey, 2000, 5000, 20000)
+		advise(t, h, "adv_short", "auth_short", c.card.ID, 5000)
+
+		a := loadAuth(t, "auth_short")
+		if a.decision != "approved" || a.approved != 5000 || a.shortfall != 3000 {
+			t.Errorf("stored = %+v, want approved 5000 with a 3000 shortfall", a)
+		}
+		if storedBalance(t, c.funding) != 0 || storedBalance(t, c.card.HeldAccountID) != 2000 {
+			t.Errorf("available %d, held %d, want 0 and 2000: never overdrawn",
+				storedBalance(t, c.funding), storedBalance(t, c.card.HeldAccountID))
+		}
+		// Nothing left: the next stand-in holds nothing and owes it all.
+		advise(t, h, "adv_empty", "auth_empty", c.card.ID, 1000)
+		if a := loadAuth(t, "auth_empty"); a.shortfall != 1000 || a.hasLedgerTxn {
+			t.Errorf("stored = %+v, want a 1000 shortfall and no ledger write", a)
+		}
+		assertNoDrift(t)
+	})
+
+	t.Run("for an unknown card", func(t *testing.T) {
+		h, _ := newTestServer(t)
+		advise(t, h, "adv_ghost", "auth_ghost", "card_ghost", 1500)
+
+		if a := loadAuth(t, "auth_ghost"); a.decision != "approved" || a.shortfall != 1500 || a.hasLedgerTxn {
+			t.Errorf("stored = %+v, want approved with the whole amount short", a)
+		}
+		if got := holds(t); got != 0 {
+			t.Errorf("holds = %d, want 0", got)
+		}
+	})
 }

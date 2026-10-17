@@ -80,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 
 	// The card network signs with its own secret and answers to its own deadline.
 	mux.HandleFunc("POST /network/authorizations", s.handleNetworkAuthorization)
+	mux.HandleFunc("POST /network/advices", s.handleNetworkAdvice)
 
 	authenticated := chain(s.routes(), withDeadline, s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)
