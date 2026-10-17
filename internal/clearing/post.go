@@ -96,39 +96,59 @@ type posting struct {
 	holder        *hold
 }
 
-// postLine records one line and its effect in one transaction, and reports
-// whether it recorded it: false means the clearing_id was already recorded.
+// postLine records one line of fileID and its effect in one transaction, and
+// reports whether it recorded it: false means the clearing_id was already
+// recorded.
 //
 // The record is inserted first: its primary key makes a second import of the
 // same line wait for the first and then skip, so no line is posted twice.
+func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bool, error) {
+	var authID *string
+	if l.AuthID != "" {
+		authID = &l.AuthID
+	}
+	return post(ctx, db, l, cfg, func(batch *pgx.Batch) *pgx.QueuedQuery {
+		return batch.Queue(`
+			INSERT INTO clearing_records (clearing_id, file_id, auth_id, card_id, kind, amount,
+				currency, merchant_id, cleared_at, status)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (clearing_id) DO NOTHING`,
+			l.ClearingID, fileID, authID, l.CardID, l.Kind, l.Amount, l.Currency, l.MerchantID, l.ClearedAt, StatusPosted)
+	})
+}
+
+// postDeferredLine posts a line an earlier import recorded as deferred, and
+// reports whether it did: false means another run already took it. The
+// status guard in the UPDATE makes a concurrent run wait on the row lock and
+// then find the line no longer deferred.
+func postDeferredLine(ctx context.Context, db DB, l Line, cfg Config) (bool, error) {
+	return post(ctx, db, l, cfg, func(batch *pgx.Batch) *pgx.QueuedQuery {
+		return batch.Queue(`UPDATE clearing_records SET status = $2 WHERE clearing_id = $1 AND status = $3`,
+			l.ClearingID, StatusPosted, StatusDeferred)
+	})
+}
+
+// post claims l with the statement queueClaim adds, which must affect one row
+// to claim it, and posts its effect in the same transaction.
+//
 // Purchases and refunds take locks in the authorization path's order (auth_id
 // lock, the authorization row, the card's daily spend, the balances), so
 // clearing cannot deadlock with a tap, a reversal or the expirer; the ledger
 // write, which takes the balance locks, comes last.
-func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bool, error) {
+func post(ctx context.Context, db DB, l Line, cfg Config, queueClaim func(*pgx.Batch) *pgx.QueuedQuery) (bool, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	var authID *string
-	if l.AuthID != "" {
-		authID = &l.AuthID
-	}
 	// One round trip claims the line and locks the authorization it names. A
-	// line already recorded took the hold's locks for nothing and rolls back.
+	// line already claimed took the hold's locks for nothing and rolls back.
 	batch := &pgx.Batch{}
 	// A tap holding an account's balance lock delays the line; bounded.
 	batch.Queue(`SET LOCAL lock_timeout = '1s'`)
 	var claimed bool
-	batch.Queue(`
-		INSERT INTO clearing_records (clearing_id, file_id, auth_id, card_id, kind, amount,
-			currency, merchant_id, cleared_at, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (clearing_id) DO NOTHING`,
-		l.ClearingID, fileID, authID, l.CardID, l.Kind, l.Amount, l.Currency, l.MerchantID, l.ClearedAt, StatusPosted,
-	).Exec(func(tag pgconn.CommandTag) error {
+	queueClaim(batch).Exec(func(tag pgconn.CommandTag) error {
 		claimed = tag.RowsAffected() == 1
 		return nil
 	})

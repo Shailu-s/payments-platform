@@ -1,5 +1,6 @@
 // Command clearing imports the card network's daily clearing file, from disk
-// or downloaded from the network, and lists or inspects imported files.
+// or downloaded from the network, lists or inspects imported files, and posts
+// refund lines that imports from before refunds were posted left deferred.
 // Importing the same file again changes nothing; an import that stopped
 // part-way is finished by running it again.
 package main
@@ -41,6 +42,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	list := flags.Bool("list", false, "list imported files")
 	inspect := flags.String("inspect", "", "inspect an imported file by id")
 	onlyFlag := flags.String("flag", "", "with -inspect, only lines carrying this flag")
+	postDeferred := flags.Bool("post-deferred", false, "post refund lines earlier imports deferred")
 	limit := flags.Int("limit", 25, "page size (1–100)")
 	offset := flags.Int("offset", 0, "page offset")
 	if err := flags.Parse(args); err != nil {
@@ -50,15 +52,16 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return errors.New("invalid arguments or page bounds")
 	}
 	modes := 0
-	for _, set := range []bool{*path != "", *networkURL != "", *list, *inspect != ""} {
+	for _, set := range []bool{*path != "", *networkURL != "", *list, *inspect != "", *postDeferred} {
 		if set {
 			modes++
 		}
 	}
 	importing := *path != "" || *networkURL != ""
+	posting := importing || *postDeferred
 	switch {
 	case modes != 1:
-		return errors.New("choose one of -file, -download, -list or -inspect")
+		return errors.New("choose one of -file, -download, -list, -inspect or -post-deferred")
 	case importing && *date == "":
 		return errors.New("-date is required to import")
 	case !importing && *date != "":
@@ -79,14 +82,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	var env config.Env
 	dsn := env.Require("DATABASE_URL")
 	tolerance := ""
-	if importing {
+	if posting {
 		tolerance = env.Require("CLEARING_OVER_TOLERANCE_PCT")
 	}
 	if err := env.Err(); err != nil {
 		return err
 	}
 	var cfg clearing.Config
-	if importing {
+	if posting {
 		pct, err := strconv.ParseInt(tolerance, 10, 64)
 		if err != nil || pct < 0 || pct > 1000 {
 			return fmt.Errorf("CLEARING_OVER_TOLERANCE_PCT must be a whole percentage from 0 to 1000: %q", tolerance)
@@ -125,6 +128,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			Summary clearing.Summary  `json:"summary"`
 			Records []clearing.Record `json:"records"`
 		}{summary, records})
+	case *postDeferred:
+		summary, err := clearing.PostDeferred(ctx, pool, cfg)
+		if err != nil {
+			return err
+		}
+		return encoder.Encode(summary)
 	}
 
 	var raw []byte

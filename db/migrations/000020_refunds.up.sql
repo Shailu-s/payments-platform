@@ -11,3 +11,7 @@ ALTER TABLE clearing_records
 ALTER TABLE clearing_files
     DROP CONSTRAINT clearing_files_sha256_key,
     ADD CONSTRAINT clearing_files_date_sha256_key UNIQUE (file_date, sha256);
+
+-- Refund lines imported before refunds were posted, for PostDeferred to find
+-- without scanning every record. New imports defer nothing, so it stays small.
+CREATE INDEX clearing_records_deferred_idx ON clearing_records (clearing_id) WHERE status = 'deferred';

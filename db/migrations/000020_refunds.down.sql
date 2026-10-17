@@ -1,3 +1,4 @@
+DROP INDEX clearing_records_deferred_idx;
 -- Fails while two dates share the same bytes: remove one of the files first.
 ALTER TABLE clearing_files
     DROP CONSTRAINT clearing_files_date_sha256_key,

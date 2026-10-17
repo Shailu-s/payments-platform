@@ -104,7 +104,7 @@ func Import(ctx context.Context, db DB, raw []byte, fileDate time.Time, cfg Conf
 
 	processed := 0
 	for _, l := range lines {
-		ok, err := postWithRetry(ctx, db, file.ID, l, cfg)
+		ok, err := postWithRetry(ctx, func() (bool, error) { return postLine(ctx, db, file.ID, l, cfg) })
 		if err != nil {
 			return Summary{}, fmt.Errorf("clearing %s: %w", l.ClearingID, err)
 		}
@@ -152,9 +152,9 @@ func insertFile(ctx context.Context, db DB, f File, raw []byte) (File, bool, err
 // another import of the same line; neither holds its lock for long.
 const maxAttempts = 5
 
-func postWithRetry(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bool, error) {
+func postWithRetry(ctx context.Context, post func() (bool, error)) (bool, error) {
 	for attempt := 1; ; attempt++ {
-		ok, err := postLine(ctx, db, fileID, l, cfg)
+		ok, err := post()
 		if err == nil || attempt == maxAttempts || !retryable(err) {
 			return ok, err
 		}
