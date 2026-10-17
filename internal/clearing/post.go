@@ -21,7 +21,10 @@ import (
 // NetworkPayableAccountID is what we owe the network for cleared purchases.
 const NetworkPayableAccountID = "acc_network_payable_usd"
 
-const EventPosted = "card.clearing.posted"
+const (
+	EventPosted       = "card.clearing.posted"
+	EventRefundPosted = "card.refund.posted"
+)
 
 // Flags: reasons a person should look at a line. A line can have several.
 const (
@@ -38,6 +41,12 @@ const (
 	// FlagCardMismatch: the line's card is not the authorization's. The
 	// authorization's accounts are charged: it is the hold being cleared.
 	FlagCardMismatch = "card_mismatch"
+	// FlagUnmatchedRefund: a refund with no cleared purchase to match, by an
+	// empty or unknown auth_id or one never cleared. It is still credited.
+	FlagUnmatchedRefund = "unmatched_refund"
+	// FlagRefundExceedsPurchase: refunds now total more than the purchase
+	// cleared. Still credited: the network has sent the money.
+	FlagRefundExceedsPurchase = "refund_exceeds_purchase"
 )
 
 // Event is the outbox record of a posted clearing line.
@@ -64,6 +73,7 @@ type hold struct {
 	held           int64
 	released       int64
 	cleared        int64
+	refunded       int64
 	expired        bool
 	// original is set on an incremental: the initial authorization holding its money.
 	original *string
@@ -91,10 +101,10 @@ type posting struct {
 //
 // The record is inserted first: its primary key makes a second import of the
 // same line wait for the first and then skip, so no line is posted twice.
-// Locks then follow the authorization path's order (auth_id lock, the
-// authorization row, the card's daily spend, the balances), so clearing cannot
-// deadlock with a tap, a reversal or the expirer; the ledger write, which
-// takes the balance locks, comes last.
+// Purchases and refunds take locks in the authorization path's order (auth_id
+// lock, the authorization row, the card's daily spend, the balances), so
+// clearing cannot deadlock with a tap, a reversal or the expirer; the ledger
+// write, which takes the balance locks, comes last.
 func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bool, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -102,16 +112,11 @@ func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bo
 	}
 	defer tx.Rollback(ctx)
 
-	status := StatusPosted
-	if l.Kind == KindRefund {
-		// Phase 14 posts refunds; until then they are kept, not applied.
-		status = StatusDeferred
-	}
 	var authID *string
 	if l.AuthID != "" {
 		authID = &l.AuthID
 	}
-	// One round trip claims the line and, for a purchase, locks its hold. A
+	// One round trip claims the line and locks the authorization it names. A
 	// line already recorded took the hold's locks for nothing and rolls back.
 	batch := &pgx.Batch{}
 	// A tap holding an account's balance lock delays the line; bounded.
@@ -122,13 +127,13 @@ func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bo
 			currency, merchant_id, cleared_at, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (clearing_id) DO NOTHING`,
-		l.ClearingID, fileID, authID, l.CardID, l.Kind, l.Amount, l.Currency, l.MerchantID, l.ClearedAt, status,
+		l.ClearingID, fileID, authID, l.CardID, l.Kind, l.Amount, l.Currency, l.MerchantID, l.ClearedAt, StatusPosted,
 	).Exec(func(tag pgconn.CommandTag) error {
 		claimed = tag.RowsAffected() == 1
 		return nil
 	})
 	var h *hold
-	if l.Kind == KindPurchase && l.AuthID != "" {
+	if l.AuthID != "" {
 		holds.QueueLockAuthID(batch, l.AuthID)
 		queueLockHold(batch, l.AuthID, &h)
 	}
@@ -138,9 +143,6 @@ func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bo
 	if !claimed {
 		return false, nil
 	}
-	if l.Kind == KindRefund {
-		return true, commit(ctx, tx)
-	}
 	// The contract clears a chain on its initial auth_id; an incremental one
 	// is resolved to the row holding the money, in the reversal path's order.
 	if h != nil && h.original != nil {
@@ -149,6 +151,13 @@ func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bo
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return false, err
 		}
+	}
+
+	if l.Kind == KindRefund {
+		if err := postRefund(ctx, tx, l, h); err != nil {
+			return false, err
+		}
+		return true, commit(ctx, tx)
 	}
 
 	p, err := plan(ctx, tx, l, h, cfg)
@@ -229,12 +238,13 @@ func queueLockHold(batch *pgx.Batch, authID string, into **hold) {
 		SELECT auth_id, card_id, account_id, held_account_id,
 			CASE WHEN kind = 'incremental' THEN original_auth_id END,
 			decision = 'approved', approved_amount, held_amount, released_amount, cleared_amount,
-			expired_at IS NOT NULL, (created_at AT TIME ZONE 'UTC')::date
+			refunded_amount, expired_at IS NOT NULL, (created_at AT TIME ZONE 'UTC')::date
 		FROM card_authorizations WHERE auth_id = $1 FOR UPDATE`
 	batch.Queue(q, authID).QueryRow(func(row pgx.Row) error {
 		var h hold
 		err := row.Scan(&h.authID, &h.cardID, &h.accountID, &h.heldAccountID, &h.original,
-			&h.approved, &h.approvedAmount, &h.held, &h.released, &h.cleared, &h.expired, &h.day)
+			&h.approved, &h.approvedAmount, &h.held, &h.released, &h.cleared, &h.refunded,
+			&h.expired, &h.day)
 		if errors.Is(err, pgx.ErrNoRows) {
 			*into = nil
 			return nil

@@ -24,6 +24,7 @@ type Record struct {
 	ChargedFromAvailable int64   `json:"charged_from_available"`
 	Released             int64   `json:"released"`
 	Shortfall            int64   `json:"shortfall"`
+	Credited             int64   `json:"credited"`
 	Flag                 *string `json:"flag"`
 	LedgerTxnID          *string `json:"ledger_txn_id"`
 }
@@ -73,7 +74,7 @@ func Records(ctx context.Context, db DB, fileID, flag string, limit, offset int)
 	rows, err := db.Query(ctx, `
 		SELECT clearing_id, COALESCE(auth_id, ''), card_id, kind, amount, currency, merchant_id, cleared_at,
 			file_id, status, charged_from_held, charged_from_available, released_amount, shortfall,
-			flag, ledger_txn_id
+			credited_amount, flag, ledger_txn_id
 		FROM clearing_records
 		WHERE file_id = $1 AND ($2 = '' OR $2 = ANY(string_to_array(flag, ',')))
 		ORDER BY cleared_at, clearing_id LIMIT $3 OFFSET $4`, fileID, flag, limit, offset)
@@ -84,7 +85,7 @@ func Records(ctx context.Context, db DB, fileID, flag string, limit, offset int)
 		var r Record
 		err := row.Scan(&r.ClearingID, &r.AuthID, &r.CardID, &r.Kind, &r.Amount, &r.Currency, &r.MerchantID,
 			&r.ClearedAt, &r.FileID, &r.Status, &r.ChargedFromHeld, &r.ChargedFromAvailable, &r.Released,
-			&r.Shortfall, &r.Flag, &r.LedgerTxnID)
+			&r.Shortfall, &r.Credited, &r.Flag, &r.LedgerTxnID)
 		r.ClearedAt = r.ClearedAt.UTC()
 		return r, err
 	})
@@ -119,7 +120,8 @@ func Download(ctx context.Context, client *http.Client, baseURL string, date tim
 func ValidFlag(flag string) bool {
 	switch flag {
 	case FlagOverTolerance, FlagClearedAfterExpiry, FlagClearedAfterReversal, FlagDuplicateClearing,
-		FlagUnauthorizedClearing, FlagUnknownCard, FlagShortfall, FlagNothingHeld, FlagCardMismatch:
+		FlagUnauthorizedClearing, FlagUnknownCard, FlagShortfall, FlagNothingHeld, FlagCardMismatch,
+		FlagUnmatchedRefund, FlagRefundExceedsPurchase:
 		return true
 	}
 	return false

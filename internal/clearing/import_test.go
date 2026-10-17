@@ -24,8 +24,8 @@ func TestClearingSameFileTwiceChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Replayed || first.Processed != 3 || first.Statuses[StatusPosted] != 2 || first.Statuses[StatusDeferred] != 1 {
-		t.Fatalf("first import = %+v, want 3 processed: 2 posted, 1 deferred", first)
+	if first.Replayed || first.Processed != 3 || first.Statuses[StatusPosted] != 3 || first.Credited != 1000 {
+		t.Fatalf("first import = %+v, want 3 processed and posted, 1000 credited", first)
 	}
 	before := moneyState(t)
 
@@ -36,7 +36,7 @@ func TestClearingSameFileTwiceChangesNothing(t *testing.T) {
 	if !again.Replayed || again.Processed != 0 || again.File.ID != first.File.ID {
 		t.Errorf("second import = %+v, want a replay of %s processing nothing", again, first.File.ID)
 	}
-	if again.Statuses[StatusPosted] != 2 || again.ChargedFromHeld != first.ChargedFromHeld {
+	if again.Statuses[StatusPosted] != 3 || again.ChargedFromHeld != first.ChargedFromHeld || again.Credited != first.Credited {
 		t.Errorf("replayed summary %+v differs from the first %+v", again, first)
 	}
 	if after := moneyState(t); after != before {
@@ -93,33 +93,6 @@ func TestClearingConcurrentImportsOfOneFile(t *testing.T) {
 	}
 	if got := storedBalance(t, card.AccountID); got != 100_000-1200*int64(len(lines)) {
 		t.Errorf("available = %d, want %d", got, 100_000-1200*len(lines))
-	}
-	assertNoDrift(t)
-}
-
-func TestRefundLinesAreDeferred(t *testing.T) {
-	resetDB(t)
-	card := newCard(t, 10_000)
-	placeHold(t, card, "auth_refunded", 2000)
-	before := storedBalance(t, card.AccountID)
-
-	s := importLines(t, refund("clr_refund", "auth_refunded", card.ID, 2000), refund("clr_refund_offline", "", card.ID, 500))
-	if s.Statuses[StatusDeferred] != 2 {
-		t.Fatalf("summary = %+v, want 2 deferred", s)
-	}
-	for _, id := range []string{"clr_refund", "clr_refund_offline"} {
-		if r := loadRecord(t, id); r.status != StatusDeferred || r.hasLedger || r.fromHeld+r.fromAvailable+r.released != 0 {
-			t.Errorf("%s = %+v, want deferred with no money", id, r)
-		}
-	}
-	if got := storedBalance(t, card.AccountID); got != before {
-		t.Errorf("available = %d, want %d", got, before)
-	}
-	if a := loadAuth(t, "auth_refunded"); a.held != 2000 || a.cleared != 0 {
-		t.Errorf("authorization = %+v, want untouched", a)
-	}
-	if got := countWhere(t, `SELECT count(*) FROM outbox_events WHERE event_type = $1`, EventPosted); got != 0 {
-		t.Errorf("posted events = %d, want 0", got)
 	}
 	assertNoDrift(t)
 }

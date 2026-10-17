@@ -157,6 +157,7 @@ type record struct {
 	status                  string
 	fromHeld, fromAvailable int64
 	released, shortfall     int64
+	credited                int64
 	flag                    string
 	hasLedger               bool
 }
@@ -166,9 +167,9 @@ func loadRecord(tb testing.TB, clearingID string) record {
 	var r record
 	if err := testPool.QueryRow(context.Background(), `
 		SELECT status, charged_from_held, charged_from_available, released_amount, shortfall,
-			COALESCE(flag, ''), ledger_txn_id IS NOT NULL
+			credited_amount, COALESCE(flag, ''), ledger_txn_id IS NOT NULL
 		FROM clearing_records WHERE clearing_id = $1`, clearingID).
-		Scan(&r.status, &r.fromHeld, &r.fromAvailable, &r.released, &r.shortfall, &r.flag, &r.hasLedger); err != nil {
+		Scan(&r.status, &r.fromHeld, &r.fromAvailable, &r.released, &r.shortfall, &r.credited, &r.flag, &r.hasLedger); err != nil {
 		tb.Fatalf("record %s: %v", clearingID, err)
 	}
 	return r

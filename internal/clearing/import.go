@@ -62,6 +62,8 @@ type Summary struct {
 	ChargedFromAvailable int64          `json:"charged_from_available"`
 	Released             int64          `json:"released"`
 	Shortfall            int64          `json:"shortfall"`
+	// Credited is what refund lines gave back to accounts.
+	Credited int64 `json:"credited"`
 }
 
 // Import records a clearing file and posts each of its lines once.
@@ -118,7 +120,7 @@ func Import(ctx context.Context, db DB, raw []byte, fileDate time.Time, cfg Conf
 	slog.Info("clearing file imported", "file_id", file.ID, "date", file.FileDate, "lines", file.LineCount,
 		"processed", processed, "statuses", summary.Statuses, "flags", summary.Flags,
 		"charged_from_held", summary.ChargedFromHeld, "charged_from_available", summary.ChargedFromAvailable,
-		"shortfall", summary.Shortfall)
+		"shortfall", summary.Shortfall, "credited", summary.Credited)
 	return summary, nil
 }
 
@@ -175,7 +177,8 @@ func retryable(err error) bool {
 func summarise(ctx context.Context, db DB, f File, ids []string) (Summary, error) {
 	const q = `
 		SELECT file_id = $2, status, COALESCE(flag, ''), count(*), sum(amount)::bigint, sum(charged_from_held)::bigint,
-			sum(charged_from_available)::bigint, sum(released_amount)::bigint, sum(shortfall)::bigint
+			sum(charged_from_available)::bigint, sum(released_amount)::bigint, sum(shortfall)::bigint,
+			sum(credited_amount)::bigint
 		FROM clearing_records WHERE clearing_id = ANY($1)
 		GROUP BY 1, 2, 3`
 	rows, err := db.Query(ctx, q, ids, f.ID)
@@ -189,8 +192,8 @@ func summarise(ctx context.Context, db DB, f File, ids []string) (Summary, error
 		var own bool
 		var status, flag string
 		var n int
-		var amount, held, available, released, shortfall int64
-		if err := rows.Scan(&own, &status, &flag, &n, &amount, &held, &available, &released, &shortfall); err != nil {
+		var amount, held, available, released, shortfall, credited int64
+		if err := rows.Scan(&own, &status, &flag, &n, &amount, &held, &available, &released, &shortfall, &credited); err != nil {
 			return Summary{}, fmt.Errorf("summarise clearing file %s: %w", f.ID, err)
 		}
 		recorded += n
@@ -208,6 +211,7 @@ func summarise(ctx context.Context, db DB, f File, ids []string) (Summary, error
 		s.ChargedFromAvailable += available
 		s.Released += released
 		s.Shortfall += shortfall
+		s.Credited += credited
 	}
 	if err := rows.Err(); err != nil {
 		return Summary{}, fmt.Errorf("summarise clearing file %s: %w", f.ID, err)

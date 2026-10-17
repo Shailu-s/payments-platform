@@ -100,8 +100,8 @@ func TestNetworkScenariosClearEndToEnd(t *testing.T) {
 	}
 
 	// Nine purchases (a full reversal clears nothing) and the late refund.
-	if statuses[StatusPosted] != 9 || statuses[StatusDeferred] != 1 || statuses[StatusRejected] != 0 {
-		t.Errorf("statuses = %v, want 9 posted, 1 deferred", statuses)
+	if statuses[StatusPosted] != 10 || statuses[StatusDeferred] != 0 || statuses[StatusRejected] != 0 {
+		t.Errorf("statuses = %v, want 10 posted", statuses)
 	}
 	if len(flags) != 1 || flags[FlagUnauthorizedClearing] != 1 {
 		t.Errorf("flags = %v, want only the offline purchase as unauthorized_clearing", flags)
@@ -114,11 +114,80 @@ func TestNetworkScenariosClearEndToEnd(t *testing.T) {
 	if got := storedBalance(t, card.HeldAccountID); got != 0 {
 		t.Errorf("held = %d, want 0", got)
 	}
-	if got := payable(t); got != total {
-		t.Errorf("payable = %d, want %d", got, total)
+	// The late refund gives its purchase back.
+	if got := payable(t); got != total-amount {
+		t.Errorf("payable = %d, want %d", got, total-amount)
 	}
-	if got := storedBalance(t, card.AccountID); got != balance-total {
-		t.Errorf("available = %d, want %d", got, balance-total)
+	if got := storedBalance(t, card.AccountID); got != balance-total+amount {
+		t.Errorf("available = %d, want %d", got, balance-total+amount)
+	}
+	assertNoDrift(t)
+}
+
+// A purchase cleared the next day and refunded weeks later, both through the
+// real issuer: the refund gives the whole charge back as a new transaction.
+func TestLateRefundScenarioEndToEnd(t *testing.T) {
+	resetDB(t)
+	ctx := context.Background()
+	issuer := httptest.NewServer(api.NewServer(testPool, []byte("test-webhook-secret-0123456789abcdef"), []byte(testNetworkSecret)).Handler())
+	t.Cleanup(issuer.Close)
+	network, err := cardnetwork.New(cardnetwork.Config{
+		IssuerURL:    issuer.URL,
+		Secret:       []byte(testNetworkSecret),
+		AuthDeadline: 2 * time.Second,
+		StandInLimit: 10_000,
+		Clock:        cardnetwork.NewFakeClock(time.Now()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const balance, amount = 50_000, 2500
+	card := newCard(t, balance)
+	seed := uint64(1400)
+	result, err := network.RunScenario(ctx, cardnetwork.ScenarioRequest{
+		Scenario: cardnetwork.ScenarioLateRefund, CardID: card.ID, Amount: amount, Seed: &seed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ClearingDates) != 2 || len(result.Authorizations) != 1 {
+		t.Fatalf("scenario = %+v, want one authorization and two clearing dates", result)
+	}
+	authID := result.Authorizations[0].AuthID
+
+	for i, date := range result.ClearingDates {
+		raw, err := network.ClearingFile(date)
+		if err != nil {
+			t.Fatal(err)
+		}
+		day, _ := time.Parse(DateLayout, date)
+		s, err := Import(ctx, testPool, raw, day, testConfig)
+		if err != nil {
+			t.Fatalf("import %s: %v", date, err)
+		}
+		if s.Statuses[StatusPosted] != 1 || len(s.Flags) != 0 {
+			t.Errorf("file %d (%s) = %+v, want 1 posted, unflagged", i, date, s)
+		}
+		if i == 0 {
+			if got := storedBalance(t, card.AccountID); got != balance-amount {
+				t.Errorf("available after the purchase = %d, want %d", got, balance-amount)
+			}
+		}
+	}
+	if got := storedBalance(t, card.AccountID); got != balance {
+		t.Errorf("available = %d, want %d", got, balance)
+	}
+	if got := storedBalance(t, card.HeldAccountID); got != 0 {
+		t.Errorf("held = %d, want 0", got)
+	}
+	if got := payable(t); got != 0 {
+		t.Errorf("payable = %d, want 0", got)
+	}
+	if a := loadAuth(t, authID); a.cleared != amount || a.held != 0 {
+		t.Errorf("authorization = %+v, want cleared %d", a, amount)
+	}
+	if got := refunded(t, authID); got != amount {
+		t.Errorf("refunded = %d, want %d", got, amount)
 	}
 	assertNoDrift(t)
 }
