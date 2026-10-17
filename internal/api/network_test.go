@@ -138,7 +138,7 @@ func countWhere(t *testing.T, q string, args ...any) int {
 	return n
 }
 
-func holds(t *testing.T) int {
+func holdCount(t *testing.T) int {
 	t.Helper()
 	return countWhere(t, `SELECT count(*) FROM ledger_transactions WHERE reference LIKE 'authorization %'`)
 }
@@ -229,7 +229,7 @@ func TestSameAuthIDAlwaysGetsTheSameAnswer(t *testing.T) {
 			if tc.want.Decision == "approved" {
 				wantHolds = 1
 			}
-			if got := holds(t); got != wantHolds {
+			if got := holdCount(t); got != wantHolds {
 				t.Errorf("holds = %d, want %d", got, wantHolds)
 			}
 			if got := storedBalance(t, c.card.HeldAccountID); got != tc.want.ApprovedAmount {
@@ -343,7 +343,7 @@ func TestRuleDeclinesMoveNoMoney(t *testing.T) {
 	if got := countRows(t, "card_authorizations"); got != len(cases) {
 		t.Errorf("authorizations = %d, want %d: declines are stored too", got, len(cases))
 	}
-	if got := holds(t); got != 0 {
+	if got := holdCount(t); got != 0 {
 		t.Errorf("holds = %d, want 0", got)
 	}
 	if got := countRows(t, "card_daily_spend"); got != 0 {
@@ -378,7 +378,7 @@ func TestUnsignedOrTamperedNetworkRequestsAreRejected(t *testing.T) {
 		{"stale timestamp", stale, sign(testNetworkSecret, stale, body), body},
 		{"mockbank headers", now, "", body},
 	}
-	for _, path := range []string{cardnetwork.PathAuthorizations, cardnetwork.PathAdvices} {
+	for _, path := range []string{cardnetwork.PathAuthorizations, cardnetwork.PathAdvices, cardnetwork.PathReversals} {
 		for _, tc := range cases {
 			t.Run(path+" "+tc.name, func(t *testing.T) {
 				req := httptest.NewRequest("POST", path, strings.NewReader(tc.body))
@@ -581,7 +581,7 @@ func TestStandInAdviceIsHonoured(t *testing.T) {
 		if a := loadAuth(t, "auth_late"); a.decision != "approved" || !a.standIn {
 			t.Errorf("stored = %+v, want approved, marked stand-in", a)
 		}
-		if got := holds(t); got != 1 {
+		if got := holdCount(t); got != 1 {
 			t.Errorf("holds = %d, want 1: the approval already held it", got)
 		}
 		if got := storedBalance(t, c.card.HeldAccountID); got != 2000 {
@@ -624,7 +624,7 @@ func TestStandInAdviceIsHonoured(t *testing.T) {
 		if processed != 1 {
 			t.Errorf("processed %d times, want 1", processed)
 		}
-		if got := holds(t); got != 1 {
+		if got := holdCount(t); got != 1 {
 			t.Errorf("holds = %d, want 1", got)
 		}
 		if got := storedBalance(t, c.card.HeldAccountID); got != 2500 {
@@ -664,7 +664,7 @@ func TestStandInAdviceIsHonoured(t *testing.T) {
 		if a := loadAuth(t, "auth_ghost"); a.decision != "approved" || a.shortfall != 1500 || a.hasLedgerTxn {
 			t.Errorf("stored = %+v, want approved with the whole amount short", a)
 		}
-		if got := holds(t); got != 0 {
+		if got := holdCount(t); got != 0 {
 			t.Errorf("holds = %d, want 0", got)
 		}
 	})

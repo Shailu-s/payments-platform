@@ -13,6 +13,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/authorizations"
 	"github.com/Shailu-s/payments-platform/internal/cardnetwork"
 	"github.com/Shailu-s/payments-platform/internal/cards"
+	"github.com/Shailu-s/payments-platform/internal/holds"
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 	"github.com/Shailu-s/payments-platform/internal/outbox"
 	"github.com/jackc/pgx/v5"
@@ -189,13 +190,16 @@ func (s *Server) authorize(ctx context.Context, req authorizations.Request) (aut
 }
 
 // insertAuthorization writes the authorization, its outbox event and, if
-// approved, the daily spend and the hold, in one transaction.
+// approved, the daily spend and the hold, in one transaction. An approval
+// then applies any reversal that arrived before it.
 //
 // The order mirrors insertTransfer. The row goes first, so the primary key
 // picks one winner among duplicates before anything else happens. Then the
 // card's daily counter, then the hold, whose balance update takes the lock
 // that serialises spending from the account: each lock is taken as late as
-// possible and all are held only until commit.
+// possible and all are held only until commit. An approval takes the auth_id
+// lock before the row, so a racing reversal is either seen parked here or
+// sees this row.
 func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Authorization, card *cards.Card) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -210,6 +214,10 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 	approved := a.Decision == authorizations.DecisionApproved
 
 	batch := &pgx.Batch{}
+	var pending []holds.Pending
+	if approved {
+		holds.QueueLockAuthID(batch, a.AuthID)
+	}
 	authorizations.QueueInsert(batch, a)
 	// After the insert, like transfers: a duplicate may wait for the original
 	// to finish; every wait after that is bounded.
@@ -225,6 +233,7 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 	})
 	if approved {
 		authorizations.QueueDailySpend(batch, a.CardID, a.Amount, card.DailyLimit)
+		holds.QueuePending(batch, a.AuthID, &pending)
 	}
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return err
@@ -237,6 +246,11 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 			{AccountID: card.AccountID, Direction: ledger.DirectionDebit, Amount: a.Amount},
 			{AccountID: card.HeldAccountID, Direction: ledger.DirectionCredit, Amount: a.Amount},
 		}); err != nil {
+			return err
+		}
+		// The network decided the order: the answer stays approved, and the
+		// ledger shows the hold, then its release.
+		if err := holds.ApplyPending(ctx, tx, a.AuthID, pending); err != nil {
 			return err
 		}
 	}
@@ -368,7 +382,11 @@ func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, er
 	}
 	defer tx.Rollback(ctx)
 
-	first, err := authorizations.RecordAdvice(ctx, tx, msg.AdviceID, msg.AuthID)
+	// Before any row lock, as everywhere: see holds.LockAuthID.
+	if err := holds.LockAuthID(ctx, tx, msg.AuthID); err != nil {
+		return "", err
+	}
+	first, err := authorizations.RecordMessage(ctx, tx, msg.AdviceID, authorizations.MessageAdvice, msg.AuthID)
 	if err != nil {
 		return "", err
 	}
@@ -405,6 +423,9 @@ func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, er
 		}
 		if err = s.placeStandInHold(ctx, tx, &stored, card); err == nil {
 			a, err = authorizations.ApproveStandIn(ctx, tx, stored)
+		}
+		if err == nil {
+			err = s.applyPendingReversals(ctx, tx, a.AuthID)
 		}
 	}
 	if err != nil {

@@ -305,14 +305,20 @@ func AddDailySpend(ctx context.Context, tx pgx.Tx, cardID string, amount int64) 
 	return nil
 }
 
-// RecordAdvice claims a network message id; false means it was already applied.
-func RecordAdvice(ctx context.Context, tx pgx.Tx, adviceID, authID string) (bool, error) {
+const (
+	MessageAdvice   = "advice"
+	MessageReversal = "reversal"
+)
+
+// RecordMessage claims a network message id (an advice or a reversal); false
+// means it was already applied.
+func RecordMessage(ctx context.Context, tx pgx.Tx, messageID, kind, authID string) (bool, error) {
 	const q = `
-		INSERT INTO network_messages (message_id, kind, auth_id) VALUES ($1, 'advice', $2)
+		INSERT INTO network_messages (message_id, kind, auth_id) VALUES ($1, $2, $3)
 		ON CONFLICT (message_id) DO NOTHING`
-	tag, err := tx.Exec(ctx, q, adviceID, authID)
+	tag, err := tx.Exec(ctx, q, messageID, kind, authID)
 	if err != nil {
-		return false, fmt.Errorf("record advice %s: %w", adviceID, err)
+		return false, fmt.Errorf("record %s %s: %w", kind, messageID, err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
