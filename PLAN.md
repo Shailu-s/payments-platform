@@ -1296,5 +1296,5 @@ reconciled, 0 drift. Deviations: transfers run twice single (not 3×); earlier b
 recorded separately, not in the medians. Open risks: goodput collapse past the knee (1 s
 deadline instead of early shedding); a card-read timeout before the transaction answers
 500 instead of 503. Tests in per-package schemas on the default database; benchmarks
-against `payments_bench` and `payments_bench_day`.
+against `payments_bench` and `payments_bench_day` (dropped). PR #18.
 
