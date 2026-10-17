@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,6 +35,8 @@ type Config struct {
 	Secret       []byte
 	AuthDeadline time.Duration
 	StandInLimit int64
+	// Seed draws the seed of every scenario run without one, so a whole session replays.
+	Seed uint64
 	// Clock defaults to the wall clock.
 	Clock Clock
 	// Client defaults to a client without its own timeout; AuthDeadline bounds each attempt.
@@ -49,10 +52,12 @@ type Network struct {
 	client       *http.Client
 
 	mu       sync.Mutex
+	seeds    *rand.Rand
 	journal  []Entry
 	ids      map[string]struct{}
 	auths    map[string]*authRecord
 	reversed map[string]int64
+	clearing []clearingPlan
 }
 
 func New(cfg Config) (*Network, error) {
@@ -73,6 +78,7 @@ func New(cfg Config) (*Network, error) {
 		standInLimit: cfg.StandInLimit,
 		clock:        cfg.Clock,
 		client:       cfg.Client,
+		seeds:        rand.New(rand.NewPCG(cfg.Seed, seedStream)),
 	}
 	if n.clock == nil {
 		n.clock = wallClock{}

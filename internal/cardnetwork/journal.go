@@ -69,7 +69,7 @@ func (n *Network) reserve(ids ...string) error {
 	return nil
 }
 
-// Reset forgets the journal and every reserved id.
+// Reset forgets the journal, every reserved id and every clearing line.
 func (n *Network) Reset() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -77,6 +77,7 @@ func (n *Network) Reset() {
 	n.ids = map[string]struct{}{}
 	n.auths = map[string]*authRecord{}
 	n.reversed = map[string]int64{}
+	n.clearing = nil
 }
 
 // rawAnswer keeps the issuer's reply readable in the journal even when it is not JSON.
