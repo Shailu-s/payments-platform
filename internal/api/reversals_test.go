@@ -1,13 +1,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/cardnetwork"
+	"github.com/Shailu-s/payments-platform/internal/holds"
 )
 
 func reversalBody(reversalID, authID string, amount int64) string {
@@ -283,6 +286,59 @@ func TestReleaseFreesDailyLimit(t *testing.T) {
 	}
 	if got := countWhere(t, `SELECT amount::int FROM card_daily_spend WHERE card_id = $1`, c.card.ID); got != 3000 {
 		t.Errorf("daily spend = %d, want 3000", got)
+	}
+	assertNoDrift(t)
+}
+
+// A reversal and the expirer reach the same old hold at once: the row lock
+// lets exactly one of them release it.
+func TestReversalRacingExpiryReleasesOnce(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	c := newCard(t, h, apiKey, 1_000_000, 5000, 1_000_000)
+	const n = 20
+	for i := range n {
+		authorizeTap(t, h, tap{authID: fmt.Sprintf("auth_old_%d", i), cardID: c.card.ID, amount: 1000})
+	}
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE card_authorizations SET created_at = now() - interval '8 days'`); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	var expireErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, expireErr = holds.ExpireBatch(context.Background(), testPool, time.Now(), 7*24*time.Hour, n)
+	}()
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			authID := fmt.Sprintf("auth_old_%d", i)
+			if code, status := tryReverse(h, "rev_"+authID, authID, 1000); code != http.StatusOK {
+				t.Errorf("reversal of %s = %d %s", authID, code, status)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if expireErr != nil {
+		t.Fatal(expireErr)
+	}
+
+	if got := countWhere(t, `SELECT count(*) FROM card_authorizations WHERE held_amount = 0 AND released_amount = 1000`); got != n {
+		t.Errorf("released exactly once = %d, want %d", got, n)
+	}
+	if got := releases(t); got != n {
+		t.Errorf("release transactions = %d, want %d", got, n)
+	}
+	if storedBalance(t, c.funding) != 1_000_000 || storedBalance(t, c.card.HeldAccountID) != 0 {
+		t.Errorf("available %d, held %d, want 1000000 and 0",
+			storedBalance(t, c.funding), storedBalance(t, c.card.HeldAccountID))
 	}
 	assertNoDrift(t)
 }
