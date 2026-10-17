@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile hold-expirer clearing bench-reconciliation bench bench-metrics bench-http bench-balance bench-expiry bench-clearing demo-v1
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile hold-expirer clearing card-settle card-reconcile bench-reconciliation bench bench-metrics bench-http bench-balance bench-expiry bench-clearing demo-v1
 
 up:
 	$(COMPOSE) up -d --wait
@@ -62,6 +62,15 @@ reconcile:
 # ARGS="-file clearing-2026-10-18.csv -date 2026-10-18", ARGS="-list" or ARGS="-inspect clf_… -flag shortfall".
 clearing:
 	@go run ./cmd/clearing $(ARGS)
+
+# Record the day's payment to the network, once: make card-settle ARGS="-date 2026-10-18".
+card-settle:
+	@go run ./cmd/card-settle $(ARGS)
+
+# Reconcile a settlement date three ways: make card-reconcile ARGS="-download $(NETWORK_URL) -date 2026-10-18",
+# ARGS="-statement settlement-2026-10-18.csv -date 2026-10-18", ARGS="-list" or ARGS="-inspect crn_… -class LATE_CLEARING".
+card-reconcile:
+	@go run ./cmd/card-reconcile $(ARGS)
 
 # Release card holds older than HOLD_EXPIRY_DAYS, every HOLD_EXPIRY_INTERVAL (0: once).
 hold-expirer:
