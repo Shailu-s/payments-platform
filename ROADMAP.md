@@ -12,14 +12,16 @@ method, the rules and the session LOG stay in PLAN.md.
 | Phase | Status | PR | Key number / proof |
 |---|---|---|---|
 | 8 fast spending path | merged 2026-10-17 | #10 | hot account ~330 -> 1,212 req/s accepted (same-session main vs p08, BENCHMARKS.md); balance read 0.12 ms at 1M entries |
-| 9 cards | in review | #11 | 20 concurrent first cards -> 1 held account, 0 orphans; 20 same-key issues -> 1 card; freeze racing close never reopens a closed card |
-| 10 network simulator | in review | #12 | 10 seeded scenarios, same seed -> byte-identical messages and clearing file; stand-in after two deadlines, advices/reversals retried six times then given up |
-| 11 authorization | in review | #13 | 20 concurrent $30 taps on $50 -> 1 approved, 19 insufficient_funds; 20 duplicates of one auth_id -> 1 row, 1 hold; auth-spread p99 3.2 ms at 500/s, 34-57 ms at 1,000/s |
-| 12 reversals, expiry, incremental holds | in review | #14 | 20 copies of one reversal -> 1 release; 10 x $20 reversals on a $50 hold -> $50 released; reversal racing its authorization (20 pairs) -> 0 stuck (1 stuck without the auth_id lock); 20 concurrent increments under a $100 chain limit -> exactly 8; expiry 1,400 holds/s |
-| 13 clearing | in review | #15 | same file twice -> 0 changes; 4 concurrent importers of one file -> each line posted once; crash at line 3 of 5, rerun -> 5 posted once; clearing racing reversals and expiry on 40 holds -> 0 both released and charged; shortfall never overdraws; import 10,000 lines ~1,300/s, replay ~16 ms |
-| 14 refunds | in review | #16 | refund = new transaction (payable -> available), charge's entries unchanged; refunds past the purchase credited and flagged; same refund line twice / 4 concurrent importers -> credited once; 4 concurrent PostDeferred runs -> each deferred line once; import 10,000 refunds ~1,250/s |
-| 15 network settlement and reconciliation | in review | #17 | 20 concurrent settlements of one day -> 1 row, 1 ledger transaction, payable back to 0; one corrupted day -> all 9 exception classes, ledger unchanged; 10 simulator scenarios end to end -> 9 MATCHED + 1 offline purchase; same run ID + bytes -> same run, other bytes refused; settle 10,000 lines ~4 ms, reconcile 10,000 ~55 ms |
-| 16 benchmark and evidence | not started | | |
+| 9 cards | merged 2026-10-17 | #11 | 20 concurrent first cards -> 1 held account, 0 orphans; 20 same-key issues -> 1 card; freeze racing close never reopens a closed card |
+| 10 network simulator | merged 2026-10-17 | #12 | 10 seeded scenarios, same seed -> byte-identical messages and clearing file; stand-in after two deadlines, advices/reversals retried six times then given up |
+| 11 authorization | merged 2026-10-17 | #13 | 20 concurrent $30 taps on $50 -> 1 approved, 19 insufficient_funds; 20 duplicates of one auth_id -> 1 row, 1 hold; auth-spread p99 3.2 ms at 500/s, 34-57 ms at 1,000/s |
+| 12 reversals, expiry, incremental holds | merged 2026-10-17 | #14 | 20 copies of one reversal -> 1 release; 10 x $20 reversals on a $50 hold -> $50 released; reversal racing its authorization (20 pairs) -> 0 stuck (1 stuck without the auth_id lock); 20 concurrent increments under a $100 chain limit -> exactly 8; expiry 1,400 holds/s |
+| 13 clearing | merged 2026-10-17 | #15 | same file twice -> 0 changes; 4 concurrent importers of one file -> each line posted once; crash at line 3 of 5, rerun -> 5 posted once; clearing racing reversals and expiry on 40 holds -> 0 both released and charged; shortfall never overdraws; import 10,000 lines ~1,300/s, replay ~16 ms |
+| 14 refunds | merged 2026-10-17 | #16 | refund = new transaction (payable -> available), charge's entries unchanged; refunds past the purchase credited and flagged; same refund line twice / 4 concurrent importers -> credited once; 4 concurrent PostDeferred runs -> each deferred line once; import 10,000 refunds ~1,250/s |
+| 15 network settlement and reconciliation | merged 2026-10-17 | #17 | 20 concurrent settlements of one day -> 1 row, 1 ledger transaction, payable back to 0; one corrupted day -> all 9 exception classes, ledger unchanged; 10 simulator scenarios end to end -> 9 MATCHED + 1 offline purchase; same run ID + bytes -> same run, other bytes refused; settle 10,000 lines ~4 ms, reconcile 10,000 ~55 ms |
+| 16 benchmark and evidence | in review | #18 | auth-spread knee ~1,000/s (p99 9.4 ms at 500, 68 ms at 1,000, median of 3, laptop under a video call); hot card ~500 approvals/s clean; card day: tap p99 6 -> 43 ms during a 10,000-line clearing import + 2,000 expiries, books reconcile (9,940 MATCHED + 60 offline), 0 drift; 20 concurrent copies x 30 auth_ids under load -> 1 row/hold each; 400 early/racing reversals -> each released once; SIGKILLed API -> network and issuer agree, 0 partial holds |
+
+**V2 complete when phase 16 merges (2026-10-17):** the debit card backend, phases 8-16. Next: V3 (stablecoin top-up).
 
 Dated entries per phase are in the [phase log](#phase-log) at the bottom.
 
@@ -325,3 +327,16 @@ later than its chain's first posted purchase (advice or incremental after cleari
 `TestSettlementMismatchIsDetected`, `TestReconRunReplayAndConflict`,
 `TestFindingsAreAppendOnly`, `TestStatementIsDeterministic`. Number: see BENCHMARKS.md
 phase 15.
+
+**2026-10-17 — Phase 16, benchmark and evidence (PR #18, in review). V2 complete.**
+`scripts/bench-http.sh` runs a discarded warm-up (`WARMUP`, 15 s) per mode and records it.
+`make bench-day` (`scripts/bench-day.sh`, `cmd/benchday`, `bench/k6/day.js`): one card day
+on `payments_bench_day` — simulator scenarios for a 10,000-line clearing file, 2,000 aged
+holds, 60 s of taps / hot-card taps / authorization + reversal pairs, the clearing import and
+`ExpireBatch` concurrently mid-load, then settle, reconcile against the statement and check
+the books. Chaos tests: `TestDuplicateAuthorizationsUnderLoad`,
+`TestReversalBeforeAuthorizationUnderLoad`, `TestAPIKilledMidAuthorizationLeavesNoPartialHold`
+(real `cmd/api` child SIGKILLed under simulator load), each failing first with its
+mechanism removed. README rewritten around the card story. Number: see BENCHMARKS.md
+phase 16. Open risk: past the knee goodput collapses to the 1 s deadline instead of
+shedding early.

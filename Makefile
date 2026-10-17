@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile hold-expirer clearing card-settle card-reconcile bench-reconciliation bench bench-metrics bench-http bench-balance bench-expiry bench-clearing bench-card-recon demo-v1
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile hold-expirer clearing card-settle card-reconcile bench-reconciliation bench bench-metrics bench-http bench-balance bench-expiry bench-clearing bench-card-recon bench-day demo-v1
 
 up:
 	$(COMPOSE) up -d --wait
@@ -85,6 +85,10 @@ bench:
 # Open-model HTTP sweep against a disposable payments_bench database. See BENCHMARKS.md.
 bench-http:
 	@bash scripts/bench-http.sh
+
+# One simulated card day under load, settled and reconciled, in payments_bench_day. See BENCHMARKS.md.
+bench-day:
+	@bash scripts/bench-day.sh
 
 bench-balance:
 	@go test ./internal/ledger -run '^$$' -bench 'Benchmark(Stored)?BalanceByHistory' -benchtime=2s -count=1

@@ -8,6 +8,7 @@ produced it does not go in this file.
 ```sh
 make bench-http        # HTTP sweep, spread + hot account, disposable payments_bench DB
 make bench-balance     # ledger.Balance cost against account history size
+make bench-day         # one card day under load, settled and reconciled, payments_bench_day DB
 ```
 
 `scripts/bench-http.sh` drops and recreates **only** a database named `payments_bench*`,
@@ -23,6 +24,9 @@ limiter from capping the load), starts the real `cmd/api` binary, and drives
 - `hot`: every request spends from the same source account.
 - Only the admission path runs: relay, sender and MockBank are not started, so the outbox
   backlog grows. This measures the synchronous API, not end-to-end settlement.
+- Each mode first runs a discarded warm-up (`WARMUP`, default 15 s) at its first rate,
+  since phase 16: the first measured step of a fresh API process had the worst tail
+  (phase 15). Rows record the `warmup` used.
 - Raw per-step JSON lands in `bench/out/<label>/results.jsonl` (ignored; holds API keys).
 
 ## Environment
@@ -651,6 +655,142 @@ clean day writes none. Memory is ~2.9 KB per record + authorization, all in the 
    lock; the Repeatable Read read-only transaction holds back vacuum for ~50 ms per 10,000
    records. At 100,000 records a day it would be ~0.6 s and ~290 MB in memory; streaming the
    classification would cut the memory, not the time.
+
+## Phase 16: V2 benchmark and failure evidence (2026-10-17)
+
+No API, ledger or SQL code changed in this phase (`git diff origin/main -- internal cmd/api`
+touches test files only); it adds the warm-up, `make bench-day`, three chaos tests and these
+numbers. Apple M4, **AC power**, `caffeinate -i`, pool 10, 30 s steps, 15 s discarded warm-up
+per mode, only the Postgres container running. **Machine not idle:** a video call
+(`avconferenced` ~0.5–1 core plus camera encoding) ran through every run below; that is
+the most likely cause of the noisier tails versus phases 11–15, and the reason these are
+the conservative numbers. `balance_drift` 0 and `declined_after` 0 on every step.
+
+```sh
+MODES="auth-spread auth-hot" RATES="250 500 1000 1500 2000 3000" make bench-http   # 3 runs
+MODES="spread hot" RATES="500 1000 1500" make bench-http                           # 2 single runs
+make bench-day                                                                     # 1 run
+```
+
+### Authorizations, spread over 1,001 cards (median of 3 runs)
+
+| target rps | achieved | p50 ms | p95 ms | p99 ms | max ms | non-200 per run | approved/s per run |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 250 | 250 | 2.44 | 4.05 | 11.98 | 112.6 | 0 / 0 / 0 | 250 / 250 / 250 |
+| 500 | 500 | 1.39 | 2.40 | **9.44** | 59.9 | 0 / 0 / 0 | 500 / 500 / 500 |
+| 1,000 | 1,000 | 1.32 | 7.97 | **68.24** | 151.7 | 0 / 0 / 0 | 1,000 / 1,000 / 1,000 |
+| 1,500 | 1,439 | 1,000.89 | 1,005.33 | 1,022.76 | 1,117.8 | 0 / 39,822 / 42,057 (503) | 1,500 / 159 / 80 |
+| 2,000 | 1,755 | 1,001.74 | 1,145.16 | 1,289.28 | 1,776.4 | 53,361 / 54,125 / 53,297 (503) | 206 / 10 / 13 |
+| 3,000 | 2,128 | 1,021.85 | 1,771.15 | 2,139.36 | 4,943.6 | 66,567 / 74,322 / 45,368 (503) | 2 / 6 / 0 |
+
+Per-run p99 at 500: 9.4 / 30.2 / 4.8 ms; at 1,000: 59.0 / 68.2 / 74.6 ms; at 1,500 run 1
+held (p99 222.8 ms, 0 non-200), runs 2 and 3 did not.
+
+**Knee: 1,000 req/s** (highest step with p99 < 100 ms and 0 non-200 in all three runs).
+
+### Authorizations on one hot card (median of 3 runs)
+
+| target rps | achieved | p50 ms | p95 ms | p99 ms | max ms | non-200 per run | approved/s per run |
+|---:|---:|---:|---:|---:|---:|---|---|
+| 250 | 250 | 2.62 | 3.97 | 10.78 | 59.5 | 0 / 132 / 0 | 250 / 245 / 250 |
+| 500 | 500 | 1.40 | 12.16 | 54.99 | 90.7 | 295 / 0 / 0 | 490 / 500 / 500 |
+| 1,000 | 997 | 87.32 | 141.57 | 224.63 | 401.3 | 4,854 / 14,468 / 1,034 | 838 / 517 / 965 |
+| 1,500 | 1,383 | 108.08 | 1,025.66 | 1,165.59 | 2,260.2 | 35,354 / 38,998 / 32,347 | 205 / 189 / 351 |
+| 2,000 | 1,615 | 682.43 | 1,336.38 | 1,807.58 | 3,144.4 | 49,675 / 48,164 / 45,205 | 39 / 80 / 80 |
+| 3,000 | 2,192 | 1,013.07 | 1,425.86 | 1,828.12 | 3,225.2 | 67,746 / 74,067 / 59,837 (one 500) | 16 / 0 / 4 |
+
+**Hot-card ceiling: ~500 approvals/s** with p99 < 100 ms (≤ 2 % `503 account_busy`);
+offered 1,000/s it approves 517–965/s and refuses the rest with 503, which the network
+retries once and then stands in for.
+
+Earlier runs of the same sweep on this branch, on **battery** (excluded from the medians;
+a third battery run was discarded because the machine slept mid-run): auth-spread p99 at
+500 4.1 / 12.8 ms, at 1,000 5.4 / 15.6 ms, at 1,500 114.9 / 356.6 ms with 0 non-200;
+auth-hot p99 at 500 2.7 / 4.2 ms.
+
+### Transfers, for comparison (two single runs, same session)
+
+| step | run 1 achieved / p50 / p99 ms / non-202 | run 2 achieved / p50 / p99 ms / non-202 |
+|---|---|---|
+| spread 500 | 485 / 16.37 / 1,755.28 / 0 (447 dropped) | 500 / 1.48 / 26.77 / 0 |
+| spread 1,000 | 630 / 2,576.71 / 5,005.16 / 1,840 | 990 / 11.43 / 406.04 / 0 |
+| spread 1,500 | 514 / 5,001.36 / 5,418.01 / 10,501 | 439 / 5,005.15 / 5,101.25 / 13,558 |
+| hot 500 | 500 / 3.69 / 213.56 / 1,618 | 500 / 128.93 / 805.72 / 7,722 |
+| hot 1,000 | 997 / 107.28 / 508.17 / 12,302 | 920 / 113.62 / 2,544.24 / 18,991 |
+| hot 1,500 | 1,445 / 193.72 / 1,596.96 / 38,477 | 1,363 / 735.84 / 1,858.83 / 40,165 |
+
+The transfer path did not change since phase 15, where spread p99 at 500 was 3–8 ms; two
+runs 4 minutes apart differ by 65× at the same step. These two runs measure the machine,
+not the code, and are recorded only because the brief asks for them.
+
+### A card day under load (`make bench-day`, one run)
+
+1,000 funded cards and a hot card; the simulator first plays 10,100 seeded scenarios (the
+10,000 purchases of a clearing file, tips, partial clears, incrementals, duplicates,
+timeouts, stand-ins, early reversals, offline purchases, late refunds) and 2,000 holds aged
+past the 7-day expiry. Then 60 s of open-model load: taps over every card 500/s, the hot
+card 20/s, authorization + reversal pairs 50/s (one in five reversal first). 20 s in, the
+10,000-line clearing import and `ExpireBatch` run concurrently. Then settle the day and
+reconcile it against the simulator's statement.
+
+| traffic | window | requests | p50 ms | p95 ms | p99 ms | max ms | non-200 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| taps 500/s | before batch | 7,365 | 1.13 | 1.70 | 6.02 | 30.36 | 0 |
+| taps 500/s | **during batch** | 5,919 | 1.15 | 7.14 | **43.05** | 72.42 | 0 |
+| taps 500/s | after batch | 14,210 | 1.14 | 1.78 | 7.85 | 44.42 | 0 |
+| hot card 20/s | during batch | 237 | 1.46 | 8.39 | 33.28 | 62.49 | 0 |
+| reversed authorization 50/s | during batch | 591 | 1.43 | 8.01 | 32.87 | 69.82 | 0 |
+| reversal 50/s | during batch | 591 | 1.74 | 6.56 | 24.23 | 46.64 | 0 |
+
+The batch window lasted 11.8 s (import 10,000 lines 11.84 s, expiry 2,000 holds 2.79 s).
+Afterwards: settled net $585,185.50 over 10,000 records; reconciliation MATCHED 9,940,
+CLEARED_NOT_AUTHORIZED 60 (the offline purchases), every other class 0, all as expected;
+`VerifyBalances` 0 drift; 0 unbalanced ledger transactions; held balances equal open holds;
+0 approved rows without a hold; 0 reversed authorizations still holding; 0 unapplied
+pending reversals; 0 dropped iterations.
+
+### Failure proofs
+
+| test | what it does | failing first |
+|---|---|---|
+| `TestDuplicateAuthorizationsUnderLoad` | 30 auth_ids × 20 concurrent copies while 8 workers tap the same cards | `card_authorizations` primary key dropped: 20 rows, 20 holds, 20 events per auth_id |
+| `TestReversalBeforeAuthorizationUnderLoad` | 200 simulator reversal-before-auth scenarios + 200 auth/reversal races under tap load | approval ignoring parked reversals: 0 of 400 released, 400 unapplied; `auth_id` advisory lock removed: 1 reversal lost (399/400) in 1 of 3 `-race` runs (0 of 10 plain runs: the window is narrow) |
+| `TestAPIKilledMidAuthorizationLeavesNoPartialHold` | real `cmd/api` child under 16 network workers, SIGKILL after ~300 decisions, restart; simulator retries, stands in, advises | hold written in its own transaction before the row: 2 (then 7) holds without a row, held balances disagreeing with rows |
+| `TestClearingSameFileTwiceChangesNothing` | phase 13, linked not duplicated | phase 13 PR |
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| auth-spread p99 at 500 | < 100 ms | **Met**: 9.4 ms median (4.8–30.2), 0 non-200 |
+| auth-spread p99 at 1,000 | < 100 ms | **Met**: 68.2 ms median (59.0–74.6), 0 non-200 |
+| auth p99 during clearing + expiry at 500/s | < 100 ms | **Met**: 43.1 ms (6.0 before) |
+| card day books | expected classes, 0 drift, 0 unbalanced | **Met** |
+| Regression rule vs phase 15 | | **Not comparable**: no hot-path code changed; the auth-spread p99 at 500 (9.4 ms) is above phase 15's 3.0–5.8 ms under a video call; see 1 |
+
+### What the numbers say
+
+1. **The environment moved, the code did not.** Only tests, the bench harness and a
+   benchmark command changed. Same-day battery runs gave 4.1–12.8 ms at
+   500 and 5.4–15.6 ms at 1,000; the transfer comparison swung 65× between two runs
+   minutes apart. Re-measure on an idle machine before quoting a capacity number; quote the
+   knee and the ceiling as "about", not as limits.
+2. **Past the knee, goodput collapses instead of plateauing.** Offered 1,500/s, two of three
+   runs approved 80–159/s and answered the rest `503` after waiting ~1 s: requests (most likely) queue for
+   one of 10 pool connections until the 1 s network deadline expires, and late answers
+   are wasted work. The one 500 (auth-hot 3,000) is the same timeout hit in the card read
+   before the transaction, which is not mapped to 503; the network treats it as no answer
+   either way. The network retries once and stands in, so money is still safe (0
+   drift, no partial holds), but stand-in exposure would rise. Shedding at admission
+   (a bounded wait for a pool connection, well under the deadline) would keep goodput near
+   the knee; recorded as an open risk, not tuned in this phase.
+3. **The hot card serialises as designed.** One balance row, 4 in flight, 250 ms lock
+   timeout: ~500 approvals/s clean, up to ~960/s with refusals, then the same deadline
+   collapse. Other cards are unaffected in the day run (hot card 20/s alongside 500/s taps).
+4. **Batch jobs cost the tail, not the median.** During the 10,000-line import and 2,000
+   expiries, tap p50 stayed 1.15 ms and p99 rose 6 → 43 ms: both jobs commit one short
+   transaction per line or hold, so they compete for the pool and the WAL but never hold
+   an account's balance lock across a batch.
 
 ## Regression rule
 
