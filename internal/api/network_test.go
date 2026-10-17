@@ -192,6 +192,9 @@ func TestSameAuthIDAlwaysGetsTheSameAnswer(t *testing.T) {
 		want    networkAnswer
 	}{
 		{"approved", 10000, networkAnswer{AuthID: "auth_dup", Decision: "approved", ApprovedAmount: 3000}},
+		// The first attempt's transaction rolls back on the overdraft; the
+		// decline stored after it must still be the only answer.
+		{"declined for funds", 2000, networkAnswer{AuthID: "auth_dup", Decision: "declined", DeclineReason: "insufficient_funds"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -400,4 +403,66 @@ func TestUnsignedOrTamperedNetworkRequestsAreRejected(t *testing.T) {
 	if got := storedBalance(t, c.funding); got != 10000 {
 		t.Errorf("available = %d, want 10000", got)
 	}
+}
+
+// Guarantee 3 for taps: the balance CHECK decides, so concurrent taps on one
+// account cannot both spend the same money.
+func TestTwoTapsAtOnceCannotOverspend(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	c := newCard(t, h, apiKey, 5000, 5000, 1_000_000)
+
+	const n = 20
+	answers := make([]networkAnswer, n)
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			answers[i], codes[i], _ = tryAuthorize(h, tap{authID: fmt.Sprintf("auth_race_%d", i), cardID: c.card.ID, amount: 3000})
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	approved, broke := 0, 0
+	for i := range n {
+		switch {
+		case codes[i] != http.StatusOK:
+			t.Errorf("request %d = %d", i, codes[i])
+		case answers[i].Decision == "approved":
+			approved++
+		case answers[i].DeclineReason == "insufficient_funds":
+			broke++
+		default:
+			t.Errorf("request %d = %+v", i, answers[i])
+		}
+	}
+	if approved != 1 || broke != n-1 {
+		t.Errorf("approved %d, insufficient funds %d, want 1 and %d", approved, broke, n-1)
+	}
+	if got := storedBalance(t, c.funding); got != 2000 {
+		t.Errorf("available = %d, want 2000", got)
+	}
+	if got := storedBalance(t, c.card.HeldAccountID); got != 3000 {
+		t.Errorf("held = %d, want 3000", got)
+	}
+	if got := countRows(t, "card_authorizations"); got != n {
+		t.Errorf("authorizations = %d, want %d: every decline is stored", got, n)
+	}
+	// A decline for funds rolled back its daily spend with the hold.
+	var spent int64
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT amount FROM card_daily_spend WHERE card_id = $1`, c.card.ID).Scan(&spent); err != nil {
+		t.Fatal(err)
+	}
+	if spent != 3000 {
+		t.Errorf("daily spend = %d, want 3000", spent)
+	}
+	if got := countWhere(t, `SELECT count(*) FROM outbox_events WHERE event_type = 'card.authorization.declined'`); got != n-1 {
+		t.Errorf("declined events = %d, want %d", got, n-1)
+	}
+	assertNoDrift(t)
 }

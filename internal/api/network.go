@@ -180,6 +180,10 @@ func (s *Server) authorize(ctx context.Context, req authorizations.Request) (aut
 		return s.replayAuthorization(ctx, a)
 	case errors.Is(err, authorizations.ErrDailyLimit):
 		return s.declineAuthorization(ctx, a, authorizations.ReasonDailyLimitExceeded)
+	case errors.Is(err, ledger.ErrInsufficientFunds):
+		// The CHECK aborted the transaction, row and all: the answer is
+		// stored by a second one.
+		return s.declineAuthorization(ctx, a, authorizations.ReasonInsufficientFunds)
 	}
 	return authorizations.Authorization{}, err
 }
