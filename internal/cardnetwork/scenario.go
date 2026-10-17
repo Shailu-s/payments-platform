@@ -136,8 +136,9 @@ func (n *Network) RunScenario(ctx context.Context, req ScenarioRequest) (Scenari
 	result := ScenarioResult{
 		Scenario:       req.Scenario,
 		Seed:           seed,
-		Authorizations: r.results,
+		Authorizations: append([]AuthResult{}, r.results...),
 		ClearingDates:  n.clearingDates(r.plans),
+		Journal:        []Entry{},
 	}
 	for _, e := range n.Journal() {
 		if slices.Contains(r.messageIDs, e.ID) {

@@ -50,7 +50,7 @@ func (n *Network) record(e Entry) {
 func (n *Network) Journal() []Entry {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return append([]Entry(nil), n.journal...)
+	return append([]Entry{}, n.journal...)
 }
 
 // reserve claims message ids for one use each; a second use of any of them fails

@@ -114,7 +114,7 @@ func (n *Network) netApprovedLocked(authID string) int64 {
 func (n *Network) clearingDates(plans []clearingPlan) []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	var dates []string
+	dates := []string{}
 	for _, p := range plans {
 		if _, ok := n.resolveLocked(p); !ok {
 			continue

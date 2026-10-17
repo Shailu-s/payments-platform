@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench bench-metrics bench-http bench-balance demo-v1
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench bench-metrics bench-http bench-balance demo-v1
 
 up:
 	$(COMPOSE) up -d --wait
@@ -81,6 +81,11 @@ bench-reconciliation:
 # Run alongside `make run`; address comes from MOCKBANK_ADDR.
 mock-bank:
 	@go run ./cmd/mock-bank
+
+# Card network simulator; settings come from NETWORK_* and ISSUER_URL. ARGS runs a
+# scenario instead: make mock-network ARGS="scenario -name stand_in -card card_x -amount 5000"
+mock-network:
+	@go run ./cmd/mock-network $(ARGS)
 
 # Address comes from API_ADDR.
 run:
