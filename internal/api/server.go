@@ -91,6 +91,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/transfers", s.handleCreateTransfer)
 	mux.HandleFunc("GET /v1/transfers/{id}", s.handleGetTransfer)
 	mux.HandleFunc("GET /v1/transfers", s.handleListTransfers)
+
+	mux.HandleFunc("POST /v1/cards", s.handleIssueCard)
+	mux.HandleFunc("GET /v1/cards/{id}", s.handleGetCard)
+
 	mux.HandleFunc("GET /v1/reconciliation/runs", s.handleListReconciliationRuns)
 	mux.HandleFunc("GET /v1/reconciliation/runs/{id}", s.handleGetReconciliationRun)
 	mux.HandleFunc("GET /v1/reconciliation/runs/{id}/findings", s.handleReconciliationFindings)
