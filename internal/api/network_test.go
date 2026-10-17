@@ -36,6 +36,8 @@ type tap struct {
 	amount         int64
 	currency, mcc  string
 	kind           string
+	// original is the incremental's original_auth_id; auth_original if empty.
+	original string
 }
 
 func (tp tap) body() string {
@@ -51,7 +53,11 @@ func (tp tap) body() string {
 	}
 	original := ""
 	if kind == "incremental" {
-		original = `,"original_auth_id":"auth_original"`
+		id := tp.original
+		if id == "" {
+			id = "auth_original"
+		}
+		original = fmt.Sprintf(`,"original_auth_id":%q`, id)
 	}
 	return fmt.Sprintf(`{"auth_id":%q,"card_id":%q,"amount":%d,"currency":%q,`+
 		`"merchant":{"id":"mer_coffee","name":"Corner Coffee","mcc":%q},"kind":%q%s,"sent_at":"2026-10-17T10:00:00Z"}`,
@@ -324,7 +330,7 @@ func TestRuleDeclinesMoveNoMoney(t *testing.T) {
 		{"currency", tap{cardID: active.card.ID, amount: 100, currency: "EUR"}, "invalid_currency"},
 		{"per-transaction limit", tap{cardID: active.card.ID, amount: 5001}, "exceeds_transaction_limit"},
 		{"blocked mcc", tap{cardID: active.card.ID, amount: 100, mcc: "7995"}, "merchant_blocked"},
-		{"incremental", tap{cardID: active.card.ID, amount: 100, kind: "incremental"}, "incremental_not_supported"},
+		{"incremental of nothing", tap{cardID: active.card.ID, amount: 100, kind: "incremental"}, "original_not_found"},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

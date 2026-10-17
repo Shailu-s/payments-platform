@@ -36,9 +36,14 @@ const (
 	ReasonInvalidCurrency         = "invalid_currency"
 	ReasonExceedsTransactionLimit = "exceeds_transaction_limit"
 	ReasonMerchantBlocked         = "merchant_blocked"
-	ReasonIncrementalNotSupported = "incremental_not_supported"
 	ReasonDailyLimitExceeded      = "daily_limit_exceeded"
 	ReasonInsufficientFunds       = "insufficient_funds"
+
+	// Incremental authorizations only.
+	ReasonOriginalNotFound    = "original_not_found"
+	ReasonOriginalNotApproved = "original_not_approved"
+	ReasonOriginalExpired     = "original_expired"
+	ReasonCardMismatch        = "card_mismatch"
 
 	EventApproved = "card.authorization.approved"
 	EventDeclined = "card.authorization.declined"
@@ -100,7 +105,9 @@ type Querier interface {
 
 // RuleDecline returns why the card's own rules refuse r, or "" if they allow
 // it. It moves no money and reads nothing: card is nil for an unknown card.
-// Funds and the daily limit are decided by the database, not here.
+// Funds and the daily limit are decided by the database, not here, and so is
+// an incremental's per-transaction limit, which applies to the chain's total:
+// see IncrementalDecline.
 func RuleDecline(card *cards.Card, r Request) string {
 	switch {
 	case card == nil:
@@ -109,14 +116,43 @@ func RuleDecline(card *cards.Card, r Request) string {
 		return ReasonCardInactive
 	case r.Currency != Currency:
 		return ReasonInvalidCurrency
-	case r.Amount > card.PerTransactionLimit:
+	case r.Kind == KindInitial && r.Amount > card.PerTransactionLimit:
 		return ReasonExceedsTransactionLimit
 	case slices.Contains(card.BlockedMCCs, r.MCC):
 		return ReasonMerchantBlocked
-	case r.Kind == KindIncremental:
-		return ReasonIncrementalNotSupported
+	case r.Kind == KindIncremental && (r.OriginalAuthID == "" || r.OriginalAuthID == r.AuthID):
+		return ReasonOriginalNotFound
 	}
 	return ""
+}
+
+// IncrementalDecline returns why inc may not raise original, or "" if it may.
+// original is nil if there is no such authorization; the caller holds its row
+// lock, so the answer holds until commit.
+func IncrementalDecline(original *Authorization, inc Authorization, card cards.Card) string {
+	switch {
+	case original == nil || original.Kind != KindInitial:
+		return ReasonOriginalNotFound
+	case original.CardID != inc.CardID:
+		return ReasonCardMismatch
+	case original.Decision != DecisionApproved:
+		return ReasonOriginalNotApproved
+	case original.ExpiredAt != nil || (original.HeldAmount == 0 && original.ReleasedAmount > 0):
+		return ReasonOriginalExpired
+	// Written as a subtraction so a huge increase cannot overflow the sum.
+	case inc.Amount > card.PerTransactionLimit-original.ApprovedAmount:
+		return ReasonExceedsTransactionLimit
+	}
+	return ""
+}
+
+// QueueRaise adds the increase to original's approved and held amounts.
+func QueueRaise(batch *pgx.Batch, originalAuthID string, increase int64) {
+	const q = `
+		UPDATE card_authorizations
+		SET approved_amount = approved_amount + $2, held_amount = held_amount + $2, updated_at = now()
+		WHERE auth_id = $1`
+	batch.Queue(q, originalAuthID, increase)
 }
 
 // New is the row for r: approved in full, or declined with reason.
