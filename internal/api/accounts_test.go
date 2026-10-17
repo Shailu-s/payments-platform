@@ -80,7 +80,7 @@ func TestCreateAccountRejectsUnknownFieldsRatherThanIgnoringThem(t *testing.T) {
 	// because migrations create them.
 	var count int
 	if err := testPool.QueryRow(context.Background(),
-		`SELECT count(*) FROM accounts WHERE id NOT IN ('acc_settlement_usd', 'acc_network_payable_usd')`).Scan(&count); err != nil {
+		`SELECT count(*) FROM accounts WHERE id NOT IN ('acc_settlement_usd', 'acc_network_payable_usd', 'acc_network_cash_usd')`).Scan(&count); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 0 {

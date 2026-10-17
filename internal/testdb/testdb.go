@@ -139,10 +139,11 @@ func TruncateAll(ctx context.Context, pool *pgxpool.Pool, schema string) error {
 		return fmt.Errorf("testdb: truncate: %w", err)
 	}
 
-	// Transfers and clearing need the system accounts removed by truncation.
+	// Transfers, clearing and settlement need the system accounts removed by truncation.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO accounts (id, currency, type) VALUES
-			('acc_settlement_usd', 'USD', 'settlement'), ('acc_network_payable_usd', 'USD', 'settlement')
+			('acc_settlement_usd', 'USD', 'settlement'), ('acc_network_payable_usd', 'USD', 'settlement'),
+			('acc_network_cash_usd', 'USD', 'settlement')
 		 ON CONFLICT (id) DO NOTHING`); err != nil {
 		return fmt.Errorf("testdb: restore system accounts: %w", err)
 	}

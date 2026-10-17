@@ -1250,3 +1250,29 @@ every refund test saw `deferred` records and unchanged balances before the posti
 ~1,250 lines/s, replay ~16–25 ms. Tests in per-package schemas on the default database
 (Kafka started for the Kafka suites, then stopped); benchmarks against `payments_bench` and
 `payments_bench_clearing` (dropped).
+
+**2026-10-17 — Phase 15 (network settlement and reconciliation) built on
+`phase-15-settlement-recon`; PR open, not merged.** Executor followed
+`briefs/phase-15-settlement-recon.md`. Simulator `GET /settlement?date=` and
+`cardnetwork.StatementOf` / `SettlementStatement` (contract updated). Migration 21:
+`acc_network_cash_usd`, `network_settlements` (PK `settlement_date`, CHECK net = purchases −
+refunds, deferrable ledger link), `card_recon_runs` / `card_recon_findings` append-only via
+migration 12's `reject_reconciliation_mutation()`, partial indexes on
+`card_authorizations (original_auth_id)` and `(expired_at)`. `cardsettlement.Settle`: insert
+first (`INSERT … SELECT` totals of posted records whose file has the date, `ON CONFLICT DO
+NOTHING`), ledger last; refuses dates with no clearing file or deferred lines.
+`cardrecon.Reconcile`: one read-only Repeatable Read snapshot (date's records; authorizations
+they name, their incrementals, holds open past `HOLD_EXPIRY_DAYS`, holds expired on the
+date; recorded settlement), in-memory classification, run + findings in one transaction with
+`COPY`, V1 run-ID replay. Deviations: (1) migration 12's trigger function reused, not
+migration 13's (13's raises "ledger history is append-only"); (2) Settle refuses no-file and
+deferred-line dates; (3) SETTLEMENT_MISMATCH compares purchases, refunds, net and count, not
+only net; (4) two partial indexes added; (5) `card_mismatch` on a purchase is reported as
+REFUND_EXCEPTION, as the brief's table says. Failing first: Settle stub failed all four
+settlement tests, and without `ON CONFLICT` concurrent callers failed with a primary-key violation;
+a stubbed `Classify` failed every reconciliation test; without the triggers UPDATE/DELETE of
+findings succeeded. Benchmarks: auth-spread p99 3.0–5.8 ms at 500, 3.7–39.7 ms at 1,000, 0
+non-200, 0 drift, p50 within 0.16 ms of main, p99 order-dependent in both directions; Settle
+10,000 lines 3.5–5.2 ms; Reconcile 10,000 55–65 ms, 29 MB. Tests in per-package schemas on
+the default database; benchmarks against `payments_bench` and `payments_bench_cardrecon`
+(dropped).

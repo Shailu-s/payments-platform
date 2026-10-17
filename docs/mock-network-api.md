@@ -188,6 +188,36 @@ Rules:
 
 ---
 
+## Settlement statement
+
+What the network says the issuer owes it for one date: the net of that date's clearing
+file. The issuer pays it once a day and reconciles against it (phase 15).
+
+```http
+GET /settlement?date=2026-10-18
+```
+
+```csv
+settlement_date,purchases_total,refunds_total,net_amount,line_count,currency
+2026-10-18,7200,0,7200,2,USD
+```
+
+| column | notes |
+|---|---|
+| `purchases_total` / `refunds_total` | sums of the `purchase` and `refund` lines of the clearing file for `settlement_date` |
+| `net_amount` | `purchases_total − refunds_total`. **Negative means the network owes the issuer** |
+| `line_count` | every line of that clearing file, purchases and refunds |
+
+Rules:
+
+- One row. Built from exactly the lines `GET /clearing?date=` returns for the same date, so
+  the two agree; the same date asked twice returns the same bytes while nothing new clears.
+- It counts every line the network cleared, including lines for cards the issuer does not
+  know: the network charges them whatever the issuer posted.
+- `400` if `date` is missing or not `YYYY-MM-DD`. A date with no activity returns zeros.
+
+---
+
 ## Sandbox (operator endpoints)
 
 Not part of the contract the issuer codes against.
@@ -239,5 +269,6 @@ All are required; there are no defaults.
 ## Limits, stated plainly
 
 - In-memory: a restart loses the journal and every clearing line, like MockBank.
-- One network, one issuer, USD only, no settlement amounts or interchange fees (phase 15).
+- One network, one issuer, USD only, no interchange fees: the statement net is exactly the
+  cleared amounts.
 - The failure modes are the ones listed here. A real network has more.

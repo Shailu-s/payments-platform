@@ -108,6 +108,12 @@ func TestScenarioEndpointPlaysAndServesItsClearingFile(t *testing.T) {
 		t.Fatalf("clearing file lacks %q:\n%s", want, first)
 	}
 
+	status, header, statement := get(t, srv.URL+"/settlement?date="+result.ClearingDates[0])
+	if status != http.StatusOK || !strings.HasPrefix(header.Get("Content-Type"), "text/csv") ||
+		string(statement) != "settlement_date,purchases_total,refunds_total,net_amount,line_count,currency\n2026-10-18,6000,0,6000,1,USD\n" {
+		t.Fatalf("settlement status %d, type %q:\n%s", status, header.Get("Content-Type"), statement)
+	}
+
 	dir := t.TempDir()
 	paths, err := exportClearing(network, dir, result.ClearingDates)
 	if err != nil || len(paths) != 1 || paths[0] != filepath.Join(dir, "clearing-2026-10-18.csv") {
@@ -140,6 +146,9 @@ func TestSandboxRejectsBadInput(t *testing.T) {
 	for _, q := range []string{"", "?date=", "?date=2026/10/18"} {
 		if status, _, _ := get(t, srv.URL+"/clearing"+q); status != http.StatusBadRequest {
 			t.Errorf("clearing%s: status %d, want 400", q, status)
+		}
+		if status, _, _ := get(t, srv.URL+"/settlement"+q); status != http.StatusBadRequest {
+			t.Errorf("settlement%s: status %d, want 400", q, status)
 		}
 	}
 }

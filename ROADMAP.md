@@ -18,7 +18,7 @@ method, the rules and the session LOG stay in PLAN.md.
 | 12 reversals, expiry, incremental holds | in review | #14 | 20 copies of one reversal -> 1 release; 10 x $20 reversals on a $50 hold -> $50 released; reversal racing its authorization (20 pairs) -> 0 stuck (1 stuck without the auth_id lock); 20 concurrent increments under a $100 chain limit -> exactly 8; expiry 1,400 holds/s |
 | 13 clearing | in review | #15 | same file twice -> 0 changes; 4 concurrent importers of one file -> each line posted once; crash at line 3 of 5, rerun -> 5 posted once; clearing racing reversals and expiry on 40 holds -> 0 both released and charged; shortfall never overdraws; import 10,000 lines ~1,300/s, replay ~16 ms |
 | 14 refunds | in review | #16 | refund = new transaction (payable -> available), charge's entries unchanged; refunds past the purchase credited and flagged; same refund line twice / 4 concurrent importers -> credited once; 4 concurrent PostDeferred runs -> each deferred line once; import 10,000 refunds ~1,250/s |
-| 15 network settlement and reconciliation | not started | | |
+| 15 network settlement and reconciliation | in review | #17 | 20 concurrent settlements of one day -> 1 row, 1 ledger transaction, payable back to 0; one corrupted day -> all 9 exception classes, ledger unchanged; 10 simulator scenarios end to end -> 9 MATCHED + 1 offline purchase; same run ID + bytes -> same run, other bytes refused; settle 10,000 lines ~4 ms, reconcile 10,000 ~55 ms |
 | 16 benchmark and evidence | not started | | |
 
 Dated entries per phase are in the [phase log](#phase-log) at the bottom.
@@ -307,3 +307,21 @@ deferred, claimed with `UPDATE … WHERE status = 'deferred'`. Proof:
 `TestUnmatchedRefundIsPostedAndFlagged`, `TestRefundLineImportedTwiceCreditsOnce`,
 `TestPostDeferredIsIdempotent`, `TestHeaderOnlyFilesForDifferentDatesAreDistinct`,
 `TestLateRefundScenarioEndToEnd`. Number: see BENCHMARKS.md phase 14.
+
+**2026-10-17 — Phase 15, network settlement and reconciliation (PR #17, in review).** Simulator:
+`GET /settlement?date=` (one CSV row: purchases, refunds, net, line count) built from the
+same lines as that date's clearing file. Migration 21: `acc_network_cash_usd`,
+`network_settlements` (date primary key), append-only `card_recon_runs` /
+`card_recon_findings` (V1's reconciliation trigger function), two partial indexes on
+`card_authorizations`. `cardsettlement.Settle` / `cmd/card-settle`: one transaction, the row
+inserted first with totals computed in the same `INSERT … SELECT` from the date's posted
+records, `ON CONFLICT DO NOTHING` so a concurrent or repeated settlement returns the first
+row; net > 0 debits the payable and credits network cash, net < 0 the reverse, net 0 no
+ledger; no file or deferred lines refused. `cardrecon.Reconcile` / `cmd/card-reconcile`:
+one Repeatable Read snapshot, ten classes (MATCHED counted, not stored), run-ID replay as in
+V1. `HOLD_AFTER_CLEARING` closes the PR #15 follow-up: a hold whose ledger transaction is
+later than its chain's first posted purchase (advice or incremental after clearing). Proof:
+`TestSettleRecordsTheDayOnce`, `TestEveryClassIsDetected`, `TestCleanDayIsAllMatched`,
+`TestSettlementMismatchIsDetected`, `TestReconRunReplayAndConflict`,
+`TestFindingsAreAppendOnly`, `TestStatementIsDeterministic`. Number: see BENCHMARKS.md
+phase 15.
