@@ -349,8 +349,8 @@ POST /network/advices          a stand-in approval to honour                    
 - **Approve** = move the amount from the card's funding (available) account to its held
   account in one ledger transaction. Declines move nothing and are stored too: unknown card,
   card not active, not USD, over the per-transaction limit, blocked merchant category
-  (`blocked_mccs` on `POST /v1/cards`), incremental (phase 12), over the daily limit, or
-  insufficient funds.
+  (`blocked_mccs` on `POST /v1/cards`), over the daily limit, or insufficient funds.
+  Incremental authorizations are phase 12, below.
 - **Same `auth_id`, same answer.** `card_authorizations.auth_id` is the primary key and is
   inserted first; a duplicate waits for the original to commit and answers the stored row.
   Every answer is the stored row
@@ -378,6 +378,54 @@ Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 11). The cost is a second hot 
 (the daily counter, locked until commit), a second short transaction on the
 insufficient-funds path, and stand-in shortfalls that are real credit exposure we only
 detect, never fix.
+
+## Reversals, expiry and incremental holds (V2, phase 12)
+
+Money held by an authorization must never be stuck and never be released twice.
+
+```text
+POST /network/reversals        signed; release (part of) a hold -> 200 released | nothing_held | pending | already_processed
+make hold-expirer              release approved holds older than HOLD_EXPIRY_DAYS
+```
+
+- **One release primitive** (`holds.Release` in [internal/holds](internal/holds/holds.go)):
+  lock the authorization row, release `min(amount, held_amount)`, give that back to the
+  day's spend counter, outbox event, ledger `held -> available` last. Every reversal,
+  parked reversal and expiry goes through it, so the row lock and `held_amount` make a
+  release exactly-once; the held account's balance CHECK is the backstop
+  ([TestReleaseNeverReleasesMoreThanHeld](internal/holds/holds_test.go),
+  [TestDifferentReversalsNeverReleaseMoreThanHeld](internal/api/reversals_test.go)).
+- **Reversals** are deduplicated on `reversal_id` in `network_messages`, in the same
+  transaction as their effect ([TestReversalReleasesTheHoldOnce](internal/api/reversals_test.go)).
+  One for an incremental `auth_id` releases from its chain's initial row.
+- **Reversal before the authorization:** parked in `pending_reversals` and applied by the
+  approval (or a stand-in advice) in the same transaction as the hold. The answer stays
+  "approved" and the ledger shows hold then release. A per-`auth_id` transaction-scoped
+  advisory lock, taken first by both sides, closes the window in which each commits
+  without seeing the other
+  ([TestReversalBeforeAuthorizationIsAppliedOnArrival](internal/api/reversals_test.go),
+  [TestReversalBeforeAuthScenario](internal/api/network_scenarios_test.go)). A reversal of
+  a declined authorization is parked too: a stand-in advice can still approve it.
+- **Expiry:** `holds.ExpireBatch` claims one open hold at a time with
+  `FOR UPDATE SKIP LOCKED` on a partial index of open holds and releases it in full in its
+  own short transaction, so concurrent expirers and reversals never release the same money
+  twice and an account's balance lock is never held across a batch
+  ([TestExpiryReleasesOldHoldsOnce](internal/holds/expire_test.go),
+  [TestReversalRacingExpiryReleasesOnce](internal/api/reversals_test.go)). A clearing line
+  that arrives after its hold expired is phase 13's problem.
+- **Incremental** (`kind = incremental`, amount = the increase): the original row is locked,
+  the chain total is checked against the per-transaction limit under that lock, the day's
+  counter and the ledger take the increase; the original's `approved_amount` and
+  `held_amount` grow, the incremental row holds nothing. Declines: `original_not_found`,
+  `original_not_approved`, `original_expired`, `card_mismatch`, plus the card rules
+  ([TestIncrementalRaisesTheOriginalHold](internal/api/incremental_test.go),
+  [TestIncrementalDeclines](internal/api/incremental_test.go),
+  [TestConcurrentIncrementalsRespectFundsAndLimits](internal/api/incremental_test.go)).
+
+Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 12). The cost is a pending-reversal table
+that grows with orphaned reversals (no retention yet), one more row lock on the
+incremental and reversal paths, an advisory lock and a pending-reversal read in every
+approval's first batch, and an expirer process to run.
 
 ## Honest V1 limits
 

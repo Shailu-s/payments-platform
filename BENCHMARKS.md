@@ -379,6 +379,74 @@ dropped and the slowest answer of the hot sweep was 204 ms, inside the 1 s deadl
    approved). They cost a rollback plus one more statement; the concurrency tests, not
    this sweep, show them correct.
 
+## Phase 12: reversals, expiry and incremental holds (2026-10-17)
+
+Every approval's first batch now also takes a per-`auth_id` advisory lock and reads
+`pending_reversals` (same round trip). Same machine, pool 10, 30 s steps, **on battery
+(13 % → 9 %), load average ~2**, only the Postgres container running, wrapped in
+`caffeinate -i`. `main` (`341624e`) was measured in the same session: run 1 branch then main,
+run 2 main then branch. `balance_drift` 0 and `declined_after` 0 on every step.
+
+```sh
+make bench-expiry                                              # BenchmarkExpireBatch, 3 runs
+MODES="auth-spread auth-hot" RATES="500 1000" make bench-http  # run 1, both
+MODES="spread" RATES="500 1000" make bench-http                # run 1, both
+MODES="auth-spread spread" RATES="500 1000" make bench-http    # run 2, both
+```
+
+Main's run-2 auth-spread steps are discarded: the laptop slept in the middle of them
+(max latency 714 s and 964 s, 14 achieved/s), even under `caffeinate -i`, at 9 % battery.
+
+### Authorizations (p50 / p99 ms, every step 0 non-200, 0 dropped)
+
+| step | run | main | p12 |
+|---|---:|---:|---:|
+| auth-spread 500 | 1 | 1.58 / 2.97 | 1.57 / 15.56 |
+| auth-spread 500 | 2 | (slept) | 1.60 / 2.73 |
+| auth-spread 1,000 | 1 | 0.80 / 3.79 | 0.80 / 4.21 |
+| auth-spread 1,000 | 2 | (slept) | 0.77 / 10.53 |
+| auth-hot 500 | 1 | 1.63 / 4.19 | 1.62 / 3.25 |
+| auth-hot 1,000 | 1 | 0.81 / 6.21 | 0.81 / 6.59 |
+
+### Transfer regression (p50 / p99 ms, every step all 202, 0 dropped)
+
+| step | run | main | p12 |
+|---|---:|---:|---:|
+| spread 500 | 1 | 1.49 / 2.82 | 1.49 / 3.20 |
+| spread 500 | 2 | 1.45 / 6.83 | 1.48 / 3.49 |
+| spread 1,000 | 1 | 1.14 / 10.27 | 1.23 / 7.92 |
+| spread 1,000 | 2 | 1.24 / 17.22 | 1.19 / 28.95 |
+
+### Expiry (`make bench-expiry`)
+
+| holds | run 1 | run 2 | run 3 |
+|---:|---:|---:|---:|
+| 10,000 on one account | 7.18 s (1,393/s) | 7.13 s (1,402/s) | 7.07 s (1,415/s) |
+
+One runner, one transaction per hold (~0.7 ms: BEGIN, claim batch, row lock, release
+batch, ledger batch, COMMIT), every release on the same two balance rows. ~120 M holds/day
+per runner; more runners help only across accounts.
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| auth-spread p99 at 500 and 1,000 req/s | < 100 ms | **Met**: 15.6 / 2.7 ms at 500, 4.2 / 10.5 ms at 1,000, 0 non-200 |
+| No worse than same-session main beyond noise | | **Met on p50** (equal on every pairing). p99 at auth-spread 500 run 1 was 15.6 ms vs 2.97 ms: the branch's first step of the session; its run 2 gave 2.73 ms. Not reproduced, so reported, not explained |
+| Transfer spread p99 at 500 (regression rule) | ≤ +20 % of main | **Met**: +13 % in run 1 (3.20 vs 2.82), −49 % in run 2 (3.49 vs 6.83) |
+| Balance drift after every step | 0 | **Met** |
+
+### What the numbers say
+
+1. **The advisory lock and pending-reversal read ride in the existing first batch**, so
+   an approval still makes the same number of round trips; p50 is unchanged to 0.01-0.03 ms
+   at every step. The lock is on the `auth_id`, which only duplicates and reversals of the
+   same authorization share, so it adds no contention on the hot card.
+2. **The p99 swings are the run-to-run noise of this laptop** (main's own spread 1,000 p99
+   went 10.3 → 17.2 ms between runs; the branch's 7.9 → 29.0 ms). Reversals, incrementals
+   and expiry are not loaded by this sweep; their correctness is shown by the concurrency
+   tests, and the expirer's throughput by `BenchmarkExpireBatch`.
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two
