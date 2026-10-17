@@ -584,6 +584,74 @@ purchase without a tip, so the same ~0.8 ms commit-bound line.
    Refunds touch one balance row (the cardholder's available), so a refund holds that
    account's lock for one line, never a batch.
 
+## Phase 15: network settlement and reconciliation (2026-10-17)
+
+Settlement and card reconciliation are offline commands; no authorization or transfer
+statement changed. Migration 21 adds two **partial** indexes to `card_authorizations`
+(`original_auth_id` where set, `expired_at` where set): an initial authorization, which is
+what a tap inserts, enters neither. Same machine (Apple M4), pool 10, 30 s steps,
+`caffeinate -i`, only the Postgres container running (Kafka stopped). `main` (`2d48a1b`)
+measured in the same session from a detached worktree: run 1 branch then main, run 2 main
+then branch, run 3 branch then main, run 4 main then branch. `balance_drift` 0 and
+`declined_after` 0 on every step.
+
+```sh
+MODES="auth-spread" RATES="500 1000" make bench-http                     # 4 runs each, both
+TEST_DATABASE_URL=…/payments_bench_cardrecon make bench-card-recon      # BenchmarkSettle, BenchmarkCardReconcile, 3 runs
+```
+
+### Authorizations (p50 / p99 ms, every step 0 non-200, 0 dropped)
+
+| step | run | order | main | p15 |
+|---|---|---|---:|---:|
+| auth-spread 500 | 1 | p15, main | 1.47 / 2.61 | 1.42 / 4.01 |
+| auth-spread 500 | 2 | main, p15 | 1.49 / 7.83 | 1.65 / 3.74 |
+| auth-spread 500 | 3 | p15, main | 1.56 / 3.28 | 1.56 / 5.83 |
+| auth-spread 500 | 4 | main, p15 | 1.66 / 4.15 | 1.64 / 3.03 |
+| auth-spread 1,000 | 1 | p15, main | 0.85 / 23.61 | 0.85 / 39.69 |
+| auth-spread 1,000 | 2 | main, p15 | 0.84 / 50.42 | 0.78 / 11.40 |
+| auth-spread 1,000 | 3 | p15, main | 0.76 / 7.27 | 0.77 / 3.65 |
+| auth-spread 1,000 | 4 | main, p15 | 0.79 / 39.88 | 0.76 / 6.75 |
+
+### Settlement and reconciliation (`make bench-card-recon`)
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| `Settle`, 10,000 posted lines (9,000 purchases, 1,000 refunds) | 5.2 ms | 3.8 ms | 3.5 ms |
+| `Settle` again (returns the row) | 0.19 ms | 0.20 ms | 0.20 ms |
+| `Reconcile`, 10,000 cleared authorizations + lines, all MATCHED | 65.0 ms | 54.8 ms | 55.9 ms |
+| `Reconcile` replay by run ID | 0.20 ms | 0.18 ms | 0.16 ms |
+| allocations per reconcile | 29.1 MB / 160k | 29.0 MB / 160k | 29.0 MB / 160k |
+
+`Settle` is one aggregate `INSERT … SELECT` over the date's records (file index) plus one
+two-entry ledger transaction. `Reconcile` is one Repeatable Read snapshot (records by file,
+authorizations by primary key / partial indexes, the chain's first clearing by
+`clearing_records_auth_idx`), classification in memory, and one `COPY` of the findings; a
+clean day writes none. Memory is ~2.9 KB per record + authorization, all in the snapshot.
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| auth-spread p99 at 500 and 1,000 req/s | < 100 ms | **Met**: 3.0–5.8 ms at 500, 3.7–39.7 ms at 1,000, 0 non-200 |
+| Balance drift after every step | 0 | **Met** |
+| No worse than same-session main beyond noise | | **Met on p50** (within 0.16 ms everywhere). p99 at 500: branch worse when it ran first (+54 %, +78 %), better when it ran second (−52 %, −27 %); see 1 |
+| Settle a 10,000-line day | | **3.5–5.2 ms**, rerun 0.2 ms |
+| Reconcile 10,000 cleared authorizations | | **55–65 ms**, 29 MB, replay 0.2 ms |
+
+### What the numbers say
+
+1. **Order, not code, decides the 500 req/s p99.** Whichever build runs first in a pair
+   has the worse tail: branch first 4.01 vs 2.61 and 5.83 vs 3.28; main first 7.83 vs 3.74
+   and 4.15 vs 3.03. Same pattern at 1,000 (the first run's p99 is 24–50 ms, the second's
+   4–11 ms). p50 is equal within 0.16 ms on every pairing. No approval statement changed;
+   the only schema change on the tap's table is two partial indexes whose predicates an
+   initial authorization fails. Reported per the regression rule rather than averaged away.
+2. **Reconciliation is bounded by the snapshot, not by money locks.** It takes no row
+   lock; the Repeatable Read read-only transaction holds back vacuum for ~50 ms per 10,000
+   records. At 100,000 records a day it would be ~0.6 s and ~290 MB in memory; streaming the
+   classification would cut the memory, not the time.
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two

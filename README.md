@@ -516,6 +516,62 @@ Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 14). The cost is that we credi
 network sends even past the purchase (flagged exposure, not refused), and refund matching is
 only as good as the network's `auth_id`.
 
+## Network settlement and card reconciliation (V2, phase 15)
+
+Each day we owe the network the net of what cleared: purchases minus refunds. We pay it
+once, and prove every cent three ways: our records (authorizations, holds, posted clearing
+lines), the clearing file as those records reflect it, and what we paid against the
+network's settlement statement (`GET /settlement?date=`, [contract](docs/mock-network-api.md#settlement-statement)).
+As in V1: **detect and report, never fix money automatically.**
+
+```text
+make card-settle ARGS="-date 2026-10-18"                                     pay the day, once
+make card-reconcile ARGS="-download $NETWORK_URL -date 2026-10-18 -run-id crn_1018"
+make card-reconcile ARGS="-statement settlement-2026-10-18.csv -date 2026-10-18 -run-id crn_1018"
+make card-reconcile ARGS="-list"
+make card-reconcile ARGS="-inspect crn_1018 -class LATE_CLEARING"
+```
+
+- **Pay once** ([cardsettlement.Settle](internal/cardsettlement/settle.go)): one transaction
+  inserts the `network_settlements` row first, totals computed in the same statement from
+  the date's posted clearing records; the date is the primary key, so a concurrent or
+  repeated settlement waits, inserts nothing and returns the first row. Net > 0: debit
+  `acc_network_payable_usd`, credit `acc_network_cash_usd`; net < 0 the reverse; net 0 no
+  ledger transaction. A date with no clearing file, or with deferred lines, is refused rather
+  than locked in at a wrong total
+  ([TestSettleRecordsTheDayOnce](internal/cardsettlement/settle_test.go): 20 concurrent
+  settlements → 1 row, 1 ledger transaction, payable back to 0).
+- **Reconcile** ([cardrecon.Reconcile](internal/cardrecon/run.go)): one read-only Repeatable
+  Read snapshot of the date's clearing records, the authorizations they clear (and their
+  incrementals), holds open longer than `HOLD_EXPIRY_DAYS`, holds expired that day, and the
+  recorded settlement; saved append-only (raw statement + SHA-256, counts, findings with
+  evidence), with V1's run-ID replay: same ID and bytes return the saved run, different bytes
+  are refused. MATCHED is counted, not stored.
+
+  | class | from |
+  |---|---|
+  | `CLEARED_NOT_AUTHORIZED` | flags `unauthorized_clearing`, `unknown_card` |
+  | `AUTHORIZED_NOT_CLEARED` | approved hold open longer than the expiry window, or expired that day, never cleared |
+  | `AMOUNT_MISMATCH` | `over_tolerance` |
+  | `DUPLICATE_CLEARING` | `duplicate_clearing` |
+  | `LATE_CLEARING` | `cleared_after_expiry`, `cleared_after_reversal`, `nothing_held` |
+  | `REFUND_EXCEPTION` | `refund_exceeds_purchase`, `unmatched_refund`, `card_mismatch` |
+  | `FUNDING_SHORTFALL` | a line's `shortfall`, or an authorization's `hold_shortfall` |
+  | `HOLD_AFTER_CLEARING` | a hold (advice or incremental) whose ledger transaction is later than the first posted purchase on its chain |
+  | `SETTLEMENT_MISMATCH` | statement ≠ recorded settlement, posted records ≠ recorded settlement, or nothing recorded |
+
+  ([TestEveryClassIsDetected](internal/cardrecon/recon_test.go): one corrupted day, every
+  class, ledger and balances unchanged; [TestCleanDayIsAllMatched](internal/cardrecon/recon_test.go):
+  all ten simulator scenarios end to end → 9 MATCHED + the offline purchase;
+  [TestSettlementMismatchIsDetected](internal/cardrecon/recon_test.go),
+  [TestReconRunReplayAndConflict](internal/cardrecon/recon_test.go),
+  [TestFindingsAreAppendOnly](internal/cardrecon/recon_test.go).)
+
+Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 15). The cost is two more append-only
+tables growing per day with no retention, and that findings are only as complete as the
+clearing flags and the statement: a class nobody thought of is not detected. The settlement
+pays what was posted when it ran; a line posted for that date later is reported, not paid.
+
 ## Honest V1 limits
 
 - Authentication, not tenancy/authorisation: a valid API key can operate on any account.

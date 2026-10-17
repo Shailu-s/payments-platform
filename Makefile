@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile hold-expirer clearing card-settle card-reconcile bench-reconciliation bench bench-metrics bench-http bench-balance bench-expiry bench-clearing demo-v1
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile hold-expirer clearing card-settle card-reconcile bench-reconciliation bench bench-metrics bench-http bench-balance bench-expiry bench-clearing bench-card-recon demo-v1
 
 up:
 	$(COMPOSE) up -d --wait
@@ -94,6 +94,10 @@ bench-expiry:
 
 bench-clearing:
 	@go test ./internal/clearing -run '^$$' -bench 'BenchmarkImport(Clearing|Refunds)' -benchtime=1x -count=3
+
+bench-card-recon:
+	@go test ./internal/cardsettlement -run '^$$' -bench BenchmarkSettle -benchmem -benchtime=1x -count=3
+	@go test ./internal/cardrecon -run '^$$' -bench BenchmarkCardReconcile -benchmem -benchtime=1x -count=3
 
 bench-metrics:
 	@go test ./internal/api -run '^$$' -bench 'Benchmark(HTTPMetricsObservation|MetricsScrape1000Records)' -benchmem -benchtime=1s -count=3
