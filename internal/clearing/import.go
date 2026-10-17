@@ -66,11 +66,11 @@ type Summary struct {
 
 // Import records a clearing file and posts each of its lines once.
 //
-// The same bytes again change nothing: the file is found by its hash and, if
-// every line already has a record, nothing is processed. Each line commits in
-// its own short transaction, so a crash leaves the file partly posted; running
-// it again posts the rest, because a line's clearing_id is claimed in the same
-// transaction as its money.
+// The same bytes for the same date change nothing: the file is found by its
+// date and hash and, if every line already has a record, nothing is
+// processed. Each line commits in its own short transaction, so a crash leaves
+// the file partly posted; running it again posts the rest, because a line's
+// clearing_id is claimed in the same transaction as its money.
 func Import(ctx context.Context, db DB, raw []byte, fileDate time.Time, cfg Config) (Summary, error) {
 	if cfg.OverTolerancePct < 0 {
 		return Summary{}, errors.New("over tolerance must not be negative")
@@ -122,14 +122,14 @@ func Import(ctx context.Context, db DB, raw []byte, fileDate time.Time, cfg Conf
 	return summary, nil
 }
 
-// insertFile stores the file unless its bytes are already stored, and returns
-// the stored file. A concurrent insert of the same bytes waits for the first
-// to commit and then finds it.
+// insertFile stores the file unless its bytes are already stored for its date,
+// and returns the stored file. A concurrent insert of the same file waits for
+// the first to commit and then finds it.
 func insertFile(ctx context.Context, db DB, f File, raw []byte) (File, bool, error) {
 	const insert = `
 		INSERT INTO clearing_files (id, file_date, sha256, raw, line_count)
 		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (sha256) DO NOTHING
+		ON CONFLICT (file_date, sha256) DO NOTHING
 		RETURNING ` + fileColumns
 	stored, err := scanFile(db.QueryRow(ctx, insert, f.ID, f.FileDate, f.SHA256, raw, f.LineCount))
 	if err == nil {
@@ -138,7 +138,8 @@ func insertFile(ctx context.Context, db DB, f File, raw []byte) (File, bool, err
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return File{}, false, fmt.Errorf("save clearing file: %w", err)
 	}
-	stored, err = scanFile(db.QueryRow(ctx, `SELECT `+fileColumns+` FROM clearing_files WHERE sha256 = $1`, f.SHA256))
+	stored, err = scanFile(db.QueryRow(ctx, `SELECT `+fileColumns+` FROM clearing_files
+		WHERE file_date = $1 AND sha256 = $2`, f.FileDate, f.SHA256))
 	if err != nil {
 		return File{}, false, fmt.Errorf("find clearing file %s: %w", f.SHA256, err)
 	}

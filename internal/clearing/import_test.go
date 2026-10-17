@@ -255,6 +255,32 @@ func TestOverlappingFilesPostSharedLinesOnce(t *testing.T) {
 	assertNoDrift(t)
 }
 
+// A day with nothing to clear is a header-only file, byte-identical every
+// such day: each date is still its own file.
+func TestHeaderOnlyFilesForDifferentDatesAreDistinct(t *testing.T) {
+	resetDB(t)
+	ctx := context.Background()
+	raw := fileOf()
+	first, err := Import(ctx, testPool, raw, testDate, testConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := Import(ctx, testPool, raw, testDate.AddDate(0, 0, 1), testConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Replayed || next.File.ID == first.File.ID || next.File.FileDate != "2026-10-19" {
+		t.Errorf("next day's file = %+v, want a new file for 2026-10-19 (first %s)", next.File, first.File.ID)
+	}
+	again, err := Import(ctx, testPool, raw, testDate.AddDate(0, 0, 1), testConfig)
+	if err != nil || !again.Replayed || again.File.ID != next.File.ID {
+		t.Errorf("same date again = %+v, %v, want a replay of %s", again, err, next.File.ID)
+	}
+	if got := countWhere(t, `SELECT count(*) FROM clearing_files`); got != 2 {
+		t.Errorf("files = %d, want 2", got)
+	}
+}
+
 func refund(clearingID, authID, cardID string, amount int64) Line {
 	l := purchase(clearingID, authID, cardID, amount)
 	l.Kind = KindRefund
