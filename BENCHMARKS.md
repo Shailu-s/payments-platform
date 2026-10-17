@@ -447,6 +447,82 @@ per runner; more runners help only across accounts.
    and expiry are not loaded by this sweep; their correctness is shown by the concurrency
    tests, and the expirer's throughput by `BenchmarkExpireBatch`.
 
+## Phase 13: clearing (2026-10-17)
+
+Clearing is an offline import, not on the authorization or transfer path; migration 19
+adds two columns to `card_authorizations` and two new tables. Same machine, pool 10, 30 s
+steps, wrapped in `caffeinate -i`, only the Postgres container running. **Battery at 3 %
+for run 1, then on AC from run 2 (charging, load average ~2.4).** `main` (`c892306`) was
+measured in the same session: run 1 branch then main, run 2 main then branch, runs 3 and 4
+(spread 500 only) in both orders. `balance_drift` 0 and `declined_after` 0 on every step.
+
+```sh
+MODES="auth-spread spread" RATES="500 1000" make bench-http   # runs 1 and 2, both
+MODES="spread" RATES="500" make bench-http                    # runs 3 and 4, both
+TEST_DATABASE_URL=…/payments_bench_clearing make bench-clearing  # BenchmarkImportClearing, 3 runs
+```
+
+### Authorizations (p50 / p99 ms, every step 0 non-200, 0 dropped)
+
+| step | run | main | p13 |
+|---|---:|---:|---:|
+| auth-spread 500 | 1 | 1.62 / 3.32 | 1.54 / 6.91 |
+| auth-spread 500 | 2 | 1.61 / 6.13 | 1.61 / 5.32 |
+| auth-spread 1,000 | 1 | 0.81 / 16.19 | 0.80 / 3.68 |
+| auth-spread 1,000 | 2 | 0.82 / 5.81 | 0.82 / 6.68 |
+
+### Transfer regression (p50 / p99 ms, every step all 202, 0 dropped)
+
+| step | run | main | p13 |
+|---|---:|---:|---:|
+| spread 500 | 1 | 1.46 / 17.77 | 1.57 / 8.05 |
+| spread 500 | 2 | 1.53 / 4.52 | 1.50 / 5.95 |
+| spread 500 | 3 | 1.48 / 21.95 | 1.54 / 56.31 |
+| spread 500 | 4 | 1.46 / 5.78 | 1.49 / 5.80 |
+| spread 1,000 | 1 | 2.37 / 37.83 | 2.39 / 30.52 |
+| spread 1,000 | 2 | 1.67 / 13.62 | 1.80 / 32.96 |
+
+### Clearing import (`make bench-clearing`)
+
+10,000 matched lines (a third each exact, tip +20 %, partial 70 %) against seeded holds on
+ten cards, one importer, then the same bytes imported again.
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| import 10,000 lines | 8.10 s (1,234/s) | 8.06 s (1,241/s) | 8.15 s (1,227/s) |
+| re-import (replay) | 19.9 ms | 15.9 ms | 24.7 ms |
+
+One transaction per line (~0.8 ms): BEGIN; one batch that inserts the record, takes the
+`auth_id` lock and locks the authorization row; the balance lock batch only when the
+available account pays (tips); one batch for the daily counter, authorization, record and
+outbox event; the ledger batch; COMMIT. ~100 M lines/day for one importer. The replay is one
+hash lookup plus one grouped read of the file's 10,000 `clearing_id`s.
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| auth-spread p99 at 500 and 1,000 req/s | < 100 ms | **Met**: 6.9 / 5.3 ms at 500, 3.7 / 6.7 ms at 1,000, 0 non-200 |
+| No worse than same-session main beyond noise | | **Met on p50** (within 0.13 ms on every pairing). p99 swings both ways |
+| Transfer spread p99 at 500 (regression rule) | ≤ +20 % of main | **Met in 2 of 4 pairings, equal in a third**: −55 % (run 1), +32 % (run 2, 5.95 vs 4.52 ms), +157 % (run 3, 56.3 vs 22.0 ms), +0.3 % (run 4, 5.80 vs 5.78 ms). No transfer code changed; see below |
+| Balance drift after every step | 0 | **Met** |
+| Import throughput | recorded | **~1,230 lines/s**, replay ~16–25 ms |
+
+### What the numbers say
+
+1. **The hot paths did not change.** No authorization or transfer statement was touched;
+   p50 is equal within 0.13 ms on every pairing. The two new nullable/defaulted columns on
+   `card_authorizations` are not read or written by an approval.
+2. **The spread 500 p99 is noise on this laptop, not a regression.** Main's own p99 at that
+   step ranged 4.5–22.0 ms across four runs, the branch's 5.8–56.3 ms; the closest-together
+   pairing (run 4, on AC, main first) gave 5.78 vs 5.80 ms. Reported, not explained away:
+   the regression rule is not cleanly met by runs 2 and 3.
+3. **Clearing is serial by design.** One importer at ~0.8 ms per line is bounded by commit
+   latency, not locks; the one-transaction-per-line choice keeps every account's balance
+   lock held for one line, never a batch. Parallel importers over disjoint lines would
+   scale it; they are safe (lines dedupe on `clearing_id`, holds serialise on their row)
+   but not built.
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two

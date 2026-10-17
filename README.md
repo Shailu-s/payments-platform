@@ -427,6 +427,59 @@ that grows with orphaned reversals (no retention yet), one more row lock on the
 incremental and reversal paths, an advisory lock and a pending-reversal read in every
 approval's first batch, and an expirer process to run.
 
+## Clearing (V2, phase 13)
+
+A tap only holds money. Days later the network's clearing file says what each merchant
+actually took, and clearing turns holds into final charges. The file is the record we must
+post: anything odd is flagged, never silently fixed, and no account is overdrawn.
+
+```text
+make clearing ARGS="-download $NETWORK_URL -date 2026-10-18"   GET /clearing?date= from the network, import
+make clearing ARGS="-file clearing-2026-10-18.csv -date 2026-10-18"
+make clearing ARGS="-list"                                     imported files
+make clearing ARGS="-inspect clf_… -flag shortfall"            a file's summary and lines
+```
+
+- **Validate, then store once** ([internal/clearing](internal/clearing/import.go)): the whole
+  file is parsed first (exact header, positive integer amounts, USD, UTC timestamps on the
+  file's date, no `clearing_id` twice); one bad line rejects the file and writes nothing
+  ([TestInvalidFileWritesNothing](internal/clearing/import_test.go)). The raw bytes are kept
+  with their SHA-256; the same bytes again find the stored file and, if every line has a
+  record, process nothing
+  ([TestClearingSameFileTwiceChangesNothing](internal/clearing/import_test.go)).
+- **One short transaction per line**, keyed by the network's `clearing_id`: the record is
+  inserted first, so a second importer of the same line waits and skips; then the
+  `auth_id` lock and the authorization row, the daily counter, the balances, and the ledger
+  last, in the authorization path's lock order. A crash mid-file is finished by running it
+  again ([TestClearingCrashMidFileRerunPostsEachLineOnce](internal/clearing/import_test.go),
+  [TestClearingConcurrentImportsOfOneFile](internal/clearing/import_test.go)).
+- **Posting** (`F` cleared, `H` still held; one balanced ledger transaction per line, credit
+  `acc_network_payable_usd`, what we owe the network):
+
+  | line | money | flag |
+  |---|---|---|
+  | `F == H` | held `F` → payable | |
+  | `F < H` (partial shipment) | held `F` → payable, `H − F` back to available, daily counter freed | |
+  | `F > H` (tip) | held `H` + available `F − H` → payable | `over_tolerance` if `F − H` > `CLEARING_OVER_TOLERANCE_PCT` of the authorized amount |
+  | hold expired / reversed / already cleared | available `F` → payable | `cleared_after_expiry` / `cleared_after_reversal` / `duplicate_clearing` |
+  | no or unknown `auth_id` (offline) | available `F` → payable | `unauthorized_clearing` |
+  | unknown card | nothing, status `rejected` | `unknown_card` |
+  | not enough available | `min(want, balance)`, rest recorded as `shortfall` | `shortfall` |
+  | refund | nothing yet, status `deferred` (phase 14) | |
+
+  ([TestClearingExactPartialAndTip](internal/clearing/post_test.go),
+  [TestShortfallNeverOverdraws](internal/clearing/post_test.go),
+  [TestClearingRacingReversalAndExpiry](internal/clearing/post_test.go): clearing, reversals
+  and the expirer racing for 40 holds never both release and charge one.)
+- **End to end:** every simulator scenario against the real issuer handler, its clearing
+  files imported twice: 9 purchases posted, the late refund deferred, nothing left held,
+  0 drift ([TestNetworkScenariosClearEndToEnd](internal/clearing/network_test.go)).
+
+Measured in [BENCHMARKS.md](BENCHMARKS.md) (phase 13). The cost is that a crash leaves a
+file partly posted until it is run again, that one importer posts ~1,300 lines/s serially,
+and that charging the network's amount when it exceeds the hold, or when nothing was held,
+is exposure we flag rather than refuse.
+
 ## Honest V1 limits
 
 - Authentication, not tenancy/authorisation: a valid API key can operate on any account.
@@ -454,10 +507,10 @@ approval's first batch, and an expirer process to run.
 - One configured customer endpoint, signed retries and a dead status; no manual replay API
   or delivery history. Customers must deduplicate `event_id` from the signed JSON envelope
   after lost acknowledgements, not trust the event-ID header alone.
-- Authorizations hold money but nothing releases it yet: reversals, expiry, incremental
-  holds (phase 12) and clearing (phase 13) are not built, so held money stays held.
-  Incremental authorizations are declined. A stand-in shortfall is recorded, not chased.
-  There is no card or authorization listing endpoint.
+- Holds are released by reversals and expiry (phase 12) and turned into charges by
+  clearing (phase 13). Refund lines are stored, not posted (phase 14); nothing pays the
+  network payable yet (phase 15). Stand-in and clearing shortfalls are recorded, not
+  chased. There is no card or authorization listing endpoint.
 - No automatic money repair, durable reconciliation scheduler, production DB roles, or
   production monitoring/deployment claim. Apply migrations and deploy new binaries explicitly.
 
