@@ -49,7 +49,11 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    command: /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic transfers --partitions 3
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic transfers --partitions 3 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic cards --partitions 3
 
 volumes:
   payments-pgdata:

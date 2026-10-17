@@ -203,6 +203,26 @@ func fingerprintCardRequest(apiKeyID string, req issueCardRequest) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// handleCardTransition answers 200 with the card whether it changed or was
+// already in the target state, so a retried freeze is not an error.
+func (s *Server) handleCardTransition(action cards.Action) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		card, err := cards.Transition(r.Context(), s.db, id, action)
+		switch {
+		case errors.Is(err, cards.ErrNotFound):
+			writeError(w, http.StatusNotFound, CodeNotFound, "no such card: "+id)
+		case errors.Is(err, cards.ErrInvalidState):
+			writeError(w, http.StatusConflict, CodeInvalidCardState,
+				fmt.Sprintf("card %s is %s and cannot %s", id, card.Status, action.Name))
+		case err != nil:
+			writeInternalError(w, r, err)
+		default:
+			writeJSON(w, http.StatusOK, toCardResponse(card))
+		}
+	}
+}
+
 func (s *Server) handleGetCard(w http.ResponseWriter, r *http.Request) {
 	card, err := cards.Get(r.Context(), s.db, r.PathValue("id"))
 	if errors.Is(err, cards.ErrNotFound) {

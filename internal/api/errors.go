@@ -31,6 +31,10 @@ const (
 	CodeNotImplemented    = "not_implemented"
 	CodeInternal          = "internal_error"
 
+	// CodeInvalidCardState means the card's status forbids the change, such
+	// as unfreezing a closed card. Retrying cannot succeed.
+	CodeInvalidCardState = "invalid_card_state"
+
 	// CodeAccountBusy is a refusal under load; the same request can be retried.
 	CodeAccountBusy = "account_busy"
 	// CodeRequestTimeout means the request ran out of time before an answer.
