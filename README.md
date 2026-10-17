@@ -303,6 +303,37 @@ POST /v1/cards/{id}/close      active | frozen -> closed (terminal)
 The cost is one extra account and balance row per funding account, and card idempotency
 keys kept forever, as for transfers.
 
+## Card network simulator (V2, phase 10)
+
+We are the card issuer; the card network decides our inputs. `mock-network` plays that
+network, the way MockBank plays the bank, and is written to a contract:
+[docs/mock-network-api.md](docs/mock-network-api.md). No issuer endpoint exists yet
+(phase 11); the tests use a fake issuer.
+
+- It sends signed authorizations, reversals and advices to `ISSUER_URL`
+  (`X-Network-Timestamp` / `X-Network-Signature`, the MockBank HMAC scheme with
+  `NETWORK_SECRET`).
+- **Deadline, retry, stand-in:** no answer within `NETWORK_AUTH_DEADLINE` → one retry with
+  the same `auth_id`; still none → the network approves up to `NETWORK_STANDIN_LIMIT` on its
+  own and later sends an advice the issuer must honour.
+- Reversals and advices are retried on any non-2xx (1s … 16s, six attempts).
+- Ten seeded scenarios (`POST /sandbox/scenarios`): approve and clear, tip, partial clear,
+  duplicate, timeout then retry, stand-in, reversal before its authorization, incremental,
+  offline purchase, late refund. **Same seed, same bytes**
+  ([TestSameSeedSameBytes](internal/cardnetwork/scenario_test.go)).
+- The clearing file (`GET /clearing?date=YYYY-MM-DD`, or `-clearing-dir` on the
+  `scenario` subcommand) is built from the network's own journal: tips and partial amounts,
+  reversed authorizations absent, offline lines with an empty `auth_id`, refunds weeks later.
+
+```sh
+make mock-network                                                        # serve on NETWORK_ADDR
+make mock-network ARGS="scenario -name stand_in -card card_x -amount 5000 -seed 3 -clearing-dir /tmp/clearing"
+```
+
+`internal/cardnetwork` is a library so later phases drive it in-process with a fake clock.
+The cost is the MockBank credibility gap again (we wrote both sides, so only the failure
+modes we thought of are tested) and an in-memory journal that a restart loses.
+
 ## Honest V1 limits
 
 - Authentication, not tenancy/authorisation: a valid API key can operate on any account.

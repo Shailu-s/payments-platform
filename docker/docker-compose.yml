@@ -34,6 +34,29 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  mock-network:
+    build:
+      context: ..
+      dockerfile: docker/mock-network.Dockerfile
+    container_name: payments-mock-network
+    # Opt-in until phase 11 adds the issuer endpoints it calls:
+    # docker compose -f docker/docker-compose.yml --profile network up -d mock-network
+    profiles: ["network"]
+    environment:
+      NETWORK_ADDR: ":8082"
+      # The issuer is the API, which runs on the host.
+      ISSUER_URL: "http://host.docker.internal:8080"
+      # Not `:?`: that would break `make up` for everyone without the secret. The
+      # binary refuses to start without it instead.
+      NETWORK_SECRET: "${NETWORK_SECRET:-}"
+      NETWORK_AUTH_DEADLINE: "2s"
+      NETWORK_STANDIN_LIMIT: "10000"
+      NETWORK_SEED: "1"
+    ports:
+      - "8082:8082"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   kafka:
     image: apache/kafka:3.8.0
     container_name: payments-kafka
