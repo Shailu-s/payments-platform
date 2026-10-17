@@ -15,7 +15,7 @@ method, the rules and the session LOG stay in PLAN.md.
 | 9 cards | in review | #11 | 20 concurrent first cards -> 1 held account, 0 orphans; 20 same-key issues -> 1 card; freeze racing close never reopens a closed card |
 | 10 network simulator | in review | #12 | 10 seeded scenarios, same seed -> byte-identical messages and clearing file; stand-in after two deadlines, advices/reversals retried six times then given up |
 | 11 authorization | in review | #13 | 20 concurrent $30 taps on $50 -> 1 approved, 19 insufficient_funds; 20 duplicates of one auth_id -> 1 row, 1 hold; auth-spread p99 3.2 ms at 500/s, 34-57 ms at 1,000/s |
-| 12 reversals, expiry, incremental holds | not started | | |
+| 12 reversals, expiry, incremental holds | in review | #14 | 20 copies of one reversal -> 1 release; 10 x $20 reversals on a $50 hold -> $50 released; reversal racing its authorization (20 pairs) -> 0 stuck (1 stuck without the auth_id lock); 20 concurrent increments under a $100 chain limit -> exactly 8; expiry 1,400 holds/s |
 | 13 clearing | not started | | |
 | 14 refunds | not started | | |
 | 15 network settlement and reconciliation | not started | | |
@@ -261,3 +261,17 @@ the rest as `hold_shortfall`. Held accounts are refused as transfer endpoints. P
 `TestSameAuthIDAlwaysGetsTheSameAnswer`, `TestTwoTapsAtOnceCannotOverspend`,
 `TestConcurrentTapsRespectTheDailyLimit`, `TestStandInAdviceIsHonoured`,
 `TestNetworkScenariosAgainstTheIssuer`. Number: see BENCHMARKS.md phase 11.
+
+**2026-10-17 — Phase 12, reversals, expiry and incremental holds (PR #14, in review).**
+Migration 18 adds `held_amount` / `released_amount` / `expired_at` to `card_authorizations`
+(backfilled) and `pending_reversals`. One release primitive, `holds.Release`: row lock,
+`min(amount, held_amount)`, daily counter given back, event, ledger `held -> available`
+last. `POST /network/reversals` deduplicates on `reversal_id`; a reversal with nothing to
+release yet is parked and applied by the approval or advice in the hold's transaction,
+serialised with it by a per-`auth_id` advisory lock. `cmd/hold-expirer` expires one hold per
+short `SKIP LOCKED` transaction. Incremental authorizations lock the original and hold the
+chain total on it. Proof: `TestReversalReleasesTheHoldOnce`,
+`TestDifferentReversalsNeverReleaseMoreThanHeld`,
+`TestReversalBeforeAuthorizationIsAppliedOnArrival`, `TestReversalRacingExpiryReleasesOnce`,
+`TestExpiryReleasesOldHoldsOnce`, `TestConcurrentIncrementalsRespectFundsAndLimits`. Number:
+see BENCHMARKS.md phase 12.

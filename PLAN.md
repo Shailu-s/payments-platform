@@ -1163,3 +1163,31 @@ answered/s with 0.3 % fast 503s; 0 drift. Missed: transfer spread p99 at 500 is 
 over main in three alternating runs (+16–37 %), not isolated. Tests ran against a
 disposable `payments_test_p11` database, benchmarks against `payments_bench_p11`; both
 dropped.
+
+**2026-10-17 — Phase 12 (reversals, expiry, incremental holds) built on `phase-12-holds`; PR
+open, not merged.** Executor followed `briefs/phase-12-reversals-expiry-incremental.md`.
+Migration 18: `held_amount` / `released_amount` / `expired_at` (backfilled from
+`approved_amount - hold_shortfall`), partial index of open holds, `pending_reversals`. Phase
+11 writers set `held_amount` (approval, stand-in). `internal/holds.Release` is the only
+release path: row `FOR UPDATE`, `min(amount, held_amount)`, daily counter for the
+authorization's UTC day floored at 0, outbox event, ledger `held -> available` last. `POST
+/network/reversals`: signature, `network_messages` dedupe, release on the holder (the
+initial row for an incremental `auth_id`), else park. Approvals and advices apply parked
+reversals after the hold in the same transaction. Incremental: insert-first, lock the
+original, decline (`original_not_found` / `original_not_approved` / `original_expired` /
+`card_mismatch` / chain over `per_transaction_limit`) by rolling back and storing the
+decline in a second statement, else raise the original and hold the increase. Deviations:
+(1) a transaction-scoped advisory lock on `auth_id`, taken first by approvals, advices and
+reversals, because without it a reversal racing its authorization was lost (1 in 20 pairs,
+`TestReversalBeforeAuthorizationIsAppliedOnArrival/racing`); (2) a reversal of a declined
+authorization is parked, not dropped, since a later stand-in advice can approve it;
+(3) `ExpireBatch` claims and releases one hold per transaction (`LIMIT 1 FOR UPDATE SKIP
+LOCKED`) instead of locking the batch in one transaction, which would hold a hot account's
+balance lock across the batch and could deadlock with a reversal on another day's counter
+row; (4) `incremental_not_supported` removed. Failing first: held_amount 0 before the
+writers; release without `FOR UPDATE` hit the CHECK; reversals 404 before the route; no
+advisory lock lost a reversal; incrementals declined `incremental_not_supported`; without
+the original's row lock 11 increments passed an 8-increment chain limit. Benchmarks (battery
+13 → 9 %): auth-spread p99 2.7–15.6 ms at 500, 4.2–10.5 ms at 1,000, 0 non-200; spread p99
+at 500 within the rule; expiry 1,400 holds/s; 0 drift. Tests ran in per-package schemas on
+the default database; benchmarks against `payments_bench` (dropped).

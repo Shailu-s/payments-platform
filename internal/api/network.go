@@ -13,6 +13,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/authorizations"
 	"github.com/Shailu-s/payments-platform/internal/cardnetwork"
 	"github.com/Shailu-s/payments-platform/internal/cards"
+	"github.com/Shailu-s/payments-platform/internal/holds"
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 	"github.com/Shailu-s/payments-platform/internal/outbox"
 	"github.com/jackc/pgx/v5"
@@ -172,10 +173,17 @@ func (s *Server) authorize(ctx context.Context, req authorizations.Request) (aut
 		a.LedgerTxnID = &txnID
 	}
 
-	err = s.insertAuthorization(ctx, &a, card)
+	if reason == "" && a.Kind == authorizations.KindIncremental {
+		err = s.insertIncremental(ctx, &a, card)
+	} else {
+		err = s.insertAuthorization(ctx, &a, card)
+	}
+	var declined incrementalDeclined
 	switch {
 	case err == nil:
 		return a, nil
+	case errors.As(err, &declined):
+		return s.declineAuthorization(ctx, a, string(declined))
 	case errors.Is(err, authorizations.ErrDuplicate):
 		return s.replayAuthorization(ctx, a)
 	case errors.Is(err, authorizations.ErrDailyLimit):
@@ -189,13 +197,16 @@ func (s *Server) authorize(ctx context.Context, req authorizations.Request) (aut
 }
 
 // insertAuthorization writes the authorization, its outbox event and, if
-// approved, the daily spend and the hold, in one transaction.
+// approved, the daily spend and the hold, in one transaction. An approval
+// then applies any reversal that arrived before it.
 //
 // The order mirrors insertTransfer. The row goes first, so the primary key
 // picks one winner among duplicates before anything else happens. Then the
 // card's daily counter, then the hold, whose balance update takes the lock
 // that serialises spending from the account: each lock is taken as late as
-// possible and all are held only until commit.
+// possible and all are held only until commit. An approval takes the auth_id
+// lock before the row, so a racing reversal is either seen parked here or
+// sees this row.
 func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Authorization, card *cards.Card) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -210,6 +221,10 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 	approved := a.Decision == authorizations.DecisionApproved
 
 	batch := &pgx.Batch{}
+	var pending []holds.Pending
+	if approved {
+		holds.QueueLockAuthID(batch, a.AuthID)
+	}
 	authorizations.QueueInsert(batch, a)
 	// After the insert, like transfers: a duplicate may wait for the original
 	// to finish; every wait after that is bounded.
@@ -225,6 +240,7 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 	})
 	if approved {
 		authorizations.QueueDailySpend(batch, a.CardID, a.Amount, card.DailyLimit)
+		holds.QueuePending(batch, a.AuthID, &pending)
 	}
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return err
@@ -239,10 +255,91 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 		}); err != nil {
 			return err
 		}
+		// The network decided the order: the answer stays approved, and the
+		// ledger shows the hold, then its release.
+		if err := holds.ApplyPending(ctx, tx, a.AuthID, pending); err != nil {
+			return err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit authorization %s: %w", a.AuthID, err)
+	}
+	return nil
+}
+
+// incrementalDeclined is why an incremental authorization's original
+// refuses it; the transaction that found out rolls back.
+type incrementalDeclined string
+
+func (r incrementalDeclined) Error() string { return "incremental declined: " + string(r) }
+
+// insertIncremental raises an approved initial authorization by a.Amount:
+// a's own row records the increase and holds nothing, the original's row
+// holds the chain's total, and the ledger moves the increase to held, last.
+//
+// The original's row lock serialises increments of one chain, so its total is
+// checked against the per-transaction limit with no read-then-write window,
+// and a reversal or the expirer releasing it waits for, or is waited on by,
+// the increment. Lock order is the authorization path's: auth_id lock, own
+// row, original row, daily spend, balances.
+func (s *Server) insertIncremental(ctx context.Context, a *authorizations.Authorization, card *cards.Card) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin incremental %s: %w", a.AuthID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	var pending []holds.Pending
+	batch := &pgx.Batch{}
+	holds.QueueLockAuthID(batch, a.AuthID)
+	authorizations.QueueInsert(batch, a)
+	batch.Queue(setSpendingLockTimeout)
+	holds.QueuePending(batch, a.AuthID, &pending)
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return err
+	}
+
+	var original *authorizations.Authorization
+	found, err := authorizations.GetForUpdate(ctx, tx, *a.OriginalAuthID)
+	switch {
+	case err == nil:
+		original = &found
+	case !errors.Is(err, authorizations.ErrNotFound):
+		return err
+	}
+	if reason := authorizations.IncrementalDecline(original, *a, *card); reason != "" {
+		return incrementalDeclined(reason)
+	}
+
+	payload, err := authorizations.EventPayload(*a)
+	if err != nil {
+		return err
+	}
+	batch = &pgx.Batch{}
+	outbox.Queue(batch, outbox.Event{
+		ID:          newID("evt"),
+		AggregateID: a.AuthID,
+		EventType:   authorizations.EventApproved,
+		Topic:       authorizations.Topic,
+		Payload:     payload,
+	})
+	authorizations.QueueRaise(batch, original.AuthID, a.Amount)
+	authorizations.QueueDailySpend(batch, a.CardID, a.Amount, card.DailyLimit)
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return err
+	}
+	if err := ledger.RecordWithID(ctx, tx, *a.LedgerTxnID, "authorization "+a.AuthID, []ledger.Entry{
+		{AccountID: card.AccountID, Direction: ledger.DirectionDebit, Amount: a.Amount},
+		{AccountID: card.HeldAccountID, Direction: ledger.DirectionCredit, Amount: a.Amount},
+	}); err != nil {
+		return err
+	}
+	if err := holds.ApplyPending(ctx, tx, original.AuthID, pending); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit incremental %s: %w", a.AuthID, err)
 	}
 	return nil
 }
@@ -252,6 +349,7 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 // have stored a row meanwhile; that row is the answer for both.
 func (s *Server) declineAuthorization(ctx context.Context, a authorizations.Authorization, reason string) (authorizations.Authorization, error) {
 	a.Decision, a.ApprovedAmount, a.DeclineReason, a.LedgerTxnID = authorizations.DecisionDeclined, 0, &reason, nil
+	a.HeldAmount = 0
 	stored, inserted, err := authorizations.InsertIfAbsent(ctx, s.db, a, newID("evt"), authorizations.EventDeclined)
 	if err != nil {
 		return authorizations.Authorization{}, err
@@ -367,7 +465,11 @@ func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, er
 	}
 	defer tx.Rollback(ctx)
 
-	first, err := authorizations.RecordAdvice(ctx, tx, msg.AdviceID, msg.AuthID)
+	// Before any row lock, as everywhere: see holds.LockAuthID.
+	if err := holds.LockAuthID(ctx, tx, msg.AuthID); err != nil {
+		return "", err
+	}
+	first, err := authorizations.RecordMessage(ctx, tx, msg.AdviceID, authorizations.MessageAdvice, msg.AuthID)
 	if err != nil {
 		return "", err
 	}
@@ -388,7 +490,7 @@ func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, er
 		MCC:          msg.Merchant.MCC,
 		Kind:         authorizations.KindInitial,
 	}, "")
-	claim.StandIn = true
+	claim.StandIn, claim.HeldAmount = true, 0
 	stored, inserted, err := authorizations.ClaimForAdvice(ctx, tx, claim)
 	if err != nil {
 		return "", err
@@ -404,6 +506,9 @@ func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, er
 		}
 		if err = s.placeStandInHold(ctx, tx, &stored, card); err == nil {
 			a, err = authorizations.ApproveStandIn(ctx, tx, stored)
+		}
+		if err == nil {
+			err = s.applyPendingReversals(ctx, tx, a.AuthID)
 		}
 	}
 	if err != nil {

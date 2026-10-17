@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -10,11 +11,9 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/cardnetwork"
 )
 
-// The simulator is the counterparty: it signs, enforces its deadline, retries,
-// stands in and advises exactly as the contract says, against the real handler.
-// Afterwards the network's record and ours must tell the same story.
-func TestNetworkScenariosAgainstTheIssuer(t *testing.T) {
-	h, apiKey := newTestServer(t)
+// newTestNetwork is the simulator pointed at h.
+func newTestNetwork(t *testing.T, h http.Handler) *cardnetwork.Network {
+	t.Helper()
 	issuer := httptest.NewServer(h)
 	t.Cleanup(issuer.Close)
 
@@ -30,6 +29,15 @@ func TestNetworkScenariosAgainstTheIssuer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return network
+}
+
+// The simulator is the counterparty: it signs, enforces its deadline, retries,
+// stands in and advises exactly as the contract says, against the real handler.
+// Afterwards the network's record and ours must tell the same story.
+func TestNetworkScenariosAgainstTheIssuer(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	network := newTestNetwork(t, h)
 
 	c := newCard(t, h, apiKey, 100_000, 50_000, 200_000)
 	cases := []struct {
@@ -88,8 +96,40 @@ func TestNetworkScenariosAgainstTheIssuer(t *testing.T) {
 			}
 		})
 	}
-	if got := holds(t); got != len(cases) {
+	if got := holdCount(t); got != len(cases) {
 		t.Errorf("holds = %d, want %d", got, len(cases))
+	}
+	assertNoDrift(t)
+}
+
+// The network sends a full reversal, then the authorization it cancels: it
+// clears nothing, so we must end up holding nothing.
+func TestReversalBeforeAuthScenario(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	network := newTestNetwork(t, h)
+	c := newCard(t, h, apiKey, 100_000, 50_000, 200_000)
+
+	seed := uint64(200)
+	result, err := network.RunScenario(context.Background(), cardnetwork.ScenarioRequest{
+		Scenario: cardnetwork.ScenarioReversalBeforeAuth, CardID: c.card.ID, Amount: 2500, Seed: &seed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Authorizations) != 1 || result.Authorizations[0].Decision != cardnetwork.DecisionApproved {
+		t.Fatalf("authorizations = %+v, want one approved", result.Authorizations)
+	}
+	for _, e := range result.Journal {
+		if e.Message == cardnetwork.MessageReversal && e.Outcome != cardnetwork.OutcomeAcknowledged {
+			t.Errorf("reversal attempt %d: %s", e.Attempt, e.Outcome)
+		}
+	}
+	if got := heldOn(t, result.Authorizations[0].AuthID); got != 0 {
+		t.Errorf("held_amount = %d, want 0", got)
+	}
+	if storedBalance(t, c.funding) != 100_000 || storedBalance(t, c.card.HeldAccountID) != 0 {
+		t.Errorf("available %d, held %d, want 100000 and 0",
+			storedBalance(t, c.funding), storedBalance(t, c.card.HeldAccountID))
 	}
 	assertNoDrift(t)
 }

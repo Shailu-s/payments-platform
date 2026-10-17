@@ -36,6 +36,8 @@ type tap struct {
 	amount         int64
 	currency, mcc  string
 	kind           string
+	// original is the incremental's original_auth_id; auth_original if empty.
+	original string
 }
 
 func (tp tap) body() string {
@@ -51,7 +53,11 @@ func (tp tap) body() string {
 	}
 	original := ""
 	if kind == "incremental" {
-		original = `,"original_auth_id":"auth_original"`
+		id := tp.original
+		if id == "" {
+			id = "auth_original"
+		}
+		original = fmt.Sprintf(`,"original_auth_id":%q`, id)
 	}
 	return fmt.Sprintf(`{"auth_id":%q,"card_id":%q,"amount":%d,"currency":%q,`+
 		`"merchant":{"id":"mer_coffee","name":"Corner Coffee","mcc":%q},"kind":%q%s,"sent_at":"2026-10-17T10:00:00Z"}`,
@@ -138,7 +144,7 @@ func countWhere(t *testing.T, q string, args ...any) int {
 	return n
 }
 
-func holds(t *testing.T) int {
+func holdCount(t *testing.T) int {
 	t.Helper()
 	return countWhere(t, `SELECT count(*) FROM ledger_transactions WHERE reference LIKE 'authorization %'`)
 }
@@ -229,7 +235,7 @@ func TestSameAuthIDAlwaysGetsTheSameAnswer(t *testing.T) {
 			if tc.want.Decision == "approved" {
 				wantHolds = 1
 			}
-			if got := holds(t); got != wantHolds {
+			if got := holdCount(t); got != wantHolds {
 				t.Errorf("holds = %d, want %d", got, wantHolds)
 			}
 			if got := storedBalance(t, c.card.HeldAccountID); got != tc.want.ApprovedAmount {
@@ -324,7 +330,7 @@ func TestRuleDeclinesMoveNoMoney(t *testing.T) {
 		{"currency", tap{cardID: active.card.ID, amount: 100, currency: "EUR"}, "invalid_currency"},
 		{"per-transaction limit", tap{cardID: active.card.ID, amount: 5001}, "exceeds_transaction_limit"},
 		{"blocked mcc", tap{cardID: active.card.ID, amount: 100, mcc: "7995"}, "merchant_blocked"},
-		{"incremental", tap{cardID: active.card.ID, amount: 100, kind: "incremental"}, "incremental_not_supported"},
+		{"incremental of nothing", tap{cardID: active.card.ID, amount: 100, kind: "incremental"}, "original_not_found"},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -343,7 +349,7 @@ func TestRuleDeclinesMoveNoMoney(t *testing.T) {
 	if got := countRows(t, "card_authorizations"); got != len(cases) {
 		t.Errorf("authorizations = %d, want %d: declines are stored too", got, len(cases))
 	}
-	if got := holds(t); got != 0 {
+	if got := holdCount(t); got != 0 {
 		t.Errorf("holds = %d, want 0", got)
 	}
 	if got := countRows(t, "card_daily_spend"); got != 0 {
@@ -378,7 +384,7 @@ func TestUnsignedOrTamperedNetworkRequestsAreRejected(t *testing.T) {
 		{"stale timestamp", stale, sign(testNetworkSecret, stale, body), body},
 		{"mockbank headers", now, "", body},
 	}
-	for _, path := range []string{cardnetwork.PathAuthorizations, cardnetwork.PathAdvices} {
+	for _, path := range []string{cardnetwork.PathAuthorizations, cardnetwork.PathAdvices, cardnetwork.PathReversals} {
 		for _, tc := range cases {
 			t.Run(path+" "+tc.name, func(t *testing.T) {
 				req := httptest.NewRequest("POST", path, strings.NewReader(tc.body))
@@ -581,7 +587,7 @@ func TestStandInAdviceIsHonoured(t *testing.T) {
 		if a := loadAuth(t, "auth_late"); a.decision != "approved" || !a.standIn {
 			t.Errorf("stored = %+v, want approved, marked stand-in", a)
 		}
-		if got := holds(t); got != 1 {
+		if got := holdCount(t); got != 1 {
 			t.Errorf("holds = %d, want 1: the approval already held it", got)
 		}
 		if got := storedBalance(t, c.card.HeldAccountID); got != 2000 {
@@ -624,7 +630,7 @@ func TestStandInAdviceIsHonoured(t *testing.T) {
 		if processed != 1 {
 			t.Errorf("processed %d times, want 1", processed)
 		}
-		if got := holds(t); got != 1 {
+		if got := holdCount(t); got != 1 {
 			t.Errorf("holds = %d, want 1", got)
 		}
 		if got := storedBalance(t, c.card.HeldAccountID); got != 2500 {
@@ -664,8 +670,47 @@ func TestStandInAdviceIsHonoured(t *testing.T) {
 		if a := loadAuth(t, "auth_ghost"); a.decision != "approved" || a.shortfall != 1500 || a.hasLedgerTxn {
 			t.Errorf("stored = %+v, want approved with the whole amount short", a)
 		}
-		if got := holds(t); got != 0 {
+		if got := holdCount(t); got != 0 {
 			t.Errorf("holds = %d, want 0", got)
 		}
 	})
+}
+
+func heldOn(t *testing.T, authID string) int64 {
+	t.Helper()
+	var held int64
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT held_amount FROM card_authorizations WHERE auth_id = $1`, authID).Scan(&held); err != nil {
+		t.Fatalf("held_amount of %s: %v", authID, err)
+	}
+	return held
+}
+
+// held_amount is what a release may give back, so it must equal what the
+// ledger actually moved into held for every way a hold is placed.
+func TestHeldAmountTracksThePlacedHold(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	c := newCard(t, h, apiKey, 6000, 5000, 20000)
+
+	authorizeTap(t, h, tap{authID: "auth_held", cardID: c.card.ID, amount: 3000})
+	authorizeTap(t, h, tap{authID: "auth_too_big", cardID: c.card.ID, amount: 5001})
+	advise(t, h, "adv_short_held", "auth_short_held", c.card.ID, 5000)
+
+	for _, tc := range []struct {
+		authID string
+		want   int64
+	}{
+		{"auth_held", 3000},
+		{"auth_too_big", 0},
+		// 3000 left in available: the rest is shortfall, not held.
+		{"auth_short_held", 3000},
+	} {
+		if got := heldOn(t, tc.authID); got != tc.want {
+			t.Errorf("%s held_amount = %d, want %d", tc.authID, got, tc.want)
+		}
+	}
+	if got := storedBalance(t, c.card.HeldAccountID); got != 6000 {
+		t.Errorf("held account = %d, want 6000: the sum of held_amount", got)
+	}
+	assertNoDrift(t)
 }

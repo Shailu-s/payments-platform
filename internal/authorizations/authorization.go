@@ -36,9 +36,14 @@ const (
 	ReasonInvalidCurrency         = "invalid_currency"
 	ReasonExceedsTransactionLimit = "exceeds_transaction_limit"
 	ReasonMerchantBlocked         = "merchant_blocked"
-	ReasonIncrementalNotSupported = "incremental_not_supported"
 	ReasonDailyLimitExceeded      = "daily_limit_exceeded"
 	ReasonInsufficientFunds       = "insufficient_funds"
+
+	// Incremental authorizations only.
+	ReasonOriginalNotFound    = "original_not_found"
+	ReasonOriginalNotApproved = "original_not_approved"
+	ReasonOriginalExpired     = "original_expired"
+	ReasonCardMismatch        = "card_mismatch"
 
 	EventApproved = "card.authorization.approved"
 	EventDeclined = "card.authorization.declined"
@@ -84,8 +89,13 @@ type Authorization struct {
 	HoldShortfall      int64
 	LedgerTxnID        *string
 	RequestFingerprint string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// HeldAmount is the money this row still holds: the whole chain's on an
+	// initial authorization, always 0 on an incremental one.
+	HeldAmount     int64
+	ReleasedAmount int64
+	ExpiredAt      *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Querier lets reads and single statements share the caller's transaction.
@@ -95,7 +105,9 @@ type Querier interface {
 
 // RuleDecline returns why the card's own rules refuse r, or "" if they allow
 // it. It moves no money and reads nothing: card is nil for an unknown card.
-// Funds and the daily limit are decided by the database, not here.
+// Funds and the daily limit are decided by the database, not here, and so is
+// an incremental's per-transaction limit, which applies to the chain's total:
+// see IncrementalDecline.
 func RuleDecline(card *cards.Card, r Request) string {
 	switch {
 	case card == nil:
@@ -104,14 +116,43 @@ func RuleDecline(card *cards.Card, r Request) string {
 		return ReasonCardInactive
 	case r.Currency != Currency:
 		return ReasonInvalidCurrency
-	case r.Amount > card.PerTransactionLimit:
+	case r.Kind == KindInitial && r.Amount > card.PerTransactionLimit:
 		return ReasonExceedsTransactionLimit
 	case slices.Contains(card.BlockedMCCs, r.MCC):
 		return ReasonMerchantBlocked
-	case r.Kind == KindIncremental:
-		return ReasonIncrementalNotSupported
+	case r.Kind == KindIncremental && (r.OriginalAuthID == "" || r.OriginalAuthID == r.AuthID):
+		return ReasonOriginalNotFound
 	}
 	return ""
+}
+
+// IncrementalDecline returns why inc may not raise original, or "" if it may.
+// original is nil if there is no such authorization; the caller holds its row
+// lock, so the answer holds until commit.
+func IncrementalDecline(original *Authorization, inc Authorization, card cards.Card) string {
+	switch {
+	case original == nil || original.Kind != KindInitial:
+		return ReasonOriginalNotFound
+	case original.CardID != inc.CardID:
+		return ReasonCardMismatch
+	case original.Decision != DecisionApproved:
+		return ReasonOriginalNotApproved
+	case original.ExpiredAt != nil || (original.HeldAmount == 0 && original.ReleasedAmount > 0):
+		return ReasonOriginalExpired
+	// Written as a subtraction so a huge increase cannot overflow the sum.
+	case inc.Amount > card.PerTransactionLimit-original.ApprovedAmount:
+		return ReasonExceedsTransactionLimit
+	}
+	return ""
+}
+
+// QueueRaise adds the increase to original's approved and held amounts.
+func QueueRaise(batch *pgx.Batch, originalAuthID string, increase int64) {
+	const q = `
+		UPDATE card_authorizations
+		SET approved_amount = approved_amount + $2, held_amount = held_amount + $2, updated_at = now()
+		WHERE auth_id = $1`
+	batch.Queue(q, originalAuthID, increase)
 }
 
 // New is the row for r: approved in full, or declined with reason.
@@ -135,8 +176,11 @@ func New(card *cards.Card, r Request, reason string) Authorization {
 	if r.OriginalAuthID != "" {
 		a.OriginalAuthID = &r.OriginalAuthID
 	}
-	if reason != "" {
+	switch {
+	case reason != "":
 		a.Decision, a.ApprovedAmount, a.DeclineReason = DecisionDeclined, 0, &reason
+	case r.Kind == KindInitial:
+		a.HeldAmount = r.Amount
 	}
 	return a
 }
@@ -154,20 +198,20 @@ func Fingerprint(r Request) string {
 const columns = `auth_id, card_id, account_id, held_account_id, amount, currency,
 	merchant_id, merchant_name, mcc, kind, original_auth_id, decision, approved_amount,
 	decline_reason, stand_in, hold_shortfall, ledger_txn_id, request_fingerprint,
-	created_at, updated_at`
+	held_amount, released_amount, expired_at, created_at, updated_at`
 
 const insertSQL = `
 	INSERT INTO card_authorizations (auth_id, card_id, account_id, held_account_id, amount,
 		currency, merchant_id, merchant_name, mcc, kind, original_auth_id, decision,
 		approved_amount, decline_reason, stand_in, hold_shortfall, ledger_txn_id,
-		request_fingerprint)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
+		request_fingerprint, held_amount)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
 func insertArgs(a Authorization) []any {
 	return []any{a.AuthID, a.CardID, a.AccountID, a.HeldAccountID, a.Amount, a.Currency,
 		a.MerchantID, a.MerchantName, a.MCC, a.Kind, a.OriginalAuthID, a.Decision,
 		a.ApprovedAmount, a.DeclineReason, a.StandIn, a.HoldShortfall, a.LedgerTxnID,
-		a.RequestFingerprint}
+		a.RequestFingerprint, a.HeldAmount}
 }
 
 // QueueInsert adds the insert of *a to batch and fills its timestamps when the
@@ -202,7 +246,7 @@ func InsertIfAbsent(ctx context.Context, db Querier, a Authorization, eventID, e
 			RETURNING ` + columns + `
 		), event AS (
 			INSERT INTO outbox_events (id, aggregate_id, event_type, topic, payload)
-			SELECT $19::text, auth_id, $20::text, $21::text, $22::jsonb FROM inserted
+			SELECT $20::text, auth_id, $21::text, $22::text, $23::jsonb FROM inserted
 		)
 		SELECT ` + columns + ` FROM inserted`
 	args := append(insertArgs(a), eventID, eventType, Topic, payload)
@@ -261,7 +305,7 @@ func ApproveStandIn(ctx context.Context, tx pgx.Tx, a Authorization) (Authorizat
 	const q = `
 		UPDATE card_authorizations
 		SET decision = 'approved', approved_amount = amount, decline_reason = NULL,
-			stand_in = true, hold_shortfall = $2, ledger_txn_id = $3,
+			stand_in = true, hold_shortfall = $2, held_amount = amount - $2, ledger_txn_id = $3,
 			account_id = $4, held_account_id = $5, updated_at = now()
 		WHERE auth_id = $1
 		RETURNING ` + columns
@@ -297,14 +341,20 @@ func AddDailySpend(ctx context.Context, tx pgx.Tx, cardID string, amount int64) 
 	return nil
 }
 
-// RecordAdvice claims a network message id; false means it was already applied.
-func RecordAdvice(ctx context.Context, tx pgx.Tx, adviceID, authID string) (bool, error) {
+const (
+	MessageAdvice   = "advice"
+	MessageReversal = "reversal"
+)
+
+// RecordMessage claims a network message id (an advice or a reversal); false
+// means it was already applied.
+func RecordMessage(ctx context.Context, tx pgx.Tx, messageID, kind, authID string) (bool, error) {
 	const q = `
-		INSERT INTO network_messages (message_id, kind, auth_id) VALUES ($1, 'advice', $2)
+		INSERT INTO network_messages (message_id, kind, auth_id) VALUES ($1, $2, $3)
 		ON CONFLICT (message_id) DO NOTHING`
-	tag, err := tx.Exec(ctx, q, adviceID, authID)
+	tag, err := tx.Exec(ctx, q, messageID, kind, authID)
 	if err != nil {
-		return false, fmt.Errorf("record advice %s: %w", adviceID, err)
+		return false, fmt.Errorf("record %s %s: %w", kind, messageID, err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
@@ -380,7 +430,7 @@ func scan(row scannable) (Authorization, error) {
 	err := row.Scan(&a.AuthID, &a.CardID, &a.AccountID, &a.HeldAccountID, &a.Amount, &a.Currency,
 		&a.MerchantID, &a.MerchantName, &a.MCC, &a.Kind, &a.OriginalAuthID, &a.Decision,
 		&a.ApprovedAmount, &a.DeclineReason, &a.StandIn, &a.HoldShortfall, &a.LedgerTxnID,
-		&a.RequestFingerprint, &a.CreatedAt, &a.UpdatedAt)
+		&a.RequestFingerprint, &a.HeldAmount, &a.ReleasedAmount, &a.ExpiredAt, &a.CreatedAt, &a.UpdatedAt)
 	return a, err
 }
 

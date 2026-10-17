@@ -3,7 +3,7 @@
 export
 COMPOSE = docker compose -f docker/docker-compose.yml
 
-.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile bench-reconciliation bench bench-metrics bench-http bench-balance demo-v1
+.PHONY: up down psql migrate-up migrate-down migrate-redo test apikey apikeys run worker mock-bank mock-network demo relay watch sender webhook-sender chaos-kill-consumer reconcile hold-expirer bench-reconciliation bench bench-metrics bench-http bench-balance bench-expiry demo-v1
 
 up:
 	$(COMPOSE) up -d --wait
@@ -58,6 +58,10 @@ webhook-sender:
 reconcile:
 	@go run ./cmd/reconcile $(ARGS)
 
+# Release card holds older than HOLD_EXPIRY_DAYS, every HOLD_EXPIRY_INTERVAL (0: once).
+hold-expirer:
+	@go run ./cmd/hold-expirer
+
 bench:
 	@go test ./internal/api -run '^TestLockStrategyComparison$$' -v -count=3
 	@go test ./internal/ratelimit -run '^$$' -bench 'Benchmark(Allow|BaselineRoundTrip)$$' -benchmem -benchtime=1s -count=3
@@ -70,6 +74,9 @@ bench-http:
 
 bench-balance:
 	@go test ./internal/ledger -run '^$$' -bench 'Benchmark(Stored)?BalanceByHistory' -benchtime=2s -count=1
+
+bench-expiry:
+	@go test ./internal/holds -run '^$$' -bench BenchmarkExpireBatch -benchtime=1x -count=3
 
 bench-metrics:
 	@go test ./internal/api -run '^$$' -bench 'Benchmark(HTTPMetricsObservation|MetricsScrape1000Records)' -benchmem -benchtime=1s -count=3
