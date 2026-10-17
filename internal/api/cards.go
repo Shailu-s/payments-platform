@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,10 +18,13 @@ import (
 )
 
 type issueCardRequest struct {
-	AccountID           string `json:"account_id"`
-	PerTransactionLimit int64  `json:"per_transaction_limit"`
-	DailyLimit          int64  `json:"daily_limit"`
+	AccountID           string   `json:"account_id"`
+	PerTransactionLimit int64    `json:"per_transaction_limit"`
+	DailyLimit          int64    `json:"daily_limit"`
+	BlockedMCCs         []string `json:"blocked_mccs"`
 }
+
+var mccPattern = regexp.MustCompile(`^[0-9]{4}$`)
 
 type cardResponse struct {
 	ID                  string    `json:"id"`
@@ -29,6 +34,7 @@ type cardResponse struct {
 	Status              string    `json:"status"`
 	PerTransactionLimit int64     `json:"per_transaction_limit"`
 	DailyLimit          int64     `json:"daily_limit"`
+	BlockedMCCs         []string  `json:"blocked_mccs"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
 }
@@ -42,6 +48,7 @@ func toCardResponse(c cards.Card) cardResponse {
 		Status:              c.Status,
 		PerTransactionLimit: c.PerTransactionLimit,
 		DailyLimit:          c.DailyLimit,
+		BlockedMCCs:         c.BlockedMCCs,
 		CreatedAt:           c.CreatedAt,
 		UpdatedAt:           c.UpdatedAt,
 	}
@@ -88,6 +95,7 @@ func (s *Server) handleIssueCard(w http.ResponseWriter, r *http.Request) {
 		AccountID:           req.AccountID,
 		PerTransactionLimit: req.PerTransactionLimit,
 		DailyLimit:          req.DailyLimit,
+		BlockedMCCs:         req.BlockedMCCs,
 		APIKeyID:            key.ID,
 		IdempotencyKey:      idempotencyKey,
 		RequestFingerprint:  fingerprint,
@@ -152,6 +160,15 @@ func (s *Server) awaitCard(ctx context.Context, idempotencyKey string) (cards.Ca
 func validateIssueCardRequest(req *issueCardRequest) (string, bool) {
 	req.AccountID = strings.TrimSpace(req.AccountID)
 
+	// Sorted and deduplicated, so the fingerprint and the stored card do not
+	// depend on the order the client listed them in.
+	req.BlockedMCCs = slices.Compact(slices.Sorted(slices.Values(req.BlockedMCCs)))
+	for _, mcc := range req.BlockedMCCs {
+		if !mccPattern.MatchString(mcc) {
+			return fmt.Sprintf("blocked_mccs must hold 4-digit merchant category codes, got %q", mcc), false
+		}
+	}
+
 	switch {
 	case req.AccountID == "":
 		return "account_id is required", false
@@ -194,12 +211,18 @@ func (s *Server) validateFundingAccount(ctx context.Context, accountID string) (
 
 // fingerprintCardRequest tells a key reused for a different card from a retry.
 func fingerprintCardRequest(apiKeyID string, req issueCardRequest) string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{
+	parts := []string{
 		apiKeyID,
 		req.AccountID,
 		strconv.FormatInt(req.PerTransactionLimit, 10),
 		strconv.FormatInt(req.DailyLimit, 10),
-	}, "|")))
+	}
+	// Only when present, so a retry of a card issued before blocked_mccs
+	// existed still matches its fingerprint.
+	if len(req.BlockedMCCs) > 0 {
+		parts = append(parts, strings.Join(req.BlockedMCCs, ","))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
 	return hex.EncodeToString(sum[:])
 }
 

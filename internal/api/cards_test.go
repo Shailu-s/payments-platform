@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -49,6 +50,9 @@ func TestIssueCardCreatesOneHeldAccountPerFundingAccount(t *testing.T) {
 	if first.PerTransactionLimit != 50000 || first.DailyLimit != 200000 {
 		t.Errorf("limits = %d/%d, want 50000/200000", first.PerTransactionLimit, first.DailyLimit)
 	}
+	if first.BlockedMCCs == nil || len(first.BlockedMCCs) != 0 {
+		t.Errorf("blocked_mccs = %#v, want an empty array", first.BlockedMCCs)
+	}
 	if first.HeldAccountID == "" || first.HeldAccountID == funding.ID {
 		t.Fatalf("held account = %q, want a separate account", first.HeldAccountID)
 	}
@@ -76,7 +80,7 @@ func TestIssueCardCreatesOneHeldAccountPerFundingAccount(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET card = %d: %s", rec.Code, rec.Body.String())
 	}
-	if got := decodeCard(t, rec.Body.Bytes()); got != first {
+	if got := decodeCard(t, rec.Body.Bytes()); !reflect.DeepEqual(got, first) {
 		t.Errorf("GET card = %+v, want %+v", got, first)
 	}
 	rec = do(t, h, "GET", "/v1/cards/card_missing", apiKey, "")
@@ -214,6 +218,7 @@ func TestIssueCardRejectsBadInput(t *testing.T) {
 		{"negative per-transaction limit", "k6", body(funding.ID, -1, 100)},
 		{"daily below per-transaction", "k7", body(funding.ID, 200, 100)},
 		{"unknown field", "k8", `{"account_id":"` + funding.ID + `","per_transaction_limit":1,"daily_limit":1,"pan":"4111"}`},
+		{"malformed blocked mcc", "k9", `{"account_id":"` + funding.ID + `","per_transaction_limit":1,"daily_limit":1,"blocked_mccs":["58a4"]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -228,5 +233,31 @@ func TestIssueCardRejectsBadInput(t *testing.T) {
 	}
 	if got := countRows(t, "card_accounts"); got != 1 {
 		t.Errorf("card_accounts = %d, want 1", got)
+	}
+}
+
+func TestIssueCardStoresBlockedMCCs(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	funding := createAccount(t, h, apiKey, "asset")
+
+	body := fmt.Sprintf(`{"account_id":%q,"per_transaction_limit":100,"daily_limit":100,"blocked_mccs":["7995","5814","7995"]}`, funding.ID)
+	rec := doWithKey(h, "POST", "/v1/cards", apiKey, "blocked", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/cards = %d: %s", rec.Code, rec.Body.String())
+	}
+	card := decodeCard(t, rec.Body.Bytes())
+	if want := []string{"5814", "7995"}; !reflect.DeepEqual(card.BlockedMCCs, want) {
+		t.Errorf("blocked_mccs = %v, want %v", card.BlockedMCCs, want)
+	}
+	rec = do(t, h, "GET", "/v1/cards/"+card.ID, apiKey, "")
+	if got := decodeCard(t, rec.Body.Bytes()); !reflect.DeepEqual(got, card) {
+		t.Errorf("GET card = %+v, want %+v", got, card)
+	}
+
+	// The same codes in another order are the same request.
+	reordered := fmt.Sprintf(`{"account_id":%q,"per_transaction_limit":100,"daily_limit":100,"blocked_mccs":["5814","7995"]}`, funding.ID)
+	rec = doWithKey(h, "POST", "/v1/cards", apiKey, "blocked", reordered)
+	if rec.Code != http.StatusCreated || decodeCard(t, rec.Body.Bytes()).ID != card.ID {
+		t.Errorf("replay with reordered codes = %d: %s, want 201 with %s", rec.Code, rec.Body.String(), card.ID)
 	}
 }
