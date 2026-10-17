@@ -95,21 +95,6 @@ func IsDuplicateKey(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation
 }
 
-// SetLedgerTxn links the initial movement; call it in the transfer's transaction.
-func SetLedgerTxn(ctx context.Context, db Querier, transferID, ledgerTxnID string) error {
-	const q = `
-		UPDATE transfers
-		SET ledger_txn_id = $1, updated_at = now()
-		WHERE id = $2
-		RETURNING id`
-
-	var id string
-	if err := db.QueryRow(ctx, q, ledgerTxnID, transferID).Scan(&id); err != nil {
-		return fmt.Errorf("link transfer %s to ledger txn %s: %w", transferID, ledgerTxnID, err)
-	}
-	return nil
-}
-
 // FindByIdempotencyKey returns the transfer owning a key.
 // This lookup alone cannot prevent concurrent inserts; the unique index does.
 func FindByIdempotencyKey(ctx context.Context, db Querier, key string) (Transfer, error) {

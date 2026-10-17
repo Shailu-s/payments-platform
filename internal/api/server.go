@@ -25,6 +25,7 @@ type DB interface {
 type Server struct {
 	db            DB
 	limiter       *ratelimit.Limiter
+	gate          *accountGate
 	webhookSecret []byte
 	httpRequests  [5]atomic.Uint64
 }
@@ -37,12 +38,17 @@ const (
 	// request that is still counting against one.
 	sweepInterval  = 5 * time.Minute
 	sweepRetention = time.Hour
+
+	// Every /v1/ request, database calls included, gives up after this rather
+	// than queueing without bound.
+	requestTimeout = 5 * time.Second
 )
 
 func NewServer(pool *pgxpool.Pool, webhookSecret []byte) *Server {
 	return &Server{
 		db:            pool,
 		limiter:       ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
+		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
 		webhookSecret: append([]byte(nil), webhookSecret...),
 	}
 }
@@ -69,7 +75,7 @@ func (s *Server) Handler() http.Handler {
 	// Provider callbacks use their signing key, not a customer API key.
 	mux.HandleFunc("POST /v1/webhooks/mockbank", s.handleProviderWebhook)
 
-	authenticated := chain(s.routes(), s.withAuth, s.withRateLimit)
+	authenticated := chain(s.routes(), withDeadline, s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)
 
 	// Recovery wraps all routes; request IDs must be assigned before logging.

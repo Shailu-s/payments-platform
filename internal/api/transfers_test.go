@@ -162,6 +162,23 @@ func TestCreateTransferRejectsBadInput(t *testing.T) {
 	}
 }
 
+// Settlement has no stored balance, so nothing would refuse its overdraft.
+func TestSettlementAccountCannotBeATransferSource(t *testing.T) {
+	h, key := newTestServer(t)
+	destination := createAccount(t, h, key, "liability")
+
+	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":500,"currency":"USD"}`,
+		settlementAccountID, destination.ID)
+	rec := doWithKey(h, "POST", "/v1/transfers", key, newID("idem"), body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeError(t, rec).Code; got != CodeInvalidRequest {
+		t.Errorf("error code = %q, want %q", got, CodeInvalidRequest)
+	}
+	assertNothingWritten(t, context.Background())
+}
+
 // Money is an integer in minor units. A fractional amount must be refused
 // rather than silently truncated, which would move the wrong sum.
 func TestCreateTransferRejectsAFractionalAmount(t *testing.T) {
@@ -366,9 +383,10 @@ func TestTransferRollsBackWhenTheLedgerWriteFails(t *testing.T) {
 	source := createAccount(t, h, key, "asset")
 	destination := createAccount(t, h, key, "liability")
 
-	// Funded from a second account rather than settlement, because settlement
-	// is about to be removed and a ledger entry against it would block that.
-	funder := createAccount(t, h, key, "asset")
+	// Funded from a second settlement-type account rather than the real one,
+	// because that is about to be removed and a ledger entry against it would
+	// block that. Only settlement-type accounts may go negative.
+	funder := createAccount(t, h, key, "settlement")
 	if _, err := ledger.Record(ctx, testPool, "funding", []ledger.Entry{
 		{AccountID: funder.ID, Direction: ledger.DirectionDebit, Amount: 1000000},
 		{AccountID: source.ID, Direction: ledger.DirectionCredit, Amount: 1000000},

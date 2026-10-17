@@ -1,5 +1,6 @@
 // Command benchseed fills a disposable benchmark database with funded accounts
-// and API keys, then writes the plaintext keys to a local fixture file.
+// and API keys, then writes the plaintext keys to a local fixture file. With
+// -verify it instead prints how many stored balances disagree with the ledger.
 package main
 
 import (
@@ -33,6 +34,8 @@ func main() {
 	keys := flag.Int("keys", 3000, "API keys; the per-key limit is 100 requests per minute")
 	funding := flag.Int64("funding", 10_000_000_000, "cents credited to each source account")
 	out := flag.String("out", "bench/out/fixture.json", "fixture file holding plaintext keys")
+	history := flag.Int("history", 0, "one-cent entries the hot account already has before the run")
+	verify := flag.Bool("verify", false, "print the number of drifted stored balances instead of seeding")
 	flag.Parse()
 
 	var env config.Env
@@ -41,26 +44,46 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
-	if err := run(context.Background(), dsn, *accounts, *keys, *funding, *out); err != nil {
+	ctx := context.Background()
+	pool, err := connect(ctx, dsn)
+	if err != nil {
+		slog.Error("connect failed", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	if *verify {
+		drifts, err := ledger.VerifyBalances(ctx, pool)
+		if err != nil {
+			slog.Error("verify failed", "error", err)
+			os.Exit(1)
+		}
+		for _, d := range drifts {
+			slog.Error("balance drift", "account", d.AccountID, "stored", d.Stored,
+				"derived", d.Derived, "missing_row", d.Missing)
+		}
+		fmt.Println(len(drifts))
+		return
+	}
+	if err := run(ctx, pool, *accounts, *keys, *funding, *history, *out); err != nil {
 		slog.Error("seed failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, dsn string, accounts, keys int, funding int64, out string) error {
-	// Refuse anything but a benchmark database: seeding writes money.
+// connect refuses anything but a benchmark database: seeding writes money.
+func connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !strings.HasPrefix(cfg.ConnConfig.Database, "payments_bench") {
-		return fmt.Errorf("database %q is not a payments_bench* database", cfg.ConnConfig.Database)
+		return nil, fmt.Errorf("database %q is not a payments_bench* database", cfg.ConnConfig.Database)
 	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer pool.Close()
+	return pgxpool.NewWithConfig(ctx, cfg)
+}
+
+func run(ctx context.Context, pool *pgxpool.Pool, accounts, keys int, funding int64, history int, out string) error {
 
 	f := fixture{HotSource: "acc_bench_hot"}
 	rows := [][]any{{f.HotSource, "USD", "asset"}}
@@ -84,6 +107,11 @@ func run(ctx context.Context, dsn string, accounts, keys int, funding int64, out
 	}
 	if _, err := ledger.Record(ctx, pool, "benchmark funding", entries); err != nil {
 		return err
+	}
+	if history > 0 {
+		if err := seedHistory(ctx, pool, f.HotSource, history); err != nil {
+			return err
+		}
 	}
 
 	keyRows := make([][]any, 0, keys)
@@ -111,5 +139,48 @@ func run(ctx context.Context, dsn string, accounts, keys int, funding int64, out
 		return err
 	}
 	slog.Info("seeded", "accounts", accounts, "keys", keys, "fixture", out)
+	return nil
+}
+
+// seedHistory gives an account n one-cent credits in one balanced transaction,
+// so a run can show whether spending cost grows with history. Bulk SQL is far
+// faster than n calls to ledger.Record, but it bypasses it, so it applies the
+// stored balance itself.
+func seedHistory(ctx context.Context, pool *pgxpool.Pool, accountID string, n int) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("seed history: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	statements := []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO ledger_transactions (id, reference) VALUES ('ltx_bench_history', 'benchmark history')`, nil},
+		{`INSERT INTO ledger_entries (id, txn_id, account_id, direction, amount)
+		  SELECT 'le_bench_history_' || g, 'ltx_bench_history', $1, 'credit', 1
+		  FROM generate_series(1, $2::int) g`, []any{accountID, n}},
+		{`INSERT INTO ledger_entries (id, txn_id, account_id, direction, amount)
+		  VALUES ('le_bench_history_debit', 'ltx_bench_history', $1, 'debit', $2)`, []any{settlementAccountID, n}},
+		{`UPDATE account_balances SET balance = balance + $2 WHERE account_id = $1`, []any{accountID, n}},
+	}
+	for _, st := range statements {
+		if _, err := tx.Exec(ctx, st.sql, st.args...); err != nil {
+			return fmt.Errorf("seed history: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("seed history: commit: %w", err)
+	}
+	// Settle the bulk insert before the run: plan against the seeded size, and
+	// leave no autovacuum or checkpoint of a million fresh rows to land on the
+	// first steps.
+	for _, maintenance := range []string{`VACUUM (ANALYZE) ledger_entries`, `CHECKPOINT`} {
+		if _, err := pool.Exec(ctx, maintenance); err != nil {
+			return fmt.Errorf("seed history: %s: %w", maintenance, err)
+		}
+	}
+	slog.Info("seeded history", "account", accountID, "entries", n)
 	return nil
 }

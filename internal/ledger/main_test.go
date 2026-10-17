@@ -54,6 +54,16 @@ func createAccount(t *testing.T, id string) {
 	}
 }
 
+// Settlement accounts have no stored balance and may go negative: a stand-in
+// for the other side of a movement whose source is not under test.
+func createSettlementAccount(t *testing.T, id string) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO accounts (id, currency, type) VALUES ($1, 'USD', 'settlement')`, id); err != nil {
+		t.Fatalf("create settlement account %s: %v", id, err)
+	}
+}
+
 func countRows(t *testing.T) (txns, entries int) {
 	t.Helper()
 	ctx := context.Background()

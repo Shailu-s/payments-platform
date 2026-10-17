@@ -14,8 +14,8 @@ requires explicit migrations and deployment of the new binaries.
 | Guarantee | Named automated proof |
 | --- | --- |
 | Every committed ledger transaction balances. | [TestRecordMovesMoneyAndBalances](internal/ledger/record_test.go), [TestRecordRejectsOverflowingTotals](internal/ledger/overflow_test.go) |
-| One transfer per API key + idempotency key, including concurrent retries. | [TestIdempotentRequestsCreateOneTransfer](internal/api/idempotency_test.go) |
-| Concurrent requests cannot overspend an account. | [TestConcurrentTransfersCannotOverspend](internal/api/overspend_test.go) |
+| One transfer per API key + idempotency key, including concurrent retries. | [TestIdempotentRequestsCreateOneTransfer](internal/api/idempotency_test.go), [TestRetryAfterFundsAreExhaustedReplaysTheOriginal](internal/api/idempotency_test.go) |
+| Concurrent requests cannot overspend an account. | [TestConcurrentTransfersCannotOverspend](internal/api/overspend_test.go), [TestLedgerRefusesOverdraft](internal/ledger/stored_balance_test.go), [TestSecondSpendWaitsForTheFirstAndSeesItsDebit](internal/api/overspend_test.go), [TestStoredBalanceTracksEveryMovement](internal/ledger/stored_balance_test.go) |
 | Duplicate provider events have one financial effect. | [TestConcurrentDuplicateWebhooksHaveOneEffect](internal/api/webhooks_test.go), [TestWebhookRetriesAfterFailedTransaction](internal/api/webhooks_test.go) |
 | Every financial transfer transition retains audit evidence. | [TestEveryFinancialTransitionRetainsAuditEvidence](internal/api/audit_test.go), [TestTerminalOutboxFailureRollsBackFinancialEffect](internal/api/terminal_events_test.go) |
 | Ledger history rejects UPDATE/DELETE; corrections append new entries. | [TestLedgerHistoryRejectsUpdatesAndDeletes](internal/ledger/immutable_test.go) |
@@ -74,8 +74,13 @@ make demo-v1
 ```
 
 Postgres uses host port **5433**, MockBank **8081**, Kafka **9092**. `make migrate-up` applies
-all migrations, including reconciliation (12) and ledger immutability (13), without resetting
-application tables. When upgrading an existing sandbox, preserve its database and capture
+all migrations, including reconciliation (12), ledger immutability (13), stored balances (14)
+and the deferred transfer-to-ledger link (15), without resetting application tables.
+Migration 14 backfills each non-settlement account's balance from its entries and **fails if
+any of them is already negative** (an overdrawn funding account, for example): fix or
+re-type that account deliberately; the migration does not clamp. The API's connection pool
+size is the DSN parameter `pool_max_conns` (pgxpool; default `max(4, CPUs)`), for example
+`...?sslmode=disable&pool_max_conns=20`. When upgrading an existing sandbox, preserve its database and capture
 provider evidence before replacing MockBank: its payment history and deduplication state are
 in memory and disappear on restart. Running tests does not upgrade your live application schema.
 
@@ -254,6 +259,8 @@ Bounded `SERIALIZABLE` carried 137–144/200 with 56–63 failed attempts at 228
 This is a database ledger-debit experiment, not HTTP-to-provider settlement throughput;
 contention is concentrated on one account, not spread uniformly. Only the row-lock path ships.
 The trade is queued spending and a per-account throughput ceiling instead of retry exhaustion.
+Since phase 08 the lock is the stored balance row, taken last in the transaction; the HTTP
+sweep, hot-account and mixed-load numbers are in [BENCHMARKS.md](BENCHMARKS.md).
 
 The Postgres rate limiter measured 0.171–0.253 ms per allowed request versus 0.101–0.144 ms
 for `SELECT 1`; sequential samples, not paired latency measurements. Reproduce the recorded
@@ -270,9 +277,19 @@ experiments plus the new metrics benchmarks with `make bench` in a disposable da
   The SIGKILL proof covers reference persistence followed by a crash before offset commit;
   the earlier bank-acceptance/local-persistence window relies on the provider's stable client
   reference and retained lookup/deduplication state, not a cross-system transaction.
-- Ledger balances are derived; SQL row locks serialise spending from a hot account. The
-  ledger writer is the supported balanced-insert path; arbitrary administrator inserts are
-  outside its validation boundary.
+- Spendable balances are stored in `account_balances` and maintained by `ledger.Record`, the
+  single write path; a CHECK refuses overdrafts and `ledger.VerifyBalances` compares every
+  stored balance with its entries (run after every benchmark step). Administrator raw SQL
+  that writes entries without the matching balance update **will drift** them; nothing in
+  the database prevents that. Settlement accounts keep no stored balance (every payment
+  touches them) and so cannot be a transfer source.
+- Spending from one account is serialised on its balance row: one hot account has a
+  per-account throughput ceiling. Past it, requests are refused fast with `503
+  account_busy` (an in-process cap of 4 concurrent creations per account with a 100 ms wait,
+  and a 250 ms lock timeout) instead of queueing; clients retry with the same
+  Idempotency-Key. The cap is per process, so N API replicas admit 4N per account.
+  Every `/v1/` request has a 5 s deadline; the auth and rate-limit middleware still answer
+  a timeout with 500.
 - One configured customer endpoint, signed retries and a dead status; no manual replay API
   or delivery history. Customers must deduplicate `event_id` from the signed JSON envelope
   after lost acknowledgements, not trust the event-ID header alone.

@@ -38,7 +38,7 @@ func TestBalanceOfUnknownAccountIsZero(t *testing.T) {
 func TestBalanceRunsInsideATransaction(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
-	createAccount(t, "acc_a")
+	createSettlementAccount(t, "acc_a")
 	createAccount(t, "acc_b")
 
 	if _, err := Record(ctx, testPool, "seed", []Entry{
@@ -66,7 +66,7 @@ func TestBalanceRunsInsideATransaction(t *testing.T) {
 func TestBalanceAccumulatesAcrossTransactions(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
-	createAccount(t, "acc_a")
+	createSettlementAccount(t, "acc_a")
 	createAccount(t, "acc_b")
 
 	for _, amount := range []int64{1000, 250, 75} {

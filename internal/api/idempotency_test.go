@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/auth"
+	"github.com/Shailu-s/payments-platform/internal/ledger"
 )
 
 // Each request needs its own reader; sharing one would consume another goroutine's body.
@@ -467,5 +468,56 @@ func TestKeyTakenButNotYetCommittedIsSerialised(t *testing.T) {
 	}
 	if created != 1 {
 		t.Errorf("%d transfers exist, want 1", created)
+	}
+}
+
+// A retry must replay the original even when the original spent every cent: the
+// key, not the balance, decides whether this is a new payment.
+func TestRetryAfterFundsAreExhaustedReplaysTheOriginal(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	ctx := context.Background()
+
+	source := createAccount(t, h, apiKey, "asset")
+	destination := createAccount(t, h, apiKey, "liability")
+	fund(t, source.ID, 50000) // $500
+
+	const idempotencyKey = "spend-it-all"
+	body := fmt.Sprintf(`{"source_account":%q,"destination_account":%q,"amount":50000,"currency":"USD"}`,
+		source.ID, destination.ID)
+
+	first := doWithKey(h, "POST", "/v1/transfers", apiKey, idempotencyKey, body)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first request status = %d, want 202: %s", first.Code, first.Body.String())
+	}
+	retry := doWithKey(h, "POST", "/v1/transfers", apiKey, idempotencyKey, body)
+	if retry.Code != http.StatusAccepted {
+		t.Fatalf("retry status = %d, want 202 replaying the original: %s",
+			retry.Code, retry.Body.String())
+	}
+
+	var original, replayed transferResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &original); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+	if err := json.Unmarshal(retry.Body.Bytes(), &replayed); err != nil {
+		t.Fatalf("decode retry: %v", err)
+	}
+	if replayed.ID != original.ID {
+		t.Errorf("retry returned transfer %s, want the original %s", replayed.ID, original.ID)
+	}
+
+	var created int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM transfers`).Scan(&created); err != nil {
+		t.Fatalf("count transfers: %v", err)
+	}
+	if created != 1 {
+		t.Errorf("%d transfers exist, want 1", created)
+	}
+	balance, err := ledger.Balance(ctx, testPool, source.ID)
+	if err != nil {
+		t.Fatalf("Balance: %v", err)
+	}
+	if balance != 0 {
+		t.Errorf("source balance = %d, want 0", balance)
 	}
 }

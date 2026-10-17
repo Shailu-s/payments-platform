@@ -1077,3 +1077,25 @@ stayed balanced after overload (0 unbalanced, 55,287 transfers). User approved: 
 hot-path phase before cards (stored balance + one-statement check-and-debit, shorter lock
 window, admission control, invariant check, replay-gap fix); executor as a subagent; phase
 PRs merge only after his "merge"; the harness PR may merge directly.
+
+**2026-10-14 — Phase 08 (fast, isolated spending path) built on `phase-08-hot-path`; PR
+open, not merged.** Executor followed `briefs/phase-08-hot-path.md`. Migration 14 adds
+`account_balances` (CHECK balance >= 0, trigger-created rows, backfill that fails on an
+already negative account; settlement accounts have no row); `ledger.Record` applies net
+deltas last in its single batch, in account-id order, maps the CHECK to
+`ErrInsufficientFunds`, and no longer uses a savepoint on a caller's transaction.
+`VerifyBalances`/`StoredBalance` added. Migration 15 defers the transfer→ledger FK so
+creation inserts the transfer (idempotency key) first and the balance debit last;
+`checkBalance`/`SetLedgerTxn` removed; settlement accounts cannot be a source; GET account
+serves the stored balance. Admission control: per-process gate (4 in flight per account,
+100 ms wait), 250 ms lock timeout set after the key is claimed (at BEGIN it broke
+`TestKeyTakenButNotYetCommittedIsSerialised`), 5 s request deadline; `503 account_busy` /
+`request_timeout` with Retry-After. Benchmarks (same session as `main`, on battery):
+balance read 0.12 ms at 1M entries; hot account 998 accepted/s at 1,000 and 1,212/s at
+1,500 with only 503s (main ~330/s); spread knee ~1,400; 0 drift on every step. Missed and
+explained in BENCHMARKS.md: strict all-202 hot ceiling (500), mixed spread p99 538 ms at 2x
+ceiling, spread p99 at 500 (17–32 ms vs main 13 ms), 500s under spread overload. Root cause
+for the misses: refused requests still spend pooled round trips on auth/rate limit before
+the gate (next phase). Owner action: migration 14 fails on `payments`
+(`acc_demo_funding` -50,000) and `payments_manual_v1` (`acc_manual_funding` -100,000) until
+those funding accounts are fixed deliberately.

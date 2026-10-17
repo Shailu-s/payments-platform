@@ -10,7 +10,7 @@ import (
 func TestRecordMovesMoneyAndBalances(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
-	createAccount(t, "acc_a")
+	createSettlementAccount(t, "acc_a")
 	createAccount(t, "acc_b")
 
 	txnID, err := Record(ctx, testPool, "vendor payout", []Entry{
@@ -139,7 +139,7 @@ func TestRecordRollsBackWhenDatabaseRejectsAnEntry(t *testing.T) {
 func TestRecordAcceptsMoreThanTwoEntries(t *testing.T) {
 	resetDB(t)
 	ctx := context.Background()
-	createAccount(t, "acc_a")
+	createSettlementAccount(t, "acc_a")
 	createAccount(t, "acc_b")
 
 	txnID, err := Record(ctx, testPool, "split payment", []Entry{

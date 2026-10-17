@@ -105,8 +105,9 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $DOOMED_
 expect "after revocation" "$CODE" "401"
 expect "the row survives revocation" "$(psql_q "SELECT count(*) FROM api_keys WHERE id = '$DOOMED_ID'")" "1"
 
-step "4. Accounts, and a balance that is derived rather than stored"
-why "There is no balance column. A stored number can disagree with the entries; a derived one cannot."
+step "4. Accounts, and a stored balance the entries can always check"
+why "The entries are the truth. account_balances holds their sum, kept by the ledger writer in the same"
+why "transaction, so spending locks one row instead of summing all history. Settlement has no row."
 
 SRC=$(curl -s -H "Authorization: Bearer $KEY" -X POST "$API/v1/accounts" \
   -d '{"currency":"USD","type":"asset"}' | json '["id"]')
@@ -115,20 +116,24 @@ DST=$(curl -s -H "Authorization: Bearer $KEY" -X POST "$API/v1/accounts" \
 printf "  source       %s\n" "$SRC"
 printf "  destination  %s\n" "$DST"
 
-expect "no balance column exists" \
-  "$(psql_q "SELECT count(*) FROM information_schema.columns WHERE table_name='accounts' AND column_name='balance'")" "0"
+expect "a new account starts with a zero balance row" \
+  "$(psql_q "SELECT balance FROM account_balances WHERE account_id = '$SRC'")" "0"
 
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $KEY" "$API/v1/accounts/acc_never_created")
 expect "an account that does not exist is 404, not a zero balance" "$CODE" "404"
 
 why "There is no deposit endpoint in V1, so the source is funded with \$10,000 by a balanced"
 why "ledger transaction written directly, from a demo funding account — as the tests do."
+why "Raw SQL bypasses the ledger writer, so it must apply the stored balance itself."
 $COMPOSE exec -T postgres psql -U payments -d payments >/dev/null <<SQL
-INSERT INTO accounts (id, currency, type) VALUES ('acc_demo_funding', 'USD', 'liability');
+BEGIN;
+INSERT INTO accounts (id, currency, type) VALUES ('acc_demo_funding', 'USD', 'settlement');
 INSERT INTO ledger_transactions (id, reference) VALUES ('ltx_demo_funding', 'demo funding');
 INSERT INTO ledger_entries (id, txn_id, account_id, direction, amount) VALUES
   ('ent_demo_funding_dr', 'ltx_demo_funding', 'acc_demo_funding', 'debit',  1000000),
   ('ent_demo_funding_cr', 'ltx_demo_funding', '$SRC',             'credit', 1000000);
+UPDATE account_balances SET balance = balance + 1000000 WHERE account_id = '$SRC';
+COMMIT;
 SQL
 expect "source funded" "$(balance "$SRC")" "1000000"
 
@@ -166,7 +171,8 @@ expect "the same key with a different body is refused" \
   "$(post_transfer_code "$IDEM" "$(body "$SRC" "$DST" 99)")" "422"
 
 step "7. Guarantee 3 — money cannot be overspent"
-why "The balance is read under a row lock in the transaction that spends it, so two requests cannot both spend the same money."
+why "The debit is applied to the stored balance, whose CHECK (balance >= 0) refuses an overdraft inside the"
+why "database. Its row lock makes a second spend wait for the first, so two requests cannot both spend the same money."
 
 BEFORE=$(psql_q "SELECT count(*) FROM transfers")
 expect "a transfer larger than the balance" \
@@ -189,6 +195,8 @@ why "Every debit has a matching credit, so every entry in the database sums to z
 
 expect "sum of every ledger entry" \
   "$(psql_q "SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0) FROM ledger_entries")" "0"
+expect "stored balances that disagree with their entries" \
+  "$(psql_q "SELECT count(*) FROM account_balances b WHERE b.balance <> (SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0) FROM ledger_entries e WHERE e.account_id = b.account_id)")" "0"
 
 step "10. Guarantee 5 — every financial change records who asked for it"
 why "The transfer carries the api key that authorised it."

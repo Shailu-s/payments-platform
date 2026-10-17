@@ -16,10 +16,14 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 	"github.com/Shailu-s/payments-platform/internal/outbox"
 	"github.com/Shailu-s/payments-platform/internal/transfers"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ErrInsufficientFunds means the source account cannot cover the transfer.
-var ErrInsufficientFunds = errors.New("insufficient funds")
+// The database decides it: the debit fails the stored balance's CHECK.
+var ErrInsufficientFunds = ledger.ErrInsufficientFunds
 
 // Every transfer credits the settlement account first. The destination is
 // credited by a second ledger transaction once the provider confirms.
@@ -109,9 +113,22 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transfer, status, err := s.createTransfer(r.Context(), req, key.ID, idempotencyKey)
-	if errors.Is(err, ErrInsufficientFunds) {
+	switch {
+	case errors.Is(err, ErrInsufficientFunds):
 		writeError(w, http.StatusUnprocessableEntity, CodeInsufficientFunds,
 			"the source account does not have enough money for this transfer")
+		return
+	case errors.Is(err, ErrAccountBusy) || isLockTimeout(err):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, CodeAccountBusy,
+			"the source account is busy with other payments: retry with the same "+
+				"Idempotency-Key, which cannot pay twice")
+		return
+	case errors.Is(err, context.DeadlineExceeded):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, CodeRequestTimeout,
+			"the request timed out before the payment was answered: retry with the "+
+				"same Idempotency-Key to get its outcome")
 		return
 	}
 	if err != nil {
@@ -149,25 +166,32 @@ func (s *Server) createTransfer(ctx context.Context, req createTransferRequest, 
 	return s.replayTransfer(ctx, idempotencyKey, fingerprint)
 }
 
-// insertTransfer writes the transfer, its ledger entries and its outbox event
+// insertTransfer writes the transfer, its outbox event and its ledger entries
 // in one transaction: none of them may exist without the others.
 //
-// It inserts before looking for an existing transfer with the same key. Looking
-// first lets concurrent requests all see nothing and all insert; inserting
-// first lets the unique index pick one winner.
+// The order is load-bearing. The transfer goes first, so the unique index on
+// the idempotency key picks one winner before anything else happens, and a
+// retry of a payment that spent the last of the funds replays it instead of
+// being refused. The ledger write goes last, because its balance update takes
+// the row lock that serialises spending from the account; everything before
+// it runs without blocking other payments from the same account.
 func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, apiKeyID, idempotencyKey, fingerprint string) (transfers.Transfer, error) {
+	// Before taking a pool connection: a hot account waits here, not in the pool.
+	release, err := s.gate.acquire(ctx, req.SourceAccount)
+	if err != nil {
+		return transfers.Transfer{}, fmt.Errorf("source %s: %w", req.SourceAccount, err)
+	}
+	defer release()
+
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return transfers.Transfer{}, fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// Inside the transaction, under a lock: a balance read before BEGIN can be
-	// spent by a concurrent transfer before this one writes.
-	if err := s.checkBalance(ctx, tx, req.SourceAccount, req.Amount); err != nil {
-		return transfers.Transfer{}, err
-	}
-
+	// Chosen up front so the transfer row can be linked when it is inserted;
+	// the deferred foreign key is checked at commit.
+	ledgerTxnID := ledger.NewTxnID()
 	transfer, err := transfers.Insert(ctx, tx, transfers.Transfer{
 		ID:                 newID("tr"),
 		SourceAccount:      req.SourceAccount,
@@ -175,6 +199,7 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 		Amount:             req.Amount,
 		Currency:           req.Currency,
 		Status:             transfers.StatusProcessing,
+		LedgerTxnID:        &ledgerTxnID,
 		APIKeyID:           apiKeyID,
 		IdempotencyKey:     &idempotencyKey,
 		RequestFingerprint: &fingerprint,
@@ -182,20 +207,6 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	if err != nil {
 		return transfers.Transfer{}, err
 	}
-
-	// Settlement, not the destination: the provider has not paid anyone yet.
-	ledgerTxnID, err := ledger.Record(ctx, tx, "transfer "+transfer.ID, []ledger.Entry{
-		{AccountID: req.SourceAccount, Direction: ledger.DirectionDebit, Amount: req.Amount},
-		{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: req.Amount},
-	})
-	if err != nil {
-		return transfers.Transfer{}, err
-	}
-
-	if err := transfers.SetLedgerTxn(ctx, tx, transfer.ID, ledgerTxnID); err != nil {
-		return transfers.Transfer{}, err
-	}
-	transfer.LedgerTxnID = &ledgerTxnID
 
 	// Written to the outbox on tx rather than published to Kafka: a publish
 	// after the commit is lost if the process dies in between.
@@ -209,13 +220,27 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	if err != nil {
 		return transfers.Transfer{}, fmt.Errorf("marshal transfer event %s: %w", transfer.ID, err)
 	}
-
-	if err := outbox.Insert(ctx, tx, outbox.Event{
+	// The lock timeout starts after the key is claimed: a duplicate may wait
+	// for the original to finish, and the original's own waits are bounded.
+	// From here on, a lock held too long means the account is busy.
+	batch := &pgx.Batch{}
+	batch.Queue(setSpendingLockTimeout)
+	outbox.Queue(batch, outbox.Event{
 		ID:          newID("evt"),
 		AggregateID: transfer.ID,
 		EventType:   "transfer.created",
 		Topic:       "transfers",
 		Payload:     payload,
+	})
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return transfers.Transfer{}, fmt.Errorf("insert outbox event for %s: %w", transfer.ID, err)
+	}
+
+	// Settlement, not the destination: the provider has not paid anyone yet.
+	// An overdraft fails here with ErrInsufficientFunds and rolls back the rest.
+	if err := ledger.RecordWithID(ctx, tx, ledgerTxnID, "transfer "+transfer.ID, []ledger.Entry{
+		{AccountID: req.SourceAccount, Direction: ledger.DirectionDebit, Amount: req.Amount},
+		{AccountID: settlementAccountID, Direction: ledger.DirectionCredit, Amount: req.Amount},
 	}); err != nil {
 		return transfers.Transfer{}, err
 	}
@@ -224,6 +249,15 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 		return transfers.Transfer{}, fmt.Errorf("commit transfer %s: %w", transfer.ID, err)
 	}
 	return transfer, nil
+}
+
+// Shorter than any client timeout: waiting longer for one account's lock only
+// holds a pool connection that other accounts need.
+const setSpendingLockTimeout = `SET LOCAL lock_timeout = '250ms'`
+
+func isLockTimeout(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.LockNotAvailable
 }
 
 // replayTransfer answers a request whose idempotency key was already used.
@@ -323,9 +357,9 @@ func validateTransferRequest(req *createTransferRequest) (string, bool) {
 }
 
 // validateAccounts confirms both accounts exist and match the requested
-// currency, in one round trip.
+// currency, and that the source can be spent from, in one round trip.
 func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest) (message, code string, ok bool) {
-	const q = `SELECT id, currency FROM accounts WHERE id = ANY($1)`
+	const q = `SELECT id, currency, type FROM accounts WHERE id = ANY($1)`
 
 	rows, err := s.db.Query(ctx, q, []string{req.SourceAccount, req.DestinationAccount})
 	if err != nil {
@@ -334,12 +368,14 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 	defer rows.Close()
 
 	currencies := map[string]string{}
+	types := map[string]string{}
 	for rows.Next() {
-		var id, currency string
-		if err := rows.Scan(&id, &currency); err != nil {
+		var id, currency, accountType string
+		if err := rows.Scan(&id, &currency, &accountType); err != nil {
 			return fmt.Sprintf("scan account: %v", err), CodeInternal, false
 		}
 		currencies[id] = currency
+		types[id] = accountType
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Sprintf("load accounts: %v", err), CodeInternal, false
@@ -356,6 +392,12 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 			return fmt.Sprintf("account %s holds %s, not %s", id, currency, req.Currency),
 				CodeInvalidRequest, false
 		}
+	}
+	// A settlement account has no stored balance, so nothing would stop it
+	// from being overspent.
+	if types[req.SourceAccount] == "settlement" {
+		return fmt.Sprintf("account %s is a settlement account and cannot be a transfer source",
+			req.SourceAccount), CodeInvalidRequest, false
 	}
 	return "", "", true
 }

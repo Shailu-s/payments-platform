@@ -43,6 +43,13 @@ func TestRealBankReportDetectsLostCallbackWithoutSettlingPayment(t *testing.T) {
 		INSERT INTO api_keys (id,key_hash,prefix,name) VALUES ('key_bank','hash_bank','bank','bank test');`); err != nil {
 		t.Fatal(err)
 	}
+	// The source must hold the money before the reserve can debit it.
+	if _, err := ledger.Record(ctx, pool, "funding", []ledger.Entry{
+		{AccountID: "acc_settlement_usd", Direction: ledger.DirectionDebit, Amount: 50000},
+		{AccountID: "acc_src", Direction: ledger.DirectionCredit, Amount: 50000},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	txnID, err := ledger.Record(ctx, pool, "reserve tr_lost_callback", []ledger.Entry{
 		{AccountID: "acc_src", Direction: ledger.DirectionDebit, Amount: 50000},
 		{AccountID: "acc_settlement_usd", Direction: ledger.DirectionCredit, Amount: 50000},
@@ -66,7 +73,7 @@ func TestRealBankReportDetectsLostCallbackWithoutSettlingPayment(t *testing.T) {
 	}
 	var status string
 	var entries int
-	if err := pool.QueryRow(ctx, "SELECT status,(SELECT count(*) FROM ledger_entries) FROM transfers WHERE id='tr_lost_callback'").Scan(&status, &entries); err != nil || status != "processing" || entries != 2 {
+	if err := pool.QueryRow(ctx, "SELECT status,(SELECT count(*) FROM ledger_entries) FROM transfers WHERE id='tr_lost_callback'").Scan(&status, &entries); err != nil || status != "processing" || entries != 4 {
 		t.Fatalf("reconciliation changed money: status=%s entries=%d err=%v", status, entries, err)
 	}
 	balance, err := ledger.Balance(ctx, pool, "acc_dst")
