@@ -669,3 +669,42 @@ func TestStandInAdviceIsHonoured(t *testing.T) {
 		}
 	})
 }
+
+func heldOn(t *testing.T, authID string) int64 {
+	t.Helper()
+	var held int64
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT held_amount FROM card_authorizations WHERE auth_id = $1`, authID).Scan(&held); err != nil {
+		t.Fatalf("held_amount of %s: %v", authID, err)
+	}
+	return held
+}
+
+// held_amount is what a release may give back, so it must equal what the
+// ledger actually moved into held for every way a hold is placed.
+func TestHeldAmountTracksThePlacedHold(t *testing.T) {
+	h, apiKey := newTestServer(t)
+	c := newCard(t, h, apiKey, 6000, 5000, 20000)
+
+	authorizeTap(t, h, tap{authID: "auth_held", cardID: c.card.ID, amount: 3000})
+	authorizeTap(t, h, tap{authID: "auth_too_big", cardID: c.card.ID, amount: 5001})
+	advise(t, h, "adv_short_held", "auth_short_held", c.card.ID, 5000)
+
+	for _, tc := range []struct {
+		authID string
+		want   int64
+	}{
+		{"auth_held", 3000},
+		{"auth_too_big", 0},
+		// 3000 left in available: the rest is shortfall, not held.
+		{"auth_short_held", 3000},
+	} {
+		if got := heldOn(t, tc.authID); got != tc.want {
+			t.Errorf("%s held_amount = %d, want %d", tc.authID, got, tc.want)
+		}
+	}
+	if got := storedBalance(t, c.card.HeldAccountID); got != 6000 {
+		t.Errorf("held account = %d, want 6000: the sum of held_amount", got)
+	}
+	assertNoDrift(t)
+}

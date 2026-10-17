@@ -84,8 +84,13 @@ type Authorization struct {
 	HoldShortfall      int64
 	LedgerTxnID        *string
 	RequestFingerprint string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// HeldAmount is the money this row still holds: the whole chain's on an
+	// initial authorization, always 0 on an incremental one.
+	HeldAmount     int64
+	ReleasedAmount int64
+	ExpiredAt      *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Querier lets reads and single statements share the caller's transaction.
@@ -135,8 +140,11 @@ func New(card *cards.Card, r Request, reason string) Authorization {
 	if r.OriginalAuthID != "" {
 		a.OriginalAuthID = &r.OriginalAuthID
 	}
-	if reason != "" {
+	switch {
+	case reason != "":
 		a.Decision, a.ApprovedAmount, a.DeclineReason = DecisionDeclined, 0, &reason
+	case r.Kind == KindInitial:
+		a.HeldAmount = r.Amount
 	}
 	return a
 }
@@ -154,20 +162,20 @@ func Fingerprint(r Request) string {
 const columns = `auth_id, card_id, account_id, held_account_id, amount, currency,
 	merchant_id, merchant_name, mcc, kind, original_auth_id, decision, approved_amount,
 	decline_reason, stand_in, hold_shortfall, ledger_txn_id, request_fingerprint,
-	created_at, updated_at`
+	held_amount, released_amount, expired_at, created_at, updated_at`
 
 const insertSQL = `
 	INSERT INTO card_authorizations (auth_id, card_id, account_id, held_account_id, amount,
 		currency, merchant_id, merchant_name, mcc, kind, original_auth_id, decision,
 		approved_amount, decline_reason, stand_in, hold_shortfall, ledger_txn_id,
-		request_fingerprint)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
+		request_fingerprint, held_amount)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
 func insertArgs(a Authorization) []any {
 	return []any{a.AuthID, a.CardID, a.AccountID, a.HeldAccountID, a.Amount, a.Currency,
 		a.MerchantID, a.MerchantName, a.MCC, a.Kind, a.OriginalAuthID, a.Decision,
 		a.ApprovedAmount, a.DeclineReason, a.StandIn, a.HoldShortfall, a.LedgerTxnID,
-		a.RequestFingerprint}
+		a.RequestFingerprint, a.HeldAmount}
 }
 
 // QueueInsert adds the insert of *a to batch and fills its timestamps when the
@@ -202,7 +210,7 @@ func InsertIfAbsent(ctx context.Context, db Querier, a Authorization, eventID, e
 			RETURNING ` + columns + `
 		), event AS (
 			INSERT INTO outbox_events (id, aggregate_id, event_type, topic, payload)
-			SELECT $19::text, auth_id, $20::text, $21::text, $22::jsonb FROM inserted
+			SELECT $20::text, auth_id, $21::text, $22::text, $23::jsonb FROM inserted
 		)
 		SELECT ` + columns + ` FROM inserted`
 	args := append(insertArgs(a), eventID, eventType, Topic, payload)
@@ -261,7 +269,7 @@ func ApproveStandIn(ctx context.Context, tx pgx.Tx, a Authorization) (Authorizat
 	const q = `
 		UPDATE card_authorizations
 		SET decision = 'approved', approved_amount = amount, decline_reason = NULL,
-			stand_in = true, hold_shortfall = $2, ledger_txn_id = $3,
+			stand_in = true, hold_shortfall = $2, held_amount = amount - $2, ledger_txn_id = $3,
 			account_id = $4, held_account_id = $5, updated_at = now()
 		WHERE auth_id = $1
 		RETURNING ` + columns
@@ -380,7 +388,7 @@ func scan(row scannable) (Authorization, error) {
 	err := row.Scan(&a.AuthID, &a.CardID, &a.AccountID, &a.HeldAccountID, &a.Amount, &a.Currency,
 		&a.MerchantID, &a.MerchantName, &a.MCC, &a.Kind, &a.OriginalAuthID, &a.Decision,
 		&a.ApprovedAmount, &a.DeclineReason, &a.StandIn, &a.HoldShortfall, &a.LedgerTxnID,
-		&a.RequestFingerprint, &a.CreatedAt, &a.UpdatedAt)
+		&a.RequestFingerprint, &a.HeldAmount, &a.ReleasedAmount, &a.ExpiredAt, &a.CreatedAt, &a.UpdatedAt)
 	return a, err
 }
 

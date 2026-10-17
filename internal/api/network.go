@@ -252,6 +252,7 @@ func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Auth
 // have stored a row meanwhile; that row is the answer for both.
 func (s *Server) declineAuthorization(ctx context.Context, a authorizations.Authorization, reason string) (authorizations.Authorization, error) {
 	a.Decision, a.ApprovedAmount, a.DeclineReason, a.LedgerTxnID = authorizations.DecisionDeclined, 0, &reason, nil
+	a.HeldAmount = 0
 	stored, inserted, err := authorizations.InsertIfAbsent(ctx, s.db, a, newID("evt"), authorizations.EventDeclined)
 	if err != nil {
 		return authorizations.Authorization{}, err
@@ -388,7 +389,7 @@ func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, er
 		MCC:          msg.Merchant.MCC,
 		Kind:         authorizations.KindInitial,
 	}, "")
-	claim.StandIn = true
+	claim.StandIn, claim.HeldAmount = true, 0
 	stored, inserted, err := authorizations.ClaimForAdvice(ctx, tx, claim)
 	if err != nil {
 		return "", err
