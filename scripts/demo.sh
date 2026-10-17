@@ -48,7 +48,7 @@ printf "${bold}Payments platform — walkthrough${reset}\n"
 printf "${dim}API %s${reset}\n" "$API"
 
 step "0. A clean slate"
-why "Wiping every table, then restoring the settlement account that migration 000003 creates."
+why "Wiping every table, then restoring the settlement accounts that migrations 000003 and 000019 create."
 # Discover tables so new outbox or ledger tables cannot survive the reset.
 # Keep schema_migrations so migration versions remain accurate.
 $COMPOSE exec -T postgres psql -U payments -d payments >/dev/null <<'SQL'
@@ -59,7 +59,8 @@ BEGIN
     FROM pg_tables
     WHERE schemaname = 'public' AND tablename <> 'schema_migrations');
 END $$;
-INSERT INTO accounts (id, currency, type) VALUES ('acc_settlement_usd', 'USD', 'settlement');
+INSERT INTO accounts (id, currency, type) VALUES
+  ('acc_settlement_usd', 'USD', 'settlement'), ('acc_network_payable_usd', 'USD', 'settlement');
 SQL
 pass "database reset"
 
