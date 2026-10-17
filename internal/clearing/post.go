@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Shailu-s/payments-platform/internal/authorizations"
+	"github.com/Shailu-s/payments-platform/internal/cards"
 	"github.com/Shailu-s/payments-platform/internal/holds"
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 	"github.com/Shailu-s/payments-platform/internal/outbox"
@@ -22,14 +23,18 @@ const NetworkPayableAccountID = "acc_network_payable_usd"
 
 const EventPosted = "card.clearing.posted"
 
-var (
-	errUnmatchedNotPosted = errors.New("lines without a known authorization are not posted yet")
-	errLateNotPosted      = errors.New("lines for a hold already released or cleared are not posted yet")
-)
-
 // Flags: reasons a person should look at a line. A line can have several.
 const (
-	FlagOverTolerance = "over_tolerance"
+	FlagOverTolerance        = "over_tolerance"
+	FlagClearedAfterExpiry   = "cleared_after_expiry"
+	FlagClearedAfterReversal = "cleared_after_reversal"
+	FlagDuplicateClearing    = "duplicate_clearing"
+	FlagUnauthorizedClearing = "unauthorized_clearing"
+	FlagUnknownCard          = "unknown_card"
+	FlagShortfall            = "shortfall"
+	// FlagNothingHeld: approved, never released or cleared, yet holding
+	// nothing, as a stand-in the account could not cover leaves it.
+	FlagNothingHeld = "nothing_held"
 	// FlagCardMismatch: the line's card is not the authorization's. The
 	// authorization's accounts are charged: it is the hold being cleared.
 	FlagCardMismatch = "card_mismatch"
@@ -146,7 +151,7 @@ func postLine(ctx context.Context, db DB, fileID string, l Line, cfg Config) (bo
 		}
 	}
 
-	p, err := plan(l, h, cfg)
+	p, err := plan(ctx, tx, l, h, cfg)
 	if err != nil {
 		return false, err
 	}
@@ -165,19 +170,49 @@ func commit(ctx context.Context, tx pgx.Tx) error {
 
 // plan decides what a purchase line does to h, the locked hold it clears (nil
 // if none). F is the line's amount and H what the hold still holds.
-func plan(l Line, h *hold, cfg Config) (posting, error) {
+func plan(ctx context.Context, tx pgx.Tx, l Line, h *hold, cfg Config) (posting, error) {
 	p := posting{status: StatusPosted}
-	if h == nil || h.accountID == nil || h.heldAccountID == nil {
-		return p, errUnmatchedNotPosted
+	switch {
+	case h != nil && h.accountID != nil && h.heldAccountID != nil:
+		p.accountID, p.heldAccountID = *h.accountID, *h.heldAccountID
+		if h.cardID != l.CardID {
+			p.flags = append(p.flags, FlagCardMismatch)
+		}
+	default:
+		// Never authorized, or authorized on a card we did not know: the
+		// line's card is all there is to charge.
+		card, err := cards.Get(ctx, tx, l.CardID)
+		if errors.Is(err, cards.ErrNotFound) {
+			p.status, p.flags = StatusRejected, append(p.flags, FlagUnknownCard)
+			return p, nil
+		}
+		if err != nil {
+			return p, err
+		}
+		p.accountID, p.heldAccountID = card.AccountID, card.HeldAccountID
 	}
-	if !h.approved || h.held == 0 || h.cleared > 0 {
-		return p, errLateNotPosted
-	}
-	p.accountID, p.heldAccountID = *h.accountID, *h.heldAccountID
-	if h.cardID != l.CardID {
-		p.flags = append(p.flags, FlagCardMismatch)
+
+	if h == nil {
+		p.flags = append(p.flags, FlagUnauthorizedClearing)
+		p.wantAvailable = l.Amount
+		return p, nil
 	}
 	p.holder = h
+	if h.cleared > 0 {
+		p.flags = append(p.flags, FlagDuplicateClearing)
+	}
+	switch {
+	case !h.approved:
+		// A stand-in whose advice never reached us: the network approved it.
+		p.flags = append(p.flags, FlagUnauthorizedClearing)
+	case h.held == 0 && h.cleared > 0:
+	case h.held == 0 && h.expired:
+		p.flags = append(p.flags, FlagClearedAfterExpiry)
+	case h.held == 0 && h.released > 0:
+		p.flags = append(p.flags, FlagClearedAfterReversal)
+	case h.held == 0:
+		p.flags = append(p.flags, FlagNothingHeld)
+	}
 	p.fromHeld = min(l.Amount, h.held)
 	p.release = h.held - p.fromHeld
 	p.wantAvailable = l.Amount - p.fromHeld
@@ -220,13 +255,43 @@ func exceeds(over, authorized, pct int64) bool {
 	return lhsHi > rhsHi || (lhsHi == rhsHi && lhsLo > rhsLo)
 }
 
-// apply writes p: the daily spend, the authorization and the record, the
-// event, and the ledger last.
+// apply writes p: the balance locks and the shortfall they decide, the daily
+// spend, the authorization and the record, the event, and the ledger last.
 func apply(ctx context.Context, tx pgx.Tx, l Line, p posting) error {
 	h := p.holder
 	if p.status == StatusPosted {
-		// The balance CHECK refuses an overdraft; shortfalls are not posted yet.
-		p.fromAvailable = p.wantAvailable
+		if p.wantAvailable > 0 {
+			batch := &pgx.Batch{}
+			// Every balance row the ledger write will touch, in its id order,
+			// so the balance read stays true until commit.
+			ids := []string{p.accountID}
+			if p.fromHeld > 0 {
+				ids = append(ids, p.heldAccountID)
+			}
+			batch.Queue(`
+				SELECT account_id, balance FROM account_balances
+				WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE`, ids).
+				Query(func(rows pgx.Rows) error {
+					for rows.Next() {
+						var id string
+						var balance int64
+						if err := rows.Scan(&id, &balance); err != nil {
+							return err
+						}
+						if id == p.accountID {
+							p.fromAvailable = min(p.wantAvailable, balance)
+						}
+					}
+					return rows.Err()
+				})
+			if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+				return fmt.Errorf("lock balances for %s: %w", l.ClearingID, err)
+			}
+		}
+		p.shortfall = p.wantAvailable - p.fromAvailable
+		if p.shortfall > 0 {
+			p.flags = append(p.flags, FlagShortfall)
+		}
 		if p.fromHeld+p.fromAvailable > 0 {
 			id := ledger.NewTxnID()
 			p.ledgerTxnID = &id
