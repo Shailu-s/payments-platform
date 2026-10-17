@@ -72,7 +72,7 @@ func BenchmarkMetricsScrape1000Records(b *testing.B) {
 		CASE WHEN g%3=0 THEN now() ELSE NULL END FROM generate_series(1,1000) g;`); err != nil {
 		b.Fatal(err)
 	}
-	h := NewServer(testPool, []byte(testWebhookSecret)).Handler()
+	h := NewServer(testPool, []byte(testWebhookSecret), nil).Handler()
 	previousLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	defer slog.SetDefault(previousLogger)

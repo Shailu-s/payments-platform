@@ -120,7 +120,7 @@ func runV1Demo(t *testing.T, timedOut bool) {
 	release := func() { releaseOnce.Do(func() { close(callbackGate) }) }
 	defer release()
 	callbackBodies := make(chan []byte, 2)
-	apiHandler := api.NewServer(pool, []byte(testWebhookSecret)).Handler()
+	apiHandler := api.NewServer(pool, []byte(testWebhookSecret), nil).Handler()
 	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/webhooks/mockbank" {
 			body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))

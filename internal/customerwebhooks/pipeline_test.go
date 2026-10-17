@@ -55,7 +55,7 @@ func TestTerminalEventTravelsThroughKafkaAndCustomerRetry(t *testing.T) {
 	if err := auth.Insert(ctx, testPool, key); err != nil {
 		t.Fatal(err)
 	}
-	handler := api.NewServer(testPool, []byte(testSecret)).Handler()
+	handler := api.NewServer(testPool, []byte(testSecret), nil).Handler()
 	req := httptest.NewRequest("POST", "/v1/transfers", strings.NewReader(`{"source_account":"acc_src","destination_account":"acc_dst","amount":500,"currency":"USD"}`))
 	req.Header.Set("Authorization", "Bearer "+plaintext)
 	req.Header.Set("Idempotency-Key", "pipeline")

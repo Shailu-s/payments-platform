@@ -28,6 +28,7 @@ type Server struct {
 	limiter       *ratelimit.Limiter
 	gate          *accountGate
 	webhookSecret []byte
+	networkSecret []byte
 	httpRequests  [5]atomic.Uint64
 }
 
@@ -45,12 +46,13 @@ const (
 	requestTimeout = 5 * time.Second
 )
 
-func NewServer(pool *pgxpool.Pool, webhookSecret []byte) *Server {
+func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte) *Server {
 	return &Server{
 		db:            pool,
 		limiter:       ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
 		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
 		webhookSecret: append([]byte(nil), webhookSecret...),
+		networkSecret: append([]byte(nil), networkSecret...),
 	}
 }
 
@@ -75,6 +77,9 @@ func (s *Server) Handler() http.Handler {
 
 	// Provider callbacks use their signing key, not a customer API key.
 	mux.HandleFunc("POST /v1/webhooks/mockbank", s.handleProviderWebhook)
+
+	// The card network signs with its own secret and answers to its own deadline.
+	mux.HandleFunc("POST /network/authorizations", s.handleNetworkAuthorization)
 
 	authenticated := chain(s.routes(), withDeadline, s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)

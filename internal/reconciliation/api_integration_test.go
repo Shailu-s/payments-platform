@@ -47,7 +47,7 @@ func TestReconciliationInspectionRequiresAuthAndReturnsSavedEvidence(t *testing.
 	if _, err := reconciliation.Reconcile(ctx, pool, "run_http", strings.NewReader(raw)); err != nil {
 		t.Fatal(err)
 	}
-	h := api.NewServer(pool, []byte("test-only-mockbank-key-for-reconciliation")).Handler()
+	h := api.NewServer(pool, []byte("test-only-mockbank-key-for-reconciliation"), nil).Handler()
 	request := func(path, key string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("GET", path, nil)
 		if key != "" {

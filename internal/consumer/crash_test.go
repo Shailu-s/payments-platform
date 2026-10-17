@@ -368,7 +368,7 @@ func newCrashFixture(t *testing.T, count int) *crashFixture {
 	if err := auth.Insert(ctx, f.pool, key); err != nil {
 		t.Fatal(err)
 	}
-	f.handler = api.NewServer(f.pool, []byte(crashWebhookSecret)).Handler()
+	f.handler = api.NewServer(f.pool, []byte(crashWebhookSecret), nil).Handler()
 	for i := 0; i < count; i++ {
 		req := httptest.NewRequest("POST", "/v1/transfers", strings.NewReader(`{"source_account":"acc_src","destination_account":"acc_dst","amount":1000,"currency":"USD"}`))
 		req.Header.Set("Authorization", "Bearer "+plaintext)
