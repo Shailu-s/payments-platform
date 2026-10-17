@@ -1,5 +1,6 @@
-// Command benchseed fills a disposable benchmark database with funded accounts
-// and API keys, then writes the plaintext keys to a local fixture file. With
+// Command benchseed fills a disposable benchmark database with funded accounts,
+// API keys and, with -cards, one card per source account plus one on the hot
+// account, then writes the plaintext keys and ids to a local fixture file. With
 // -verify it instead prints how many stored balances disagree with the ledger.
 package main
 
@@ -27,6 +28,8 @@ type fixture struct {
 	Sources      []string `json:"sources"`
 	Destinations []string `json:"destinations"`
 	HotSource    string   `json:"hot_source"`
+	Cards        []string `json:"cards,omitempty"`
+	HotCard      string   `json:"hot_card,omitempty"`
 }
 
 func main() {
@@ -35,6 +38,7 @@ func main() {
 	funding := flag.Int64("funding", 10_000_000_000, "cents credited to each source account")
 	out := flag.String("out", "bench/out/fixture.json", "fixture file holding plaintext keys")
 	history := flag.Int("history", 0, "one-cent entries the hot account already has before the run")
+	withCards := flag.Bool("cards", false, "issue a card on every source account and on the hot account")
 	verify := flag.Bool("verify", false, "print the number of drifted stored balances instead of seeding")
 	flag.Parse()
 
@@ -65,7 +69,7 @@ func main() {
 		fmt.Println(len(drifts))
 		return
 	}
-	if err := run(ctx, pool, *accounts, *keys, *funding, *history, *out); err != nil {
+	if err := run(ctx, pool, *accounts, *keys, *funding, *history, *withCards, *out); err != nil {
 		slog.Error("seed failed", "error", err)
 		os.Exit(1)
 	}
@@ -83,7 +87,7 @@ func connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pgxpool.NewWithConfig(ctx, cfg)
 }
 
-func run(ctx context.Context, pool *pgxpool.Pool, accounts, keys int, funding int64, history int, out string) error {
+func run(ctx context.Context, pool *pgxpool.Pool, accounts, keys int, funding int64, history int, withCards bool, out string) error {
 
 	f := fixture{HotSource: "acc_bench_hot"}
 	rows := [][]any{{f.HotSource, "USD", "asset"}}
@@ -115,17 +119,26 @@ func run(ctx context.Context, pool *pgxpool.Pool, accounts, keys int, funding in
 	}
 
 	keyRows := make([][]any, 0, keys)
+	var firstKeyID string
 	for i := range keys {
 		plaintext, k, err := auth.Generate(fmt.Sprintf("bench-%d", i))
 		if err != nil {
 			return err
 		}
 		f.Keys = append(f.Keys, plaintext)
+		if i == 0 {
+			firstKeyID = k.ID
+		}
 		keyRows = append(keyRows, []any{k.ID, k.Hash, k.Prefix, k.Name})
 	}
 	if _, err := pool.CopyFrom(ctx, pgx.Identifier{"api_keys"},
 		[]string{"id", "key_hash", "prefix", "name"}, pgx.CopyFromRows(keyRows)); err != nil {
 		return fmt.Errorf("copy api keys: %w", err)
+	}
+	if withCards {
+		if err := seedCards(ctx, pool, &f, firstKeyID); err != nil {
+			return err
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
@@ -139,6 +152,48 @@ func run(ctx context.Context, pool *pgxpool.Pool, accounts, keys int, funding in
 		return err
 	}
 	slog.Info("seeded", "accounts", accounts, "keys", keys, "fixture", out)
+	return nil
+}
+
+// seedCards issues one active card per funded account, with limits no run
+// reaches and no blocked merchants, so every tap is decided by the funds. Bulk
+// copies bypass cards.Issue; the accounts trigger still creates the held
+// accounts' balance rows.
+func seedCards(ctx context.Context, pool *pgxpool.Pool, f *fixture, apiKeyID string) error {
+	const perTransaction, daily = 1_000_000, 1 << 60
+
+	funded := append([]string{f.HotSource}, f.Sources...)
+	var heldRows, linkRows, cardRows [][]any
+	for i, account := range funded {
+		held := account + "_held"
+		card := fmt.Sprintf("card_bench_%05d", i)
+		if account == f.HotSource {
+			card = "card_bench_hot"
+			f.HotCard = card
+		} else {
+			f.Cards = append(f.Cards, card)
+		}
+		heldRows = append(heldRows, []any{held, "USD", "asset"})
+		linkRows = append(linkRows, []any{account, held})
+		cardRows = append(cardRows, []any{card, account, "0000", "active", perTransaction, daily,
+			apiKeyID, "bench-" + card, "bench"})
+	}
+	copies := []struct {
+		table   string
+		columns []string
+		rows    [][]any
+	}{
+		{"accounts", []string{"id", "currency", "type"}, heldRows},
+		{"card_accounts", []string{"account_id", "held_account_id"}, linkRows},
+		{"cards", []string{"id", "account_id", "last4", "status", "per_transaction_limit", "daily_limit",
+			"api_key_id", "idempotency_key", "request_fingerprint"}, cardRows},
+	}
+	for _, c := range copies {
+		if _, err := pool.CopyFrom(ctx, pgx.Identifier{c.table}, c.columns, pgx.CopyFromRows(c.rows)); err != nil {
+			return fmt.Errorf("copy %s: %w", c.table, err)
+		}
+	}
+	slog.Info("seeded cards", "cards", len(cardRows))
 	return nil
 }
 

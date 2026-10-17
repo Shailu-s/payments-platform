@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# HTTP load benchmark for POST /v1/transfers against a disposable database.
-# Never touches the application database: the target must be named payments_bench*.
+# HTTP load benchmark for POST /v1/transfers and POST /network/authorizations
+# against a disposable database. Never touches the application database: the
+# target must be named payments_bench*.
 #
 #   MODES="spread hot" RATES="100 250 500 1000" DURATION=30s scripts/bench-http.sh
+#   MODES="auth-spread auth-hot" RATES="250 500 1000" scripts/bench-http.sh
 #
+# auth-spread taps a random card among one per source account; auth-hot taps the
+# one card on the hot account. Each auth row also reports how many were declined.
 # MODE mixed drives the hot account at each RATE while spread traffic runs at
 # SPREAD_RATE alongside it, and reports the two as mixed-hot and mixed-spread.
 # HOT_HISTORY gives the hot account that many pre-existing entries.
@@ -21,6 +25,8 @@ KEYS="${KEYS:-3000}"
 SPREAD_RATE="${SPREAD_RATE:-300}"
 HOT_HISTORY="${HOT_HISTORY:-0}"
 LABEL="${LABEL:-$(git rev-parse --short HEAD)}"
+# Throwaway, shared by the API and k6 only for this run.
+NETWORK_SECRET="$(openssl rand -hex 32)"
 
 db_name="${BENCH_DATABASE_URL##*/}"; db_name="${db_name%%\?*}"
 case "$db_name" in
@@ -40,22 +46,25 @@ reset_db() {
   psql "$ADMIN_URL" -qAt -c "DROP DATABASE IF EXISTS $db_name WITH (FORCE)" -c "CREATE DATABASE $db_name"
   migrate -path db/migrations -database "$BENCH_DATABASE_URL" up >/dev/null
   BENCH_DATABASE_URL="$BENCH_DATABASE_URL" "$out/bin/benchseed" \
-    -accounts "$ACCOUNTS" -keys "$KEYS" -history "$HOT_HISTORY" -out "$out/fixture.json"
+    -accounts "$ACCOUNTS" -keys "$KEYS" -history "$HOT_HISTORY" -cards -out "$out/fixture.json"
 }
 
 # run_k6 ROW_MODE MODE RATE KEY_OFFSET STEP writes one row to $out/step-ROW_MODE.json.
 # STEP keeps idempotency keys unique when a fixed-rate stream runs in every step.
 run_k6() {
   rm -f "$out/step-$1.json"
+  local script=transfers.js
+  case "$2" in auth-*) script=authorizations.js ;; esac
   MODE="$2" ROW_MODE="$1" RATE="$3" KEY_OFFSET="$4" DURATION="$DURATION" RUN_ID="$LABEL-$1-$5" \
     FIXTURE="$out/fixture.json" API_URL="http://$API_ADDR" OUT="$out/step-$1.json" \
-    k6 run --quiet --no-color "bench/k6/transfers.js" > "$out/k6-$1-$5.log" 2>&1
+    NETWORK_SECRET="$NETWORK_SECRET" \
+    k6 run --quiet --no-color "bench/k6/$script" > "$out/k6-$1-$5.log" 2>&1
 }
 
 api_pid=""
 start_api() {
   DATABASE_URL="$BENCH_DATABASE_URL" API_ADDR="$API_ADDR" \
-    MOCKBANK_WEBHOOK_SECRET="$(openssl rand -hex 32)" \
+    MOCKBANK_WEBHOOK_SECRET="$(openssl rand -hex 32)" NETWORK_SECRET="$NETWORK_SECRET" \
     "$out/bin/api" > "$out/api.log" 2>&1 &
   api_pid=$!
   for _ in $(seq 1 50); do
@@ -84,9 +93,11 @@ for mode in $MODES; do
     fi
     entries=$(psql "$BENCH_DATABASE_URL" -qAt -c "SELECT count(*) FROM ledger_entries")
     drift=$(BENCH_DATABASE_URL="$BENCH_DATABASE_URL" "$out/bin/benchseed" -verify)
+    # Cumulative over the mode's steps, like ledger_entries_after.
+    declined=$(psql "$BENCH_DATABASE_URL" -qAt -c "SELECT count(*) FROM card_authorizations WHERE decision = 'declined'")
     for row in $rows; do
-      jq -c --argjson e "$entries" --argjson d "$drift" \
-        '. + {ledger_entries_after: $e, balance_drift: $d}' "$out/step-$row.json" | tee -a "$results"
+      jq -c --argjson e "$entries" --argjson d "$drift" --argjson x "$declined" \
+        '. + {ledger_entries_after: $e, balance_drift: $d, declined_after: $x}' "$out/step-$row.json" | tee -a "$results"
     done
     sleep 2
   done
