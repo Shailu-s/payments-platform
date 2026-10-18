@@ -39,6 +39,11 @@ type Server struct {
 	webhookSecret []byte
 	networkSecret []byte
 	httpRequests  [5]atomic.Uint64
+	// Time in the rate limiter's Allow, and in the whole request from Allow
+	// on: their ratio is the limiter's share of a rate-limited request.
+	rateLimitChecks  atomic.Uint64
+	rateLimitNanos   atomic.Uint64
+	rateLimitedNanos atomic.Uint64
 }
 
 const (

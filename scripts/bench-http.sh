@@ -65,6 +65,9 @@ run_k6() {
     k6 run --quiet --no-color "bench/k6/$script" > "$out/k6-$1-$5.log" 2>&1
 }
 
+# metric NAME prints the value of an unlabelled metric in $metrics, or null.
+metric() { awk -v n="$1" '$1 == n { v = $2 } END { print (v == "" ? "null" : v) }' <<<"$metrics"; }
+
 api_pid=""
 start_api() {
   DATABASE_URL="$BENCH_DATABASE_URL" API_ADDR="$API_ADDR" \
@@ -111,9 +114,18 @@ for mode in $MODES; do
     drift=$(BENCH_DATABASE_URL="$BENCH_DATABASE_URL" "$out/bin/benchseed" -verify)
     # Cumulative over the mode's steps, like ledger_entries_after.
     declined=$(psql "$BENCH_DATABASE_URL" -qAt -c "SELECT count(*) FROM card_authorizations WHERE decision = 'declined'")
+    # Cumulative too: time in the rate limiter and in the requests it checked.
+    # Absent (null) on builds that do not export them.
+    metrics=$(curl -fs -H "Authorization: Bearer $(jq -r '.keys[0]' "$out/fixture.json")" "http://$API_ADDR/metrics" || true)
+    rl_checks=$(metric payments_ratelimit_checks_total)
+    rl_seconds=$(metric payments_ratelimit_check_seconds_total)
+    rl_request_seconds=$(metric payments_ratelimited_request_seconds_total)
     for row in $rows; do
       jq -c --argjson e "$entries" --argjson d "$drift" --argjson x "$declined" --arg w "$WARMUP" \
-        '. + {ledger_entries_after: $e, balance_drift: $d, declined_after: $x, warmup: $w}' "$out/step-$row.json" | tee -a "$results"
+        --argjson rc "$rl_checks" --argjson rs "$rl_seconds" --argjson rr "$rl_request_seconds" \
+        '. + {ledger_entries_after: $e, balance_drift: $d, declined_after: $x, warmup: $w,
+              ratelimit_checks_after: $rc, ratelimit_seconds_after: $rs, ratelimited_request_seconds_after: $rr}' \
+        "$out/step-$row.json" | tee -a "$results"
     done
     sleep 2
   done

@@ -312,6 +312,14 @@ func TestRateLimitReturns429ThroughTheChain(t *testing.T) {
 	if rec.Header().Get("Retry-After") == "" {
 		t.Error("a 429 carries no Retry-After header")
 	}
+
+	// Every check is timed, refused or not, and never exceeds its request.
+	if n := s.rateLimitChecks.Load(); n != limit+1 {
+		t.Errorf("rate limit checks = %d, want %d", n, limit+1)
+	}
+	if checked, total := s.rateLimitNanos.Load(), s.rateLimitedNanos.Load(); checked == 0 || checked > total {
+		t.Errorf("time in Allow = %dns of %dns, want positive and within the request", checked, total)
+	}
 }
 
 func TestRateLimitedTransferWritesNothing(t *testing.T) {
