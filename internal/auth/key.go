@@ -74,10 +74,17 @@ func Insert(ctx context.Context, db Execer, key Key) error {
 // It performs an exact hash lookup, not a byte-by-byte plaintext comparison.
 func Verify(ctx context.Context, db Querier, plaintext string) (Key, error) {
 	// Cheap shape check first, so a malformed header never reaches the database.
-	if !strings.HasPrefix(plaintext, keyPrefix) || len(plaintext) != len(keyPrefix)+43 {
+	if !wellFormed(plaintext) {
 		return Key{}, ErrInvalidKey
 	}
+	return lookup(ctx, db, hashKey(plaintext))
+}
 
+func wellFormed(plaintext string) bool {
+	return strings.HasPrefix(plaintext, keyPrefix) && len(plaintext) == len(keyPrefix)+43
+}
+
+func lookup(ctx context.Context, db Querier, hash string) (Key, error) {
 	const q = `
 		SELECT id, key_hash, prefix, name, created_at, revoked_at
 		FROM api_keys
@@ -85,7 +92,7 @@ func Verify(ctx context.Context, db Querier, plaintext string) (Key, error) {
 
 	// The display prefix is neither secret nor unique.
 	var key Key
-	err := db.QueryRow(ctx, q, hashKey(plaintext)).
+	err := db.QueryRow(ctx, q, hash).
 		Scan(&key.ID, &key.Hash, &key.Prefix, &key.Name, &key.CreatedAt, &key.RevokedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Key{}, ErrInvalidKey

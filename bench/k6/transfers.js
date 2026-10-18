@@ -4,7 +4,7 @@
 import http from 'k6/http';
 import exec from 'k6/execution';
 import { SharedArray } from 'k6/data';
-import { Counter } from 'k6/metrics';
+import { Counter, Trend } from 'k6/metrics';
 
 const fixture = JSON.parse(open(__ENV.FIXTURE));
 const keys = new SharedArray('keys', () => fixture.keys);
@@ -26,6 +26,9 @@ const TRACKED_STATUSES = [0, 202, 400, 422, 429, 500, 503];
 const statusCounters = Object.fromEntries(
   TRACKED_STATUSES.map((s) => [s, new Counter(`status_${s}`)]));
 const otherStatus = new Counter('status_other');
+// Answers and refusals apart: shedding is only cheap if the 503s are fast.
+const okDuration = new Trend('ok_duration', true);
+const refusedDuration = new Trend('refused_duration', true);
 
 export const options = {
   discardResponseBodies: true,
@@ -62,6 +65,8 @@ export default function () {
     },
   });
   (statusCounters[res.status] || otherStatus).add(1);
+  if (res.status === 202) okDuration.add(res.timings.duration);
+  if (res.status === 503) refusedDuration.add(res.timings.duration);
 }
 
 export function handleSummary(data) {
@@ -88,9 +93,15 @@ export function handleSummary(data) {
     p99_ms: Number(d['p(99)'].toFixed(2)),
     max_ms: Number(d.max.toFixed(2)),
     status_counts: statusCounts,
+    ok_p99_ms: trendP99(m.ok_duration),
+    refused_p99_ms: trendP99(m.refused_duration),
   };
   const line = JSON.stringify(row);
   const outputs = { stdout: line + '\n' };
   if (OUT) outputs[OUT] = line + '\n';
   return outputs;
+}
+
+function trendP99(metric) {
+  return metric && metric.values['p(99)'] !== undefined ? Number(metric.values['p(99)'].toFixed(2)) : null;
 }

@@ -61,6 +61,11 @@ func (s *Server) writeMetrics(w http.ResponseWriter, r *http.Request) {
 	for i := range s.httpRequests {
 		fmt.Fprintf(&output, "payments_http_requests_total{status_class=\"%dxx\"} %d\n", i+1, s.httpRequests[i].Load())
 	}
+	fmt.Fprintf(&output, "# TYPE payments_ratelimit_checks_total counter\npayments_ratelimit_checks_total %d\n", s.rateLimitChecks.Load())
+	fmt.Fprintf(&output, "# TYPE payments_ratelimit_check_seconds_total counter\npayments_ratelimit_check_seconds_total %.6f\n",
+		time.Duration(s.rateLimitNanos.Load()).Seconds())
+	fmt.Fprintf(&output, "# TYPE payments_ratelimited_request_seconds_total counter\npayments_ratelimited_request_seconds_total %.6f\n",
+		time.Duration(s.rateLimitedNanos.Load()).Seconds())
 	fmt.Fprintf(&output, "# TYPE payments_outbox_pending gauge\npayments_outbox_pending %d\n", pending)
 	fmt.Fprintf(&output, "# TYPE payments_reconciliation_last_run_timestamp_seconds gauge\npayments_reconciliation_last_run_timestamp_seconds %d\n", lastRun)
 	for _, family := range families {

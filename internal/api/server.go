@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Shailu-s/payments-platform/internal/auth"
 	"github.com/Shailu-s/payments-platform/internal/cards"
 	"github.com/Shailu-s/payments-platform/internal/ratelimit"
 
@@ -24,12 +25,25 @@ type DB interface {
 }
 
 type Server struct {
-	db            DB
-	limiter       *ratelimit.Limiter
-	gate          *accountGate
+	db DB
+	// hot serves the money routes: it refuses rather than queue for a
+	// connection. Nil falls back to db.
+	hot DB
+	// keys caches verified api keys; nil verifies every request against db.
+	keys    *auth.Cache
+	limiter *ratelimit.Limiter
+	gate    *accountGate
+	// admit holds one token per request in flight on the money routes; nil
+	// admits everything.
+	admit         chan struct{}
 	webhookSecret []byte
 	networkSecret []byte
 	httpRequests  [5]atomic.Uint64
+	// Time in the rate limiter's Allow, and in the whole request from Allow
+	// on: their ratio is the limiter's share of a rate-limited request.
+	rateLimitChecks  atomic.Uint64
+	rateLimitNanos   atomic.Uint64
+	rateLimitedNanos atomic.Uint64
 }
 
 const (
@@ -49,11 +63,22 @@ const (
 func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte) *Server {
 	return &Server{
 		db:            pool,
+		hot:           newBoundedPool(pool, poolAcquireWait),
+		keys:          auth.NewCache(pool, auth.DefaultCacheTTL, auth.DefaultCacheSize),
 		limiter:       ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
 		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
+		admit:         make(chan struct{}, admissionPerConn*int(pool.Config().MaxConns)),
 		webhookSecret: append([]byte(nil), webhookSecret...),
 		networkSecret: append([]byte(nil), networkSecret...),
 	}
+}
+
+// hotDB is the database for taps, advices, reversals and transfer creations.
+func (s *Server) hotDB() DB {
+	if s.hot != nil {
+		return s.hot
+	}
+	return s.db
 }
 
 // StartRateLimitSweeper bounds retained rate-limit windows until ctx is cancelled.
@@ -78,13 +103,17 @@ func (s *Server) Handler() http.Handler {
 	// Provider callbacks use their signing key, not a customer API key.
 	mux.HandleFunc("POST /v1/webhooks/mockbank", s.handleProviderWebhook)
 
-	// The card network signs with its own secret and answers to its own deadline.
-	mux.HandleFunc("POST /network/authorizations", s.handleNetworkAuthorization)
-	mux.HandleFunc("POST /network/advices", s.handleNetworkAdvice)
-	mux.HandleFunc("POST /network/reversals", s.handleNetworkReversal)
+	// The card network signs with its own secret and answers to its own
+	// deadline. Admission comes first, so excess is refused before the body
+	// is even read.
+	mux.Handle("POST /network/authorizations", s.withAdmission(http.HandlerFunc(s.handleNetworkAuthorization)))
+	mux.Handle("POST /network/advices", s.withAdmission(http.HandlerFunc(s.handleNetworkAdvice)))
+	mux.Handle("POST /network/reversals", s.withAdmission(http.HandlerFunc(s.handleNetworkReversal)))
 
 	authenticated := chain(s.routes(), withDeadline, s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)
+	// Admitted before auth and the rate limit, which both use the database.
+	mux.Handle("POST /v1/transfers", s.withAdmission(authenticated))
 
 	// Recovery wraps all routes; request IDs must be assigned before logging.
 	return chain(mux, withRequestID, s.withMetrics, withRecovery, withLogging)

@@ -151,7 +151,13 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 			return
 		}
 
+		start := time.Now()
 		decision, err := s.limiter.Allow(r.Context(), key.ID)
+		checked := time.Since(start)
+		s.rateLimitChecks.Add(1)
+		s.rateLimitNanos.Add(uint64(checked))
+		// Whatever the outcome, so the share of time spent in Allow is exact.
+		defer func() { s.rateLimitedNanos.Add(uint64(time.Since(start))) }()
 		if err != nil {
 			writeInternalError(w, r, err)
 			return
@@ -182,7 +188,13 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		key, err := auth.Verify(r.Context(), s.db, plaintext)
+		var key auth.Key
+		var err error
+		if s.keys != nil {
+			key, err = s.keys.Verify(r.Context(), plaintext)
+		} else {
+			key, err = auth.Verify(r.Context(), s.db, plaintext)
+		}
 		switch {
 		case errors.Is(err, auth.ErrRevokedKey):
 			writeError(w, http.StatusUnauthorized, CodeRevokedKey, "this api key has been revoked")

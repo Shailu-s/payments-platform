@@ -56,7 +56,7 @@ func (s *Server) handleNetworkReversal(w http.ResponseWriter, r *http.Request) {
 // that its approval applies, if it is ever approved. A declined row parks it
 // too: a stand-in advice can still turn it into an approval.
 func (s *Server) applyReversal(ctx context.Context, msg networkReversal) (string, error) {
-	tx, err := s.db.Begin(ctx)
+	tx, err := s.hotDB().Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("begin reversal %s: %w", msg.ReversalID, err)
 	}
