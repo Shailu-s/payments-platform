@@ -182,7 +182,13 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		key, err := auth.Verify(r.Context(), s.db, plaintext)
+		var key auth.Key
+		var err error
+		if s.keys != nil {
+			key, err = s.keys.Verify(r.Context(), plaintext)
+		} else {
+			key, err = auth.Verify(r.Context(), s.db, plaintext)
+		}
 		switch {
 		case errors.Is(err, auth.ErrRevokedKey):
 			writeError(w, http.StatusUnauthorized, CodeRevokedKey, "this api key has been revoked")

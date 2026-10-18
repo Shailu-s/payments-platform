@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Shailu-s/payments-platform/internal/auth"
 	"github.com/Shailu-s/payments-platform/internal/cards"
 	"github.com/Shailu-s/payments-platform/internal/ratelimit"
 
@@ -27,7 +28,9 @@ type Server struct {
 	db DB
 	// hot serves the money routes: it refuses rather than queue for a
 	// connection. Nil falls back to db.
-	hot     DB
+	hot DB
+	// keys caches verified api keys; nil verifies every request against db.
+	keys    *auth.Cache
 	limiter *ratelimit.Limiter
 	gate    *accountGate
 	// admit holds one token per request in flight on the money routes; nil
@@ -56,6 +59,7 @@ func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte) *Server 
 	return &Server{
 		db:            pool,
 		hot:           newBoundedPool(pool, poolAcquireWait),
+		keys:          auth.NewCache(pool, auth.DefaultCacheTTL, auth.DefaultCacheSize),
 		limiter:       ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
 		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
 		admit:         make(chan struct{}, admissionPerConn*int(pool.Config().MaxConns)),
