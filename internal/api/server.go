@@ -27,6 +27,9 @@ type Server struct {
 	db            DB
 	limiter       *ratelimit.Limiter
 	gate          *accountGate
+	// admit holds one token per request in flight on the money routes; nil
+	// admits everything.
+	admit         chan struct{}
 	webhookSecret []byte
 	networkSecret []byte
 	httpRequests  [5]atomic.Uint64
@@ -51,6 +54,7 @@ func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte) *Server 
 		db:            pool,
 		limiter:       ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
 		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
+		admit:         make(chan struct{}, admissionPerConn*int(pool.Config().MaxConns)),
 		webhookSecret: append([]byte(nil), webhookSecret...),
 		networkSecret: append([]byte(nil), networkSecret...),
 	}
@@ -78,13 +82,17 @@ func (s *Server) Handler() http.Handler {
 	// Provider callbacks use their signing key, not a customer API key.
 	mux.HandleFunc("POST /v1/webhooks/mockbank", s.handleProviderWebhook)
 
-	// The card network signs with its own secret and answers to its own deadline.
-	mux.HandleFunc("POST /network/authorizations", s.handleNetworkAuthorization)
-	mux.HandleFunc("POST /network/advices", s.handleNetworkAdvice)
-	mux.HandleFunc("POST /network/reversals", s.handleNetworkReversal)
+	// The card network signs with its own secret and answers to its own
+	// deadline. Admission comes first, so excess is refused before the body
+	// is even read.
+	mux.Handle("POST /network/authorizations", s.withAdmission(http.HandlerFunc(s.handleNetworkAuthorization)))
+	mux.Handle("POST /network/advices", s.withAdmission(http.HandlerFunc(s.handleNetworkAdvice)))
+	mux.Handle("POST /network/reversals", s.withAdmission(http.HandlerFunc(s.handleNetworkReversal)))
 
 	authenticated := chain(s.routes(), withDeadline, s.withAuth, s.withRateLimit)
 	mux.Handle("/v1/", authenticated)
+	// Admitted before auth and the rate limit, which both use the database.
+	mux.Handle("POST /v1/transfers", s.withAdmission(authenticated))
 
 	// Recovery wraps all routes; request IDs must be assigned before logging.
 	return chain(mux, withRequestID, s.withMetrics, withRecovery, withLogging)

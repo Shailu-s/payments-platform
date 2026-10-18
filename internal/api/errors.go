@@ -39,6 +39,9 @@ const (
 	CodeAccountBusy = "account_busy"
 	// CodeRequestTimeout means the request ran out of time before an answer.
 	CodeRequestTimeout = "request_timeout"
+	// CodeOverloaded means the process refused the request before doing any
+	// work for it; the same request can be retried.
+	CodeOverloaded = "overloaded"
 )
 
 // Once headers are written, encoding errors can only be logged, not answered again.
