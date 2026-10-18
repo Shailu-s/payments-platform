@@ -103,36 +103,19 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Checked up front so a missing account is a 400, not a foreign key 500.
-	if msg, code, ok := s.validateAccounts(r.Context(), req); !ok {
-		if code == CodeInternal {
-			writeInternalError(w, r, errors.New(msg))
-			return
-		}
-		writeError(w, http.StatusBadRequest, code, msg)
+	msg, err := s.validateAccounts(r.Context(), req)
+	if err != nil {
+		writeTransferError(w, r, err)
+		return
+	}
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, msg)
 		return
 	}
 
 	transfer, status, err := s.createTransfer(r.Context(), req, key.ID, idempotencyKey)
-	switch {
-	case errors.Is(err, ErrInsufficientFunds):
-		writeError(w, http.StatusUnprocessableEntity, CodeInsufficientFunds,
-			"the source account does not have enough money for this transfer")
-		return
-	case errors.Is(err, ErrAccountBusy) || isLockTimeout(err):
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, CodeAccountBusy,
-			"the source account is busy with other payments: retry with the same "+
-				"Idempotency-Key, which cannot pay twice")
-		return
-	case errors.Is(err, context.DeadlineExceeded):
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, CodeRequestTimeout,
-			"the request timed out before the payment was answered: retry with the "+
-				"same Idempotency-Key to get its outcome")
-		return
-	}
 	if err != nil {
-		writeInternalError(w, r, err)
+		writeTransferError(w, r, err)
 		return
 	}
 
@@ -146,6 +129,30 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 				"use a new key for a new payment")
 	default:
 		writeJSON(w, http.StatusAccepted, toResponse(transfer))
+	}
+}
+
+// writeTransferError answers a transfer creation that failed. Every refusal
+// under load is a 503 the client can retry with the same Idempotency-Key.
+func writeTransferError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, ErrOverloaded):
+		writeOverloaded(w)
+	case errors.Is(err, ErrInsufficientFunds):
+		writeError(w, http.StatusUnprocessableEntity, CodeInsufficientFunds,
+			"the source account does not have enough money for this transfer")
+	case errors.Is(err, ErrAccountBusy) || isLockTimeout(err):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, CodeAccountBusy,
+			"the source account is busy with other payments: retry with the same "+
+				"Idempotency-Key, which cannot pay twice")
+	case isTimeout(err):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, CodeRequestTimeout,
+			"the request timed out before the payment was answered: retry with the "+
+				"same Idempotency-Key to get its outcome")
+	default:
+		writeInternalError(w, r, err)
 	}
 }
 
@@ -183,7 +190,7 @@ func (s *Server) insertTransfer(ctx context.Context, req createTransferRequest, 
 	}
 	defer release()
 
-	tx, err := s.db.Begin(ctx)
+	tx, err := s.hotDB().Begin(ctx)
 	if err != nil {
 		return transfers.Transfer{}, fmt.Errorf("begin: %w", err)
 	}
@@ -260,6 +267,12 @@ func isLockTimeout(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == pgerrcode.LockNotAvailable
 }
 
+// isTimeout reports a deadline that expired anywhere below the handler: the
+// request's, a shorter one inside it, or the driver's.
+func isTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || pgconn.Timeout(err)
+}
+
 // replayTransfer answers a request whose idempotency key was already used.
 func (s *Server) replayTransfer(ctx context.Context, idempotencyKey, fingerprint string) (transfers.Transfer, int, error) {
 	existing, err := s.awaitTransfer(ctx, idempotencyKey)
@@ -288,7 +301,7 @@ func (s *Server) awaitTransfer(ctx context.Context, idempotencyKey string) (tran
 	var err error
 	for i := 0; i < attempts; i++ {
 		var transfer transfers.Transfer
-		transfer, err = transfers.FindByIdempotencyKey(ctx, s.db, idempotencyKey)
+		transfer, err = transfers.FindByIdempotencyKey(ctx, s.hotDB(), idempotencyKey)
 		if err == nil {
 			return transfer, nil
 		}
@@ -358,17 +371,18 @@ func validateTransferRequest(req *createTransferRequest) (string, bool) {
 
 // validateAccounts confirms both accounts exist and match the requested
 // currency, that the source can be spent from, and that neither is a card
-// held account, in one round trip.
-func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest) (message, code string, ok bool) {
+// held account, in one round trip. A non-empty message is the caller's
+// mistake; an error is ours.
+func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest) (string, error) {
 	const q = `
 		SELECT a.id, a.currency, a.type, ca.held_account_id IS NOT NULL
 		FROM accounts a
 		LEFT JOIN card_accounts ca ON ca.held_account_id = a.id
 		WHERE a.id = ANY($1)`
 
-	rows, err := s.db.Query(ctx, q, []string{req.SourceAccount, req.DestinationAccount})
+	rows, err := s.hotDB().Query(ctx, q, []string{req.SourceAccount, req.DestinationAccount})
 	if err != nil {
-		return fmt.Sprintf("load accounts: %v", err), CodeInternal, false
+		return "", fmt.Errorf("load accounts: %w", err)
 	}
 	defer rows.Close()
 
@@ -379,14 +393,14 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 		var id, currency, accountType string
 		var isHeld bool
 		if err := rows.Scan(&id, &currency, &accountType, &isHeld); err != nil {
-			return fmt.Sprintf("scan account: %v", err), CodeInternal, false
+			return "", fmt.Errorf("scan account: %w", err)
 		}
 		currencies[id] = currency
 		types[id] = accountType
 		held[id] = isHeld
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Sprintf("load accounts: %v", err), CodeInternal, false
+		return "", fmt.Errorf("load accounts: %w", err)
 	}
 
 	for _, id := range []string{req.SourceAccount, req.DestinationAccount} {
@@ -394,26 +408,24 @@ func (s *Server) validateAccounts(ctx context.Context, req createTransferRequest
 		if !found {
 			// 400, not 404: the account is a field in the body, not the
 			// resource being addressed.
-			return "no such account: " + id, CodeInvalidRequest, false
+			return "no such account: " + id, nil
 		}
 		if currency != req.Currency {
-			return fmt.Sprintf("account %s holds %s, not %s", id, currency, req.Currency),
-				CodeInvalidRequest, false
+			return fmt.Sprintf("account %s holds %s, not %s", id, currency, req.Currency), nil
 		}
 		// Its balance is money set aside for card authorizations: only
 		// authorizations and their clearing may move it.
 		if held[id] {
-			return fmt.Sprintf("account %s is a card held account and cannot be a transfer endpoint", id),
-				CodeInvalidRequest, false
+			return fmt.Sprintf("account %s is a card held account and cannot be a transfer endpoint", id), nil
 		}
 	}
 	// A settlement account has no stored balance, so nothing would stop it
 	// from being overspent.
 	if types[req.SourceAccount] == "settlement" {
 		return fmt.Sprintf("account %s is a settlement account and cannot be a transfer source",
-			req.SourceAccount), CodeInvalidRequest, false
+			req.SourceAccount), nil
 	}
-	return "", "", true
+	return "", nil
 }
 
 func (s *Server) handleGetTransfer(w http.ResponseWriter, r *http.Request) {

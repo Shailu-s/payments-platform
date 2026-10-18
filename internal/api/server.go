@@ -24,9 +24,12 @@ type DB interface {
 }
 
 type Server struct {
-	db            DB
-	limiter       *ratelimit.Limiter
-	gate          *accountGate
+	db DB
+	// hot serves the money routes: it refuses rather than queue for a
+	// connection. Nil falls back to db.
+	hot     DB
+	limiter *ratelimit.Limiter
+	gate    *accountGate
 	// admit holds one token per request in flight on the money routes; nil
 	// admits everything.
 	admit         chan struct{}
@@ -52,12 +55,21 @@ const (
 func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte) *Server {
 	return &Server{
 		db:            pool,
+		hot:           newBoundedPool(pool, poolAcquireWait),
 		limiter:       ratelimit.New(pool, DefaultRateLimit, DefaultRateWindow),
 		gate:          newAccountGate(maxInFlightPerAccount, accountSlotWait),
 		admit:         make(chan struct{}, admissionPerConn*int(pool.Config().MaxConns)),
 		webhookSecret: append([]byte(nil), webhookSecret...),
 		networkSecret: append([]byte(nil), networkSecret...),
 	}
+}
+
+// hotDB is the database for taps, advices, reversals and transfer creations.
+func (s *Server) hotDB() DB {
+	if s.hot != nil {
+		return s.hot
+	}
+	return s.db
 }
 
 // StartRateLimitSweeper bounds retained rate-limit windows until ctx is cancelled.

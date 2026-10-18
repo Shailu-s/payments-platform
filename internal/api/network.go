@@ -120,9 +120,11 @@ func (s *Server) handleNetworkAuthorization(w http.ResponseWriter, r *http.Reque
 // stored for this attempt, so the network's retry starts afresh.
 func writeNetworkError(ctx context.Context, w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, ErrOverloaded):
+		writeOverloaded(w)
 	case errors.Is(err, ErrAccountBusy) || isLockTimeout(err):
 		writeError(w, http.StatusServiceUnavailable, CodeAccountBusy, "the account is busy, retry")
-	case errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil:
+	case isTimeout(err) || ctx.Err() != nil:
 		writeError(w, http.StatusServiceUnavailable, CodeRequestTimeout, "no answer within the deadline, retry")
 	case errors.Is(err, authorizations.ErrNotFound):
 		writeError(w, http.StatusServiceUnavailable, CodeIdempotencyInFlight,
@@ -152,7 +154,7 @@ func (s *Server) authorize(ctx context.Context, req authorizations.Request) (aut
 	// connection is. Reading it inside without a lock would be no stronger: a
 	// freeze could still commit between the read and the hold.
 	var card *cards.Card
-	found, err := cards.Get(ctx, s.db, req.CardID)
+	found, err := cards.Get(ctx, s.hotDB(), req.CardID)
 	switch {
 	case err == nil:
 		card = &found
@@ -208,7 +210,7 @@ func (s *Server) authorize(ctx context.Context, req authorizations.Request) (aut
 // lock before the row, so a racing reversal is either seen parked here or
 // sees this row.
 func (s *Server) insertAuthorization(ctx context.Context, a *authorizations.Authorization, card *cards.Card) error {
-	tx, err := s.db.Begin(ctx)
+	tx, err := s.hotDB().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin authorization %s: %w", a.AuthID, err)
 	}
@@ -284,7 +286,7 @@ func (r incrementalDeclined) Error() string { return "incremental declined: " + 
 // the increment. Lock order is the authorization path's: auth_id lock, own
 // row, original row, daily spend, balances.
 func (s *Server) insertIncremental(ctx context.Context, a *authorizations.Authorization, card *cards.Card) error {
-	tx, err := s.db.Begin(ctx)
+	tx, err := s.hotDB().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin incremental %s: %w", a.AuthID, err)
 	}
@@ -350,7 +352,7 @@ func (s *Server) insertIncremental(ctx context.Context, a *authorizations.Author
 func (s *Server) declineAuthorization(ctx context.Context, a authorizations.Authorization, reason string) (authorizations.Authorization, error) {
 	a.Decision, a.ApprovedAmount, a.DeclineReason, a.LedgerTxnID = authorizations.DecisionDeclined, 0, &reason, nil
 	a.HeldAmount = 0
-	stored, inserted, err := authorizations.InsertIfAbsent(ctx, s.db, a, newID("evt"), authorizations.EventDeclined)
+	stored, inserted, err := authorizations.InsertIfAbsent(ctx, s.hotDB(), a, newID("evt"), authorizations.EventDeclined)
 	if err != nil {
 		return authorizations.Authorization{}, err
 	}
@@ -384,7 +386,7 @@ func (s *Server) awaitAuthorization(ctx context.Context, authID string) (authori
 	var err error
 	for i := 0; i < attempts; i++ {
 		var a authorizations.Authorization
-		a, err = authorizations.Get(ctx, s.db, authID)
+		a, err = authorizations.Get(ctx, s.hotDB(), authID)
 		if err == nil {
 			return a, nil
 		}
@@ -451,7 +453,7 @@ func (s *Server) handleNetworkAdvice(w http.ResponseWriter, r *http.Request) {
 // effect commit together, so a redelivered advice changes nothing.
 func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, error) {
 	var card *cards.Card
-	found, err := cards.Get(ctx, s.db, msg.CardID)
+	found, err := cards.Get(ctx, s.hotDB(), msg.CardID)
 	switch {
 	case err == nil:
 		card = &found
@@ -459,7 +461,7 @@ func (s *Server) applyAdvice(ctx context.Context, msg networkAdvice) (string, er
 		return "", err
 	}
 
-	tx, err := s.db.Begin(ctx)
+	tx, err := s.hotDB().Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("begin advice %s: %w", msg.AdviceID, err)
 	}
