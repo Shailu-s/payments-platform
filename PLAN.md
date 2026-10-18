@@ -1326,5 +1326,4 @@ admission slots. Rate limiter: 20–25 % of a rate-limited transfer's time below
 (0.27–0.41 ms per `Allow`), ~30 % above. Recommendation: do step 3 (move the limiter off
 Postgres). Deviation: an extra commit for the limiter timing and the k6 fields. Tests in
 per-package schemas on the default database; Kafka started for the Kafka packages and
-stopped; benchmarks against `payments_bench` (dropped).
-
+stopped; benchmarks against `payments_bench` (dropped). PR #19.
