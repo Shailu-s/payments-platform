@@ -1298,3 +1298,33 @@ deadline instead of early shedding); a card-read timeout before the transaction 
 500 instead of 503. Tests in per-package schemas on the default database; benchmarks
 against `payments_bench` and `payments_bench_day` (dropped). PR #18.
 
+**2026-10-18 — Phase 17 (shed load early, cache API keys) built on `phase-17-load-shedding`;
+PR open, not merged.** Executor followed `briefs/phase-17-load-shedding.md`. Commits: an
+admission limit in front of the three network routes and `POST /v1/transfers` (3 × pool
+max conns, non-blocking, `503 overloaded` + `Retry-After: 1`, registered before auth so a
+refused transfer costs no query); `boundedPool` for those routes (20 ms acquire deadline,
+then `ErrOverloaded`; query/transaction on the acquired connection under the request's
+deadline; tests keep a plain `DB`); a timed-out read before the transaction mapped to 503
+(the transfer account check had flattened its error into a string: 500); `auth.Cache`
+(hash-keyed, 30 s TTL, 10,000 entries oldest-first, singleflight per hash, live keys only,
+`Revoke` evicts locally and bumps a generation so an in-flight lookup cannot re-cache);
+`/metrics` time in `Allow` and in the rate-limited request, k6 p99 of answers and of 503s
+apart. Failing first: middleware unwired -> tap/advice/reversal 200 and transfer 202 with
+the slots full; unbounded acquire -> 503 after 1.0 s (tap) and 3.0 s client timeout
+(transfer); `ErrOverloaded` unmapped -> 500; account-check error flattened -> 500 (the
+card-read half already answered 503 on main: context deadlines were mapped); no
+singleflight -> 50 queries for 50 misses; no local eviction / no expiry -> revoked key
+accepted. Benchmarks (battery, idle machine, same session as main, 2 runs): auth-spread
+offered 3,000 -> 1,352/1,903 approved/s vs main 862/60; 2,000 -> 1,926/1,964 vs 2,000/1,814;
+p99 at 500 3.7/3.3 ms vs 6.5/3.3; transfer spread 2,000 -> 1,481/1,489 accepted p99 42–44 ms
+vs main 1,607/826 p99 4.1/5.0 s; hot transfers 1,351 vs 1,235 accepted/s at 1,500; 0 drift.
+Missed: p99 of 503s 277 ms at auth-spread 3,000 in run 1 (32 ms in run 2; CPU saturated
+with k6 on the same machine). Costs measured: 0.05–0.4 % refused at 1,000/s (admission
+limit during stalls, not the 20 ms bound: 15,977 of 16,131 transfer 503s < 1 ms); the hot
+card approves 1,614–1,680/s at 2,000 vs main 1,593–1,946 because gate waiters hold
+admission slots. Rate limiter: 20–25 % of a rate-limited transfer's time below the knee
+(0.27–0.41 ms per `Allow`), ~30 % above. Recommendation: do step 3 (move the limiter off
+Postgres). Deviation: an extra commit for the limiter timing and the k6 fields. Tests in
+per-package schemas on the default database; Kafka started for the Kafka packages and
+stopped; benchmarks against `payments_bench` (dropped).
+

@@ -792,6 +792,134 @@ pending reversals; 0 dropped iterations.
    transaction per line or hold, so they compete for the pool and the WAL but never hold
    an account's balance lock across a batch.
 
+## Phase 17: shed load early, cache API keys (2026-10-18)
+
+Three changes on the money routes (taps, advices, reversals, `POST /v1/transfers`): a
+process-wide admission limit of 3 × pool size (30) in flight, refused at once with `503
+overloaded`; a 20 ms bound on waiting for a pool connection, then the same 503; and an
+in-process API key cache (30 s TTL). Apple M4, **battery** (no AC available), `caffeinate -i`,
+only the Postgres container running, machine otherwise idle, pool 10, 30 s steps, 15 s
+discarded warm-up per mode. `main` (`427703c`) measured in the same session from a detached
+worktree carrying this branch's bench scripts (they only add fields), alternating main then
+branch. `balance_drift` 0 and `declined_after` 0 on every step of every run.
+
+```sh
+MODES="auth-spread auth-hot" RATES="500 1000 1500 2000 3000" make bench-http   # 2 runs each
+MODES="spread" RATES="500 1000 1500 2000" make bench-http                      # 2 runs each
+MODES="hot" RATES="500 1000 1500" make bench-http                              # 1 valid run each
+```
+
+New per-step fields: `ok_p99_ms` / `refused_p99_ms` (p99 of the 200/202 answers and of the
+503s, apart) and the rate limiter's cumulative time from `/metrics`.
+
+### Authorizations, spread over 1,001 cards (run 1 / run 2)
+
+| offered /s | build | approved /s | 503s | p50 ms | p99 ms | p99 of approvals | p99 of 503s |
+|---:|---|---|---|---|---|---|---|
+| 500 | main | 500 / 500 | 0 / 0 | 1.40 / 1.65 | 6.52 / 3.33 | 6.52 / 3.33 | – |
+| 500 | p17 | 500 / 499 | 0 / 3 | 1.55 / 1.59 | **3.72 / 3.25** | 3.72 / 3.25 | – / 0.38 |
+| 1,000 | main | 1,000 / 1,000 | 0 / 0 | 0.87 / 0.81 | 30.71 / 9.15 | 30.71 / 9.15 | – |
+| 1,000 | p17 | 997 / 999 | 81 / 16 | 0.76 / 0.82 | **8.98 / 3.89** | 7.18 / 3.88 | 43.3 / 22.8 |
+| 1,500 | main | 1,500 / 1,500 | 0 / 0 | 0.79 / 1.03 | 69.37 / 83.77 | 69.37 / 83.77 | – |
+| 1,500 | p17 | 1,474 / 1,493 | 756 / 183 | 0.80 / 0.76 | 22.12 / 7.28 | 20.28 / 6.24 | 40.2 / 35.6 |
+| 2,000 | main | 2,000 / **1,814** | 0 / 5,478 | 0.87 / 89.03 | 226.10 / 1,003.26 | 226.10 / 725.69 | – / 1,023.0 |
+| 2,000 | p17 | 1,926 / 1,964 | 2,218 / 1,057 | 1.05 / 0.86 | 28.95 / 20.26 | 27.28 / 14.17 | 43.7 / 40.3 |
+| 3,000 | main | **862 / 60** | 63,800 / 87,528 | 1,000.23 / 1,000.40 | 1,009.05 / 1,021.36 | 996.39 / 1,032.80 | 1,012.0 / 1,020.7 |
+| 3,000 | p17 | **1,352 / 1,903** | 49,430 / 32,901 | 11.57 / 11.73 | 207.55 / 42.13 | 87.50 / 44.43 | **276.7** / 31.9 |
+
+Main also dropped 323 / 646 iterations at 3,000 (k6 ran out of VUs waiting on 1 s answers)
+and 91 at 2,000 in run 2; the branch dropped none.
+
+### Authorizations on one hot card (run 1 / run 2)
+
+| offered /s | build | approved /s | 503s | p99 ms | p99 of 503s |
+|---:|---|---|---|---|---|
+| 500 | main | 500 / 500 | 0 / 0 | 12.94 / 10.34 | – |
+| 500 | p17 | 500 / 500 | 0 / 0 | 6.08 / 4.14 | – |
+| 1,000 | main | 1,000 / 998 | 0 / 47 | 21.39 / 45.71 | – / 127.4 |
+| 1,000 | p17 | 999 / 993 | 19 / 204 | 15.96 / 22.39 | 1.0 / 40.0 |
+| 1,500 | main | 1,500 / 1,491 | 0 / 245 | 74.74 / 91.60 | – / 192.5 |
+| 1,500 | p17 | 1,477 / 1,487 | 667 / 363 | 26.67 / 19.86 | 4.1 / 20.7 |
+| 2,000 | main | 1,946 / 1,593 | 1,614 / 12,203 | 104.64 / 117.02 | 146.4 / 160.7 |
+| 2,000 | p17 | 1,614 / 1,680 | 11,561 / 9,590 | 40.74 / 39.53 | 3.6 / 6.5 |
+| 3,000 | main | 1,215 / 572 | 53,536 / 72,818 | 155.66 / 177.23 | 160.0 / 182.9 |
+| 3,000 | p17 | 852 / 1,033 | 64,413 / 58,990 | 99.85 / 58.52 | 31.0 / 6.6 |
+
+### Transfers (run 1 / run 2)
+
+| step | build | accepted /s | 503s | dropped | p50 ms | p99 ms | p99 of 503s |
+|---|---|---|---|---|---|---|---|
+| spread 500 | main | 500 / 500 | 0 / 0 | 0 / 0 | 1.54 / 1.46 | 17.95 / 4.14 | – |
+| spread 500 | p17 | 500 / 500 | 0 / 0 | 0 / 0 | 1.43 / 1.41 | **5.89 / 4.02** | – |
+| spread 1,000 | main | 1,000 / 1,000 | 0 / 0 | 0 / 0 | 1.23 / 1.84 | 9.52 / 32.52 | – |
+| spread 1,000 | p17 | 996 / 998 | 119 / 58 | 0 / 0 | 1.23 / 1.31 | 14.79 / 8.76 | 10.6 / 0.5 |
+| spread 1,500 | main | 1,500 / **1,374** | 0 / 21 | 0 / 3,736 | 1.50 / 1,367.37 | 69.53 / 2,370.25 | – / 1,944.4 |
+| spread 1,500 | p17 | 1,434 / 1,475 | 1,953 / 745 | 0 / 0 | 4.98 / 5.34 | 46.28 / 26.74 | 90.7 / 59.6 |
+| spread 2,000 | main | 1,607 / **826** | 75 / 7,544 | 11,709 / 27,649 | 1,083.31 / 3,279.65 | 4,102.39 / 5,004.04 | 3,384.7 / 5,015.4 |
+| spread 2,000 | p17 | 1,481 / 1,489 | 15,560 / 15,328 | 0 / 0 | 17.55 / 17.70 | 43.62 / 41.75 | 5.5 / 15.2 |
+| hot 500 | main | 500 | 0 | 0 | 1.49 | 40.67 | – |
+| hot 500 | p17 | 499 | 15 | 0 | 1.44 | 18.51 | 29.6 |
+| hot 1,000 | main | 1,000 | 1 | 0 | 1.29 | 109.04 | 127.2 |
+| hot 1,000 | p17 | 984 | 463 | 0 | 1.23 | 39.53 | 110.7 |
+| hot 1,500 | main | 1,235 | 7,922 | 0 | 74.84 | 353.06 | 460.1 |
+| hot 1,500 | p17 | **1,351** | 4,447 | 0 | 1.43 | 62.69 | 12.9 |
+
+A first main hot run is excluded: the laptop slept during it (one request took 965 s).
+
+### The rate limiter's share of a transfer
+
+`/metrics` times `Allow` and the whole request from `Allow` on (validation, account check,
+transaction). Per step, from the deltas, both runs:
+
+| spread step | time in `Allow` per check | request time from `Allow` on | limiter share |
+|---|---:|---:|---:|
+| 500 | 0.27–0.29 ms | 1.37–1.42 ms | **20.0–20.6 %** |
+| 1,000 | 0.38–0.41 ms | 1.55–1.69 ms | **24.0–24.6 %** |
+| 1,500 | 1.76–1.94 ms | 6.6–6.9 ms | 26.6–28.1 % |
+| 2,000 | 5.8 ms | 19.1 ms | 30.3–30.5 % |
+
+Above the knee the share includes `Allow` waiting for a pool connection (its pool is not
+bounded).
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| auth-spread approvals at every overloaded step | ≥ ~900/s, no collapse | **Met**: 1,926–1,964 at 2,000 (main 1,814–2,000), 1,352–1,903 at 3,000 (main 60–862) |
+| p99 of the 503s under overload | < 50 ms | **Met except one step**: 22.8–43.7 ms at 1,000–2,000 and 31.9 ms at 3,000 in run 2; **276.7 ms at 3,000 in run 1**; see 3 |
+| auth-spread p99 of approvals at 500 / 1,000 | not worse than main beyond noise | **Met**: 3.72 / 3.25 vs 6.52 / 3.33 at 500; 7.18 / 3.88 vs 30.71 / 9.15 at 1,000 |
+| Regression rule: transfer spread p99 at 500 | ≤ +20 % vs main | **Met**: 5.89 / 4.02 vs 17.95 / 4.14 ms |
+| Regression rule: hot transfer ceiling | not lower | **Met**: 1,351 accepted/s at 1,500 vs main 1,235 (one run each) |
+| Balance drift | 0 | **Met** on every step |
+
+### What the numbers say
+
+1. **Throughput levels off instead of collapsing.** Offered 3,000 taps/s, main answered
+   60–862/s and spent the rest waiting out the 1 s deadline; the branch approves
+   1,352–1,903/s and refuses the excess. The refused tap costs a goroutine for
+   microseconds instead of one second, so the approvals behind it stay fast (p99 of
+   approvals 44–88 ms at 3,000 against main's ~1 s). Transfers show the same at 2,000/s:
+   1,481–1,489 accepted with p99 42–44 ms against main's 826–1,607 with p99 4–5 s.
+2. **The cost is refusals below the knee.** At 1,000/s the branch refuses 16–119 requests
+   per 30 s (0.05–0.4 %) that main served late; at 2,000 taps/s 1,057–2,218 (1.8–3.7 %).
+   Almost all are admission refusals: in transfer run 2, 15,977 of 16,131 503s took under
+   1 ms (the limit), 151 took 20 ms or more (the connection bound or the account gate).
+   At 1,000/s about 1.5 requests are in flight on average, so 30 means a stall (checkpoint,
+   GC, the load generator) piled them up. For a tap the network retries once with the same
+   `auth_id`; for a transfer the client retries with the same Idempotency-Key. The hot card
+   at 2,000/s approves 1,614–1,680/s against main's 1,593–1,946: requests parked at the
+   per-account gate hold admission tokens, so one hot card can fill the 30 slots and
+   refuses sooner; the p99 drops from ~110 ms to ~40 ms.
+3. **A 503 is only as fast as the CPU that writes it.** The admission refusal does no I/O,
+   but at 3,000/s in run 1 the API, k6 and Postgres saturated the 10 cores and the p99 of
+   refusals reached 277 ms (run 2: 32 ms). k6 on the same machine is part of the load; on a
+   separate load generator this tail would belong to the API alone.
+4. **The rate limiter is a fifth to a quarter of a transfer below the knee** (0.27–0.41 ms
+   of 1.4–1.7 ms; ~30 % above it). With API keys now cached it is the only database write
+   per request that is not the payment itself. Moving it to Redis (or an approximate
+   in-process bucket) would cut that share and free a pool connection per request; see the
+   phase 17 log entry for the recommendation.
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two

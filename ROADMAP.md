@@ -20,6 +20,7 @@ method, the rules and the session LOG stay in PLAN.md.
 | 14 refunds | merged 2026-10-17 | #16 | refund = new transaction (payable -> available), charge's entries unchanged; refunds past the purchase credited and flagged; same refund line twice / 4 concurrent importers -> credited once; 4 concurrent PostDeferred runs -> each deferred line once; import 10,000 refunds ~1,250/s |
 | 15 network settlement and reconciliation | merged 2026-10-17 | #17 | 20 concurrent settlements of one day -> 1 row, 1 ledger transaction, payable back to 0; one corrupted day -> all 9 exception classes, ledger unchanged; 10 simulator scenarios end to end -> 9 MATCHED + 1 offline purchase; same run ID + bytes -> same run, other bytes refused; settle 10,000 lines ~4 ms, reconcile 10,000 ~55 ms |
 | 16 benchmark and evidence | in review | #18 | auth-spread knee ~1,000/s (p99 9.4 ms at 500, 68 ms at 1,000, median of 3, laptop under a video call); hot card ~500 approvals/s clean; card day: tap p99 6 -> 43 ms during a 10,000-line clearing import + 2,000 expiries, books reconcile (9,940 MATCHED + 60 offline), 0 drift; 20 concurrent copies x 30 auth_ids under load -> 1 row/hold each; 400 early/racing reversals -> each released once; SIGKILLed API -> network and issuer agree, 0 partial holds |
+| 17 load shedding (post-V2 tuning) | in review | — | offered 3,000 taps/s: 1,352-1,903 approved/s vs main 60-862 (collapse), excess refused with 503 overloaded; transfers at 2,000/s: 1,481-1,489 accepted, p99 42-44 ms vs main 826-1,607, p99 4-5 s; 100 verifications -> 1 key query; 50 concurrent misses -> 1 query; rate limiter 20-25 % of a transfer below the knee |
 
 **V2 complete when phase 16 merges (2026-10-17):** the debit card backend, phases 8-16. Next: V3 (stablecoin top-up).
 
@@ -340,3 +341,17 @@ the books. Chaos tests: `TestDuplicateAuthorizationsUnderLoad`,
 mechanism removed. README rewritten around the card story. Number: see BENCHMARKS.md
 phase 16. Open risk: past the knee goodput collapses to the 1 s deadline instead of
 shedding early.
+
+**2026-10-18 — Phase 17, load shedding (post-V2 tuning) (in review).** Past the knee,
+phase 16 measured goodput collapsing to the 1 s deadline. Taps, advices, reversals and
+transfer creations now pass a process-wide admission limit (buffered-channel semaphore,
+3 × pool size, never waits: full -> `503 overloaded`, `Retry-After: 1`) and wait at most
+20 ms for a pool connection (`boundedPool`: acquire under a short deadline, run the
+transaction on that connection under the request's). A timed-out read before the
+transaction answers 503, not 500. `auth.Cache` keeps verified API keys for 30 s by hash,
+bounded, one query per concurrent miss; revocation lag on other processes = TTL. `/metrics`
+exports the rate limiter's time. Proof: `TestExcessRequestsAreRefusedImmediately`,
+`TestSlowPoolAcquireReturns503Fast`, `TestCardLookupTimeoutIs503`,
+`TestAPIKeyCacheServesWithoutTheDatabase`, `TestRevokedKeyIsEvictedLocally`,
+`TestCachedKeyExpiresAfterTTL`, `TestConcurrentMissesQueryOnce`. Number: see BENCHMARKS.md
+phase 17.

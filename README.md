@@ -80,7 +80,9 @@ after a discarded 15 s warm-up, median of 3 runs. Taps spread over 1,001 cards:
 | 1,500 | 1,439 | 1,000.89 | 1,005.33 | 1,022.76 | 0 / 39,822 / 42,057 (per run) |
 
 - **Knee: ~1,000 authorizations/s** with p99 under the 100 ms target. Past it, goodput
-  collapses (requests wait out the 1 s deadline and answer 503; the network stands in).
+  collapsed (requests waited out the 1 s deadline and answered 503); since phase 17 the
+  excess is refused in milliseconds and approvals level off (1,350–1,900/s offered 3,000,
+  [BENCHMARKS.md](BENCHMARKS.md#phase-17-shed-load-early-cache-api-keys-2026-10-18)).
 - **One hot card: ~500 approvals/s** clean; offered 1,000/s it approves 517–965/s and
   refuses the rest fast with `503 account_busy`, because spending from one account is
   serialised on its balance row.
@@ -124,8 +126,18 @@ BENCHMARKS.md).
   partitioning accounts across databases.
 - **Per-process admission gate.** The 4-in-flight-per-account cap lives in each API process:
   N replicas admit 4N per account (the balance row lock still prevents overspend).
-- **Goodput collapse past the knee**: overload is answered by the 1 s deadline, not by early
-  shedding; the network's stand-in absorbs it as credit exposure.
+- **Load shedding is per process and refuses a little early** (phase 17). Each API process
+  admits 3 × its pool size of taps, advices, reversals and transfer creations in flight
+  and waits at most 20 ms for a connection; past that it answers `503 overloaded` at once.
+  Offered 3,000 taps/s it keeps approving 1,350–1,900/s instead of collapsing to 60–860/s,
+  but a stall below the knee also refuses a few (0.05–0.4 % at 1,000/s) that would have
+  been served late; the network retries once and then stands in. Requests waiting at the
+  per-account gate hold admission slots, so one very hot card fills them sooner.
+- **Revoked API keys keep working for up to 30 s** on processes other than the one that
+  revoked them: verified keys are cached in memory for 30 s. Unknown keys are not cached
+  and still cost a query each.
+- **The rate limiter is in Postgres**: about 20–25 % of a transfer's time below the knee
+  ([BENCHMARKS.md](BENCHMARKS.md#phase-17-shed-load-early-cache-api-keys-2026-10-18)).
 - **Reconciliation holds a day in memory** (~2.9 KB per record; 100,000 lines ≈ 290 MB).
   `HOLD_AFTER_CLEARING` compares transaction start times, so an incremental that started
   before the clearing transaction but waited on its lock is not caught; a late advice is
@@ -492,6 +504,8 @@ confirms its outcome. Spending is serialised on the source account's stored bala
 taken last in the transaction; past an account's ceiling requests are refused fast with
 `503 account_busy` (4 in flight per account per process, 100 ms wait, 250 ms lock timeout)
 and clients retry with the same Idempotency-Key. Every `/v1/` request has a 5 s deadline.
+A process with 3 × pool size transfer creations and taps in flight, or no connection free
+within 20 ms, answers `503 overloaded` with `Retry-After: 1` and records nothing.
 
 ### End-to-end demonstration
 
