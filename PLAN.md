@@ -1327,3 +1327,9 @@ admission slots. Rate limiter: 20–25 % of a rate-limited transfer's time below
 Postgres). Deviation: an extra commit for the limiter timing and the k6 fields. Tests in
 per-package schemas on the default database; Kafka started for the Kafka packages and
 stopped; benchmarks against `payments_bench` (dropped). PR #19.
+
+**2026-10-19 — Phases 16 and 17 merged; flow docs.** PR #18 (phase 16, benchmark and
+evidence, V2 complete) merged 2026-10-17; PR #19 (phase 17, load shedding and the API key
+cache) merged 2026-10-18. The owner added `SYSTEM_DESIGN.md` (the system on one page, the
+scaling steps and their triggers) and `docs/flows/` (request flow diagrams) on `feat/docs`;
+they ship with phase 18. ROADMAP progress rows and phase log updated to merged.
