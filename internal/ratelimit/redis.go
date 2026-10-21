@@ -3,7 +3,9 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -57,6 +59,8 @@ type RedisLimiter struct {
 	window time.Duration
 	ttlMS  int64
 	now    func() time.Time
+	// Unix nanoseconds of the last fail-open warning.
+	lastWarn atomic.Int64
 }
 
 // NewRedis counts in client. Windows shorter than a second share a key, since
@@ -74,7 +78,8 @@ func NewRedis(client *redis.Client, limit int, window time.Duration) *RedisLimit
 	}
 }
 
-// Allow counts every request, including refusals, in one round trip.
+// Allow counts every request, including refusals, in one round trip under its
+// own redisTimeout. Any Redis error lets the request through as Degraded.
 // Replicas take the window from their own clocks: with skew, requests near a
 // boundary may count into the adjacent window (the Postgres limiter does the
 // same).
@@ -83,11 +88,27 @@ func (l *RedisLimiter) Allow(ctx context.Context, apiKeyID string) (Decision, er
 	start := windowStart(now, l.window)
 	resetAt := start.Add(l.window)
 
+	ctx, cancel := context.WithTimeout(ctx, redisTimeout)
+	defer cancel()
 	count, err := incrWindow.Run(ctx, l.client, []string{redisKey(apiKeyID, start)}, l.ttlMS).Int64()
 	if err != nil {
-		return Decision{}, fmt.Errorf("rate limit %s: %w", apiKeyID, err)
+		// Fail open: while Redis is down or slow, quotas are not enforced
+		// rather than every payment failing. Admission and the bounded pool
+		// still protect the database.
+		l.warn(err)
+		return Decision{Allowed: true, Limit: l.limit, Degraded: true}, nil
 	}
 	return decide(int(count), l.limit, now, resetAt), nil
+}
+
+// warn logs at most once a second, so an outage does not log every request.
+func (l *RedisLimiter) warn(err error) {
+	now := time.Now().UnixNano()
+	last := l.lastWarn.Load()
+	if now-last < int64(time.Second) || !l.lastWarn.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("rate limiter failing open: redis unavailable", "error", err)
 }
 
 func redisKey(apiKeyID string, windowStart time.Time) string {

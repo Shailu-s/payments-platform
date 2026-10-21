@@ -44,6 +44,8 @@ type Server struct {
 	rateLimitChecks  atomic.Uint64
 	rateLimitNanos   atomic.Uint64
 	rateLimitedNanos atomic.Uint64
+	// Requests served unchecked because the limiter's store was unreachable.
+	rateLimitFailOpen atomic.Uint64
 }
 
 const (

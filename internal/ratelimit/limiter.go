@@ -36,6 +36,9 @@ type Decision struct {
 	Remaining  int
 	RetryAfter time.Duration // how long until the window rolls over
 	ResetAt    time.Time
+	// Degraded: the counter could not be reached and the request was let
+	// through unchecked (Redis only). Remaining and ResetAt are unknown.
+	Degraded bool
 }
 
 // Allow counts every request, including refusals, and reports quota remaining.

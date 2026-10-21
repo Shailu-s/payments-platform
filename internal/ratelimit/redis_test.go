@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -137,6 +138,8 @@ func raceReplicas(t *testing.T, allow func(*RedisLimiter) func(context.Context, 
 				switch {
 				case err != nil:
 					nFailed.Add(1)
+				case decision.Degraded:
+					nDegraded.Add(1)
 				case decision.Allowed:
 					nAllowed.Add(1)
 				default:
@@ -224,4 +227,88 @@ func TestRedisRefusalCarriesRetryAfter(t *testing.T) {
 		t.Errorf("second request: allowed %v, remaining %d, retry after %v; want false, 0, 1s",
 			d.Allowed, d.Remaining, d.RetryAfter)
 	}
+}
+
+// Redis is down: the request is allowed, marked degraded, and the check gives
+// up at once instead of turning a Redis outage into a payments outage.
+func TestRedisDownFailsOpen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // nothing listens here now
+
+	l := NewRedis(clientFor(t, addr), 100, time.Minute)
+	start := time.Now()
+	d, err := l.Allow(context.Background(), "ak_down")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Allow returned %v, want nil: an error answers 500", err)
+	}
+	if !d.Allowed || !d.Degraded || d.Limit != 100 {
+		t.Errorf("decision = %+v, want allowed, degraded, limit 100", d)
+	}
+	if elapsed >= 50*time.Millisecond {
+		t.Errorf("Allow took %v with Redis down, want under 50ms", elapsed)
+	}
+}
+
+// Redis accepts the connection and never answers: the check gives up after
+// its own deadline, not the caller's.
+func TestRedisSlowFailsOpenWithinDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c) // held open, never read or answered
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+
+	l := NewRedis(clientFor(t, ln.Addr().String()), 100, time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	d, err := l.Allow(ctx, "ak_slow")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Allow returned %v, want nil", err)
+	}
+	if !d.Allowed || !d.Degraded {
+		t.Errorf("decision = %+v, want allowed and degraded", d)
+	}
+	if limit := redisTimeout + 20*time.Millisecond; elapsed > limit {
+		t.Errorf("Allow took %v against a silent Redis, want at most %v", elapsed, limit)
+	}
+}
+
+func clientFor(tb testing.TB, addr string) *redis.Client {
+	tb.Helper()
+	opts, err := RedisOptions("redis://"+addr+"/14", 4)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	client := redis.NewClient(opts)
+	tb.Cleanup(func() { _ = client.Close() })
+	return client
 }
