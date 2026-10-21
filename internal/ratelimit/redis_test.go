@@ -15,50 +15,19 @@ import (
 
 var testRedisURL string
 
-func pingRedis(ctx context.Context, url string) error {
-	opts, err := RedisOptions(url, 1)
-	if err != nil {
-		return err
-	}
-	client := redis.NewClient(opts)
-	defer client.Close()
-	return client.Ping(ctx).Err()
-}
-
-// newRedisClient is one API replica's client, with the production options.
-func newRedisClient(tb testing.TB, poolSize int) *redis.Client {
+// relaxed is one API replica's client with the latency bounds lifted, for
+// tests about counting, not timing: 200 requests released at once through Docker Desktop's port forwarding can take
+// longer than 10 ms, which would fail them open and hide what is counted.
+func relaxed(tb testing.TB, poolSize int) *redis.Client {
 	tb.Helper()
 	opts, err := RedisOptions(testRedisURL, poolSize)
 	if err != nil {
 		tb.Fatal(err)
 	}
+	opts.ReadTimeout, opts.WriteTimeout, opts.PoolTimeout = 5*time.Second, 5*time.Second, 5*time.Second
 	client := redis.NewClient(opts)
 	tb.Cleanup(func() { _ = client.Close() })
 	return client
-}
-
-// warm opens n connections up front, so a test measures counting rather than
-// dialling under the 10 ms budget.
-func warm(tb testing.TB, client *redis.Client, n int) {
-	tb.Helper()
-	var wg sync.WaitGroup
-	errs := make(chan error, n)
-	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			errs <- client.Do(ctx, "PING").Err()
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			tb.Fatalf("warm: %v", err)
-		}
-	}
 }
 
 // redisKeyID is a key id no other test or package uses, so tests sharing the
@@ -88,7 +57,7 @@ func TestRedisLimitHoldsAcrossReplicas(t *testing.T) {
 		return l.Allow
 	})
 	if degraded != 0 {
-		t.Fatalf("%d decisions failed open: Redis did not answer within %v", degraded, redisTimeout)
+		t.Fatalf("%d decisions failed open", degraded)
 	}
 	if allowed != 100 || refused != 100 {
 		t.Errorf("allowed %d, refused %d across 4 replicas, want exactly 100 and 100", allowed, refused)
@@ -116,12 +85,12 @@ func raceReplicas(t *testing.T, allow func(*RedisLimiter) func(context.Context, 
 	limiters := make([]*RedisLimiter, replicas)
 	var keyID string
 	for i := range limiters {
-		client := newRedisClient(t, perReplica)
-		warm(t, client, perReplica)
+		client := relaxed(t, perReplica)
 		if i == 0 {
 			keyID = redisKeyID(t, client)
 		}
 		limiters[i] = NewRedis(client, limit, time.Minute)
+		limiters[i].timeout = 5 * time.Second
 	}
 
 	var nAllowed, nRefused, nDegraded, nFailed atomic.Int64
@@ -161,11 +130,12 @@ func raceReplicas(t *testing.T, allow func(*RedisLimiter) func(context.Context, 
 // later requests leave it alone; the next window is a new key from 1.
 func TestRedisWindowKeyExpires(t *testing.T) {
 	ctx := context.Background()
-	client := newRedisClient(t, 2)
+	client := relaxed(t, 2)
 	keyID := redisKeyID(t, client)
 
 	const window = time.Minute
 	l := NewRedis(client, 5, window)
+	l.timeout = 5 * time.Second
 	now := time.Date(2026, 10, 20, 12, 0, 30, 0, time.UTC)
 	l.now = func() time.Time { return now }
 	key := redisKey(keyID, windowStart(now, window))
@@ -209,10 +179,11 @@ func TestRedisWindowKeyExpires(t *testing.T) {
 // A refusal says how long until the window rolls over, never less than 1 s.
 func TestRedisRefusalCarriesRetryAfter(t *testing.T) {
 	ctx := context.Background()
-	client := newRedisClient(t, 2)
+	client := relaxed(t, 2)
 	keyID := redisKeyID(t, client)
 
 	l := NewRedis(client, 1, time.Minute)
+	l.timeout = 5 * time.Second
 	now := time.Date(2026, 10, 20, 12, 0, 59, 800_000_000, time.UTC)
 	l.now = func() time.Time { return now }
 

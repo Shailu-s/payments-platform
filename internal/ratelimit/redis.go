@@ -58,7 +58,9 @@ type RedisLimiter struct {
 	limit  int
 	window time.Duration
 	ttlMS  int64
-	now    func() time.Time
+	// timeout is redisTimeout; tests about counting, not latency, raise it.
+	timeout time.Duration
+	now     func() time.Time
 	// Unix nanoseconds of the last fail-open warning.
 	lastWarn atomic.Int64
 }
@@ -73,8 +75,9 @@ func NewRedis(client *redis.Client, limit int, window time.Duration) *RedisLimit
 		// Twice the window: the key outlives its window even when it was
 		// created at the window's last instant, so a slow request can never
 		// recreate an expired key and restart the count mid-window.
-		ttlMS: (2 * window).Milliseconds(),
-		now:   nowUTC,
+		ttlMS:   (2 * window).Milliseconds(),
+		timeout: redisTimeout,
+		now:     nowUTC,
 	}
 }
 
@@ -88,7 +91,7 @@ func (l *RedisLimiter) Allow(ctx context.Context, apiKeyID string) (Decision, er
 	start := windowStart(now, l.window)
 	resetAt := start.Add(l.window)
 
-	ctx, cancel := context.WithTimeout(ctx, redisTimeout)
+	ctx, cancel := context.WithTimeout(ctx, l.timeout)
 	defer cancel()
 	count, err := incrWindow.Run(ctx, l.client, []string{redisKey(apiKeyID, start)}, l.ttlMS).Int64()
 	if err != nil {

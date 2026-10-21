@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 	url, err := testredis.URL()
 	if err == nil {
 		testRedisURL = url
-		err = pingRedis(ctx, url)
+		err = testredis.Ping(ctx, url)
 	}
 	if err != nil {
 		fmt.Fprint(os.Stderr, testredis.ConnectionHint(err))

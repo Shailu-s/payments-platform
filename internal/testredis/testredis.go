@@ -2,8 +2,10 @@
 package testredis
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -38,4 +40,17 @@ Start it with:   docker compose -f docker/docker-compose.yml up -d --wait redis
 Or point at one: TEST_REDIS_URL=redis://host:port/14
 Or skip them:    LEDGER_TESTS=skip go test ./...
 `, err)
+}
+
+// Ping checks that Redis answers at url.
+func Ping(ctx context.Context, url string) error {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		return err
+	}
+	client := redis.NewClient(opts)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return client.Ping(ctx).Err()
 }
