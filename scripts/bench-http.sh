@@ -13,6 +13,9 @@
 # HOT_HISTORY gives the hot account that many pre-existing entries.
 # Each mode first runs WARMUP at its first rate and discards it: the first
 # measured step of a fresh API process otherwise carries the worst tail.
+# RATE_LIMIT_BACKEND (redis or postgres) picks the API's rate limiter; with
+# redis it counts in BENCH_REDIS_URL, a database other than 0 that every
+# mode flushes. Builds without the setting ignore it and report null.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,6 +30,8 @@ ACCOUNTS="${ACCOUNTS:-1000}"
 KEYS="${KEYS:-3000}"
 SPREAD_RATE="${SPREAD_RATE:-300}"
 HOT_HISTORY="${HOT_HISTORY:-0}"
+RATE_LIMIT_BACKEND="${RATE_LIMIT_BACKEND:-redis}"
+BENCH_REDIS_URL="${BENCH_REDIS_URL:-redis://localhost:6379/15}"
 LABEL="${LABEL:-$(git rev-parse --short HEAD)}"
 # Throwaway, shared by the API and k6 only for this run.
 NETWORK_SECRET="$(openssl rand -hex 32)"
@@ -36,6 +41,15 @@ case "$db_name" in
   payments_bench*) ;;
   *) echo "refusing: $db_name is not a payments_bench* database" >&2; exit 1 ;;
 esac
+
+# redis://host:port/N without credentials; N must not be 0 (the application's).
+if [[ ! "$BENCH_REDIS_URL" =~ ^redis://([^:/@]+):([0-9]+)/([0-9]+)$ ]]; then
+  echo "refusing: BENCH_REDIS_URL must look like redis://host:port/N" >&2; exit 1
+fi
+redis_host="${BASH_REMATCH[1]}" redis_port="${BASH_REMATCH[2]}" redis_db="${BASH_REMATCH[3]}"
+if [ "$redis_db" -eq 0 ]; then
+  echo "refusing: BENCH_REDIS_URL selects database 0" >&2; exit 1
+fi
 
 out="$PWD/bench/out/$LABEL"
 mkdir -p "$out/bin"
@@ -50,6 +64,23 @@ reset_db() {
   migrate -path db/migrations -database "$BENCH_DATABASE_URL" up >/dev/null
   BENCH_DATABASE_URL="$BENCH_DATABASE_URL" "$out/bin/benchseed" \
     -accounts "$ACCOUNTS" -keys "$KEYS" -history "$HOT_HISTORY" -cards -out "$out/fixture.json"
+  flush_redis
+}
+
+# flush_redis empties the benchmark's Redis database (only that index), so no
+# mode inherits another's counters. Plain RESP over bash's /dev/tcp: no
+# redis-cli needed on the host.
+flush_redis() {
+  [ "$RATE_LIMIT_BACKEND" = redis ] || return 0
+  local reply
+  exec 3<>"/dev/tcp/$redis_host/$redis_port"
+  printf 'SELECT %s\r\nFLUSHDB\r\n' "$redis_db" >&3
+  reply=$(head -c 10 <&3)
+  exec 3<&-
+  # $(...) drops the final newline.
+  if [ "$reply" != $'+OK\r\n+OK\r' ]; then
+    echo "redis FLUSHDB on database $redis_db failed: $reply" >&2; exit 1
+  fi
 }
 
 # run_k6 ROW_MODE MODE RATE KEY_OFFSET STEP [DURATION] writes one row to
@@ -72,6 +103,7 @@ api_pid=""
 start_api() {
   DATABASE_URL="$BENCH_DATABASE_URL" API_ADDR="$API_ADDR" \
     MOCKBANK_WEBHOOK_SECRET="$(openssl rand -hex 32)" NETWORK_SECRET="$NETWORK_SECRET" \
+    RATE_LIMIT_BACKEND="$RATE_LIMIT_BACKEND" REDIS_URL="$BENCH_REDIS_URL" \
     "$out/bin/api" > "$out/api.log" 2>&1 &
   api_pid=$!
   for _ in $(seq 1 50); do
@@ -120,11 +152,16 @@ for mode in $MODES; do
     rl_checks=$(metric payments_ratelimit_checks_total)
     rl_seconds=$(metric payments_ratelimit_check_seconds_total)
     rl_request_seconds=$(metric payments_ratelimited_request_seconds_total)
+    rl_failopen=$(metric payments_ratelimit_failopen_total)
+    # The backend the API reported at startup; null on builds that do not.
+    rl_backend=$(jq -cR 'fromjson? | select(.msg == "rate limiter") | .backend' "$out/api.log" | head -1 || true)
     for row in $rows; do
       jq -c --argjson e "$entries" --argjson d "$drift" --argjson x "$declined" --arg w "$WARMUP" \
         --argjson rc "$rl_checks" --argjson rs "$rl_seconds" --argjson rr "$rl_request_seconds" \
+        --argjson rf "$rl_failopen" --argjson rb "${rl_backend:-null}" \
         '. + {ledger_entries_after: $e, balance_drift: $d, declined_after: $x, warmup: $w,
-              ratelimit_checks_after: $rc, ratelimit_seconds_after: $rs, ratelimited_request_seconds_after: $rr}' \
+              ratelimit_checks_after: $rc, ratelimit_seconds_after: $rs, ratelimited_request_seconds_after: $rr,
+              ratelimit_backend: $rb, ratelimit_failopen_after: $rf}' \
         "$out/step-$row.json" | tee -a "$results"
     done
     sleep 2
