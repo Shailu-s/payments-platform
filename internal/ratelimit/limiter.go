@@ -1,4 +1,5 @@
-// Package ratelimit enforces per-key quotas in PostgreSQL across API instances.
+// Package ratelimit enforces per-key quotas across API instances, counted in
+// PostgreSQL (Limiter) or Redis (RedisLimiter).
 package ratelimit
 
 import (
@@ -40,7 +41,8 @@ type Decision struct {
 // Allow counts every request, including refusals, and reports quota remaining.
 // An atomic upsert serialises increments; a separate read-then-write would race.
 func (l *Limiter) Allow(ctx context.Context, apiKeyID string) (Decision, error) {
-	windowStart := l.windowStart(nowUTC())
+	now := nowUTC()
+	windowStart := l.windowStart(now)
 	resetAt := windowStart.Add(l.window)
 
 	const q = `
@@ -55,25 +57,34 @@ func (l *Limiter) Allow(ctx context.Context, apiKeyID string) (Decision, error) 
 		return Decision{}, fmt.Errorf("rate limit %s: %w", apiKeyID, err)
 	}
 
+	return decide(count, l.limit, now, resetAt), nil
+}
+
+// decide turns the window's count, this request included, into a Decision.
+func decide(count, limit int, now, resetAt time.Time) Decision {
 	decision := Decision{
-		Allowed:   count <= l.limit,
-		Limit:     l.limit,
-		Remaining: max(l.limit-count, 0),
+		Allowed:   count <= limit,
+		Limit:     limit,
+		Remaining: max(limit-count, 0),
 		ResetAt:   resetAt,
 	}
 	if !decision.Allowed {
 		// Rounded up: a Retry-After of 0 invites an immediate retry that is
 		// certain to be refused again.
-		decision.RetryAfter = max(time.Until(resetAt).Round(time.Second), time.Second)
+		decision.RetryAfter = max(resetAt.Sub(now).Round(time.Second), time.Second)
 	}
-	return decision, nil
+	return decision
+}
+
+func (l *Limiter) windowStart(now time.Time) time.Time {
+	return windowStart(now, l.window)
 }
 
 // windowStart truncates to the current window boundary. Truncating in Go rather
 // than with date_trunc keeps the window size configurable: date_trunc only
 // knows about named units like 'minute'.
-func (l *Limiter) windowStart(now time.Time) time.Time {
-	return now.UTC().Truncate(l.window)
+func windowStart(now time.Time, window time.Duration) time.Time {
+	return now.UTC().Truncate(window)
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }
