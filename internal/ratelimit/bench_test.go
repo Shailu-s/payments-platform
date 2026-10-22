@@ -98,7 +98,7 @@ func benchRedis(b *testing.B) *redis.Client {
 	if url == "" {
 		url = "redis://localhost:6379/15"
 	}
-	opts, err := RedisOptions(url, 4)
+	opts, err := RedisOptions(url, 4, 4)
 	if err != nil {
 		b.Fatal(err)
 	}

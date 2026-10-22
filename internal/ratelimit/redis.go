@@ -13,16 +13,21 @@ import (
 )
 
 // RedisOptions parses url and sets the client up for a check on every
-// request: socket reads and writes follow the caller's deadline, and a
-// failed call is not retried (the next request tries a fresh connection).
-func RedisOptions(url string, poolSize int) (*redis.Options, error) {
+// request: socket reads and writes follow the caller's deadline, a failed
+// call is not retried, and minIdle connections are opened up front and kept.
+func RedisOptions(url string, poolSize, minIdle int) (*redis.Options, error) {
 	opts, err := redis.ParseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("parse redis url: %w", err)
 	}
 	opts.PoolSize = poolSize
+	// A warm pool: go-redis closes a connection whose call timed out, and a
+	// new connection's handshake took up to ~27 ms under load. Started empty,
+	// one slow moment cascaded into dial, timeout, close, dial. The pool
+	// refills to minIdle in the background, off the request path.
+	opts.MinIdleConns = minIdle
 	opts.ContextTimeoutEnabled = true
-	// Allow's own 10 ms deadline bounds the hot path (ContextTimeoutEnabled).
+	// Allow's own deadline bounds the hot path (ContextTimeoutEnabled).
 	// These only bound calls without a tighter deadline: the startup ping and
 	// the handshake of a new connection, which took up to ~27 ms when 50 were
 	// opened at once against Docker Desktop.
@@ -31,15 +36,21 @@ func RedisOptions(url string, poolSize int) (*redis.Options, error) {
 	opts.PoolTimeout = redisTimeout
 	opts.DialTimeout = 100 * time.Millisecond
 	opts.MaxRetries = -1
+	// One dial attempt: by default go-redis redials a refused connection five
+	// times, 100 ms apart, so a stopped Redis would hold every check for the
+	// whole deadline instead of failing it at once.
+	opts.DialerRetries = 1
 	// Only a managed Redis Enterprise sends these; skip the handshake round trip.
 	opts.MaintNotificationsConfig = &maintnotifications.Config{Mode: maintnotifications.ModeDisabled}
 	return opts, nil
 }
 
-// redisTimeout bounds every Allow call to Redis. A healthy local Redis answers
-// in well under a millisecond; one that takes longer than this is treated as
-// down.
-const redisTimeout = 10 * time.Millisecond
+// redisTimeout bounds every Allow call to Redis. It detects a broken Redis,
+// not a busy one: at 10 ms, 2-6 % of checks failed open on a loaded laptop.
+// The cost is up to 50 ms added to each rate-limited request while Redis
+// accepts connections but does not answer (a refused connection fails at
+// once). Card network routes are not rate limited, so taps never pay it.
+const redisTimeout = 50 * time.Millisecond
 
 // incrWindow counts one request and starts the key's expiry on the first, in
 // one atomic step: a crash between a separate INCR and EXPIRE would leave a

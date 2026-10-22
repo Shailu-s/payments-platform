@@ -68,10 +68,11 @@ func main() {
 
 	var opts []api.Option
 	if backend == "redis" {
-		// Twice the admission limit (3 per pool connection): admission bounds
-		// the money routes only, and reads are checked too. A check holds a
-		// connection for ~0.1 ms, so this is far from the bottleneck.
-		redisOpts, err := ratelimit.RedisOptions(redisURL, 6*int(pool.Config().MaxConns))
+		// At most twice the admission limit (3 per pool connection):
+		// admission bounds the money routes only, and reads are checked too.
+		// The admission limit's worth stays open and warm.
+		admission := 3 * int(pool.Config().MaxConns)
+		redisOpts, err := ratelimit.RedisOptions(redisURL, 2*admission, admission)
 		if err != nil {
 			slog.Error("bad REDIS_URL", "error", err)
 			os.Exit(1)

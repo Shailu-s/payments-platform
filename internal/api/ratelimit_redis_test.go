@@ -20,7 +20,7 @@ import (
 // Redis to be built.
 func redisClientAt(t *testing.T, url string) *redis.Client {
 	t.Helper()
-	opts, err := ratelimit.RedisOptions(url, 4)
+	opts, err := ratelimit.RedisOptions(url, 4, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

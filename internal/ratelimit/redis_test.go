@@ -17,14 +17,15 @@ var testRedisURL string
 
 // relaxed is one API replica's client with the latency bounds lifted, for
 // tests about counting, not timing: 200 requests released at once through Docker Desktop's port forwarding can take
-// longer than 10 ms, which would fail them open and hide what is counted.
+// longer than the check's deadline, which would fail them open and hide what is counted.
 func relaxed(tb testing.TB, poolSize int) *redis.Client {
 	tb.Helper()
-	opts, err := RedisOptions(testRedisURL, poolSize)
+	opts, err := RedisOptions(testRedisURL, poolSize, 0)
 	if err != nil {
 		tb.Fatal(err)
 	}
 	opts.ReadTimeout, opts.WriteTimeout, opts.PoolTimeout = 5*time.Second, 5*time.Second, 5*time.Second
+	opts.DialerRetries = 0 // go-redis default: redial, as 200 dials at once can see a reset
 	client := redis.NewClient(opts)
 	tb.Cleanup(func() { _ = client.Close() })
 	return client
@@ -221,8 +222,9 @@ func TestRedisDownFailsOpen(t *testing.T) {
 	if !d.Allowed || !d.Degraded || d.Limit != 100 {
 		t.Errorf("decision = %+v, want allowed, degraded, limit 100", d)
 	}
-	if elapsed >= 50*time.Millisecond {
-		t.Errorf("Allow took %v with Redis down, want under 50ms", elapsed)
+	// A refused connection must not wait out redisTimeout.
+	if limit := redisTimeout / 2; elapsed >= limit {
+		t.Errorf("Allow took %v with Redis down, want under %v: a refused dial should fail at once", elapsed, limit)
 	}
 }
 
@@ -275,11 +277,30 @@ func TestRedisSlowFailsOpenWithinDeadline(t *testing.T) {
 
 func clientFor(tb testing.TB, addr string) *redis.Client {
 	tb.Helper()
-	opts, err := RedisOptions("redis://"+addr+"/14", 4)
+	opts, err := RedisOptions("redis://"+addr+"/14", 4, 0)
 	if err != nil {
 		tb.Fatal(err)
 	}
 	client := redis.NewClient(opts)
 	tb.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+// The pool opens its minimum idle connections up front, so the first checks
+// under load do not each pay a dial and handshake inside their deadline.
+func TestRedisPoolStartsWarm(t *testing.T) {
+	opts, err := RedisOptions(testRedisURL, 10, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := redis.NewClient(opts)
+	t.Cleanup(func() { _ = client.Close() })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for client.PoolStats().IdleConns < 5 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if idle := client.PoolStats().IdleConns; idle < 5 {
+		t.Fatalf("%d idle connections before any command, want 5", idle)
+	}
 }
