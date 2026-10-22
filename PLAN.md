@@ -1335,7 +1335,7 @@ scaling steps and their triggers) and `docs/flows/` (request flow diagrams) on `
 they ship with phase 18. ROADMAP progress rows and phase log updated to merged.
 
 **2026-10-22 — Phase 18 (rate limiter in Redis, docs catch-up) built on
-`phase-18-redis-limiter`; PR open, not merged.** Executor followed
+`phase-18-redis-limiter`; PR open, not merged (numbers superseded by the next entry).** Executor followed
 `briefs/phase-18-redis-limiter.md`. Commits: docs catch-up (phases 16/17 merged, flow docs);
 compose service `redis` (redis:7-alpine, no volume, no persistence) and go-redis v9.23.0;
 `ratelimit.RedisLimiter` (one Lua script: `INCR`, `PEXPIRE` 2 × window on the first hit,
@@ -1360,3 +1360,19 @@ rate under load on this machine; the regression rule needs a re-run on an idle m
 Owner action: add `RATE_LIMIT_BACKEND=redis` and `REDIS_URL=redis://localhost:6379/0` to
 `.env`. Tests in per-package schemas and Redis db 14; benchmarks against `payments_bench`
 (dropped) and Redis db 15; Kafka started for the race suite and stopped. PR #20.
+
+**2026-10-22 — Phase 18 review fix: warm Redis pool, 50 ms deadline (PR #20).** Orchestrator
+review: the 2–6 % fail-open rate was a parameter problem. The pool started empty, go-redis
+closes a connection whose call timed out, and a handshake took up to ~27 ms under load, so
+one slow moment cascaded (dial, timeout, close, dial). Commit `bd47ea0`: `MinIdleConns` =
+admission limit (30 at pool 10, pool size 60), `redisTimeout` 50 ms (detects a broken
+Redis, not a busy one; cost: up to 50 ms per rate-limited request while Redis accepts but
+does not answer; taps are not rate limited), `DialerRetries = 1` (go-redis redials a refused
+connection 5 × 100 ms by default, which held a stopped-Redis check for the whole deadline).
+Failing first: no `MinIdleConns` -> `TestRedisPoolStartsWarm` 0 idle; default dial retries
+-> `TestRedisDownFailsOpen` 51.7 ms (bound redisTimeout/2); no own deadline -> 102 ms
+against a silent Redis (bound 70 ms). Re-run, 2 pairs vs main (battery, `caffeinate -i`):
+fail-opens 0–0.13 % of checks at spread 500/1,000 (was 1.8–6.1 %), `Allow` 0.21–0.40 ms vs
+main 0.43–2.46, share 12.1–16.8 % vs 24.4–35.4 % (< 5 % not reachable through Docker
+Desktop: ~0.1 ms per round trip serially), spread p99 at 500 10.9/21.7 vs 34.8/23.8 ms,
+hot ceiling 1,066/888 vs 1,345/950 accepted/s (main alone 804–1,345 at hot 1,500), 0 drift.

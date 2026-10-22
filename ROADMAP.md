@@ -21,7 +21,7 @@ method, the rules and the session LOG stay in PLAN.md.
 | 15 network settlement and reconciliation | merged 2026-10-17 | #17 | 20 concurrent settlements of one day -> 1 row, 1 ledger transaction, payable back to 0; one corrupted day -> all 9 exception classes, ledger unchanged; 10 simulator scenarios end to end -> 9 MATCHED + 1 offline purchase; same run ID + bytes -> same run, other bytes refused; settle 10,000 lines ~4 ms, reconcile 10,000 ~55 ms |
 | 16 benchmark and evidence | merged 2026-10-17 | #18 | auth-spread knee ~1,000/s (p99 9.4 ms at 500, 68 ms at 1,000, median of 3, laptop under a video call); hot card ~500 approvals/s clean; card day: tap p99 6 -> 43 ms during a 10,000-line clearing import + 2,000 expiries, books reconcile (9,940 MATCHED + 60 offline), 0 drift; 20 concurrent copies x 30 auth_ids under load -> 1 row/hold each; 400 early/racing reversals -> each released once; SIGKILLed API -> network and issuer agree, 0 partial holds |
 | 17 load shedding (post-V2 tuning) | merged 2026-10-18 | #19 | offered 3,000 taps/s: 1,352-1,903 approved/s vs main 60-862 (collapse), excess refused with 503 overloaded; transfers at 2,000/s: 1,481-1,489 accepted, p99 42-44 ms vs main 826-1,607, p99 4-5 s; 100 verifications -> 1 key query; 50 concurrent misses -> 1 query; rate limiter 20-25 % of a transfer below the knee |
-| 18 rate limiter in Redis (post-V2 tuning) | in review | #20 | 200 concurrent checks through 4 Redis clients, limit 100 -> exactly 100 allowed (GET-then-INCR: 142); Redis down/silent -> served, degraded, in < 50 ms / <= 30 ms; limiter share of a transfer 26-38 % -> 10-15 % (target < 5 % missed, laptop under load), 2-6 % of checks failed open below the knee |
+| 18 rate limiter in Redis (post-V2 tuning) | in review | #20 | 200 concurrent checks through 4 Redis clients, limit 100 -> exactly 100 allowed (GET-then-INCR: 142); Redis down/silent -> served, degraded, at once / within 50 ms + 20; limiter share of a transfer 24-35 % -> 12-17 % (target < 5 % missed, laptop), 0-0.13 % of checks failed open below the knee after warming the pool (2-6 % before) |
 
 **V2 completed when phase 16 merged (2026-10-17):** the debit card backend, phases 8-16. Next: V3 (stablecoin top-up).
 
@@ -360,11 +360,13 @@ phase 17.
 **2026-10-22 — Phase 18, rate limiter in Redis (post-V2 tuning) (in review).** The per-key
 fixed window counts in Redis: `ratelimit.RedisLimiter`, one Lua script (`INCR`, `PEXPIRE`
 2 × window on the first hit; key `rl:<key id>:<window start>`), no sweeper. Each check runs
-under a 10 ms deadline and fails open on any Redis error (`Decision.Degraded`,
+under a 50 ms deadline on a warm pool (`MinIdleConns` = admission limit; a 10 ms
+deadline on an empty pool failed open on 2–6 % of checks) and fails open on any Redis error (`Decision.Degraded`,
 `payments_ratelimit_failopen_total`, one warning per second at most); the Postgres limiter
 is unchanged and selectable with `RATE_LIMIT_BACKEND=postgres`. `/readyz` does not depend on
 Redis. Compose service `redis` (no volume, no persistence). Proof:
 `TestRedisLimitHoldsAcrossReplicas` (GET-then-INCR demo allows 142 of 200),
 `TestRedisWindowKeyExpires`, `TestRedisDownFailsOpen`,
 `TestRedisSlowFailsOpenWithinDeadline`, `TestRateLimitHeadersAndRefusalWithRedis`. Number:
-see BENCHMARKS.md phase 18 (share cut 43–72 %, not to < 5 %; fail-opens under load).
+see BENCHMARKS.md phase 18 (share 12–17 % vs main 24–35 %, not < 5 %; fail-opens 0–0.13 %
+below the knee; hot ceiling lower than main within main's own noise).
