@@ -1359,4 +1359,4 @@ spread p99 at 500 43.6/57.3 vs main 50.0/28.8 ms and hot ceiling 871/730 vs 736/
 rate under load on this machine; the regression rule needs a re-run on an idle machine.
 Owner action: add `RATE_LIMIT_BACKEND=redis` and `REDIS_URL=redis://localhost:6379/0` to
 `.env`. Tests in per-package schemas and Redis db 14; benchmarks against `payments_bench`
-(dropped) and Redis db 15; Kafka started for the race suite and stopped.
+(dropped) and Redis db 15; Kafka started for the race suite and stopped. PR #20.
