@@ -19,10 +19,11 @@ method, the rules and the session LOG stay in PLAN.md.
 | 13 clearing | merged 2026-10-17 | #15 | same file twice -> 0 changes; 4 concurrent importers of one file -> each line posted once; crash at line 3 of 5, rerun -> 5 posted once; clearing racing reversals and expiry on 40 holds -> 0 both released and charged; shortfall never overdraws; import 10,000 lines ~1,300/s, replay ~16 ms |
 | 14 refunds | merged 2026-10-17 | #16 | refund = new transaction (payable -> available), charge's entries unchanged; refunds past the purchase credited and flagged; same refund line twice / 4 concurrent importers -> credited once; 4 concurrent PostDeferred runs -> each deferred line once; import 10,000 refunds ~1,250/s |
 | 15 network settlement and reconciliation | merged 2026-10-17 | #17 | 20 concurrent settlements of one day -> 1 row, 1 ledger transaction, payable back to 0; one corrupted day -> all 9 exception classes, ledger unchanged; 10 simulator scenarios end to end -> 9 MATCHED + 1 offline purchase; same run ID + bytes -> same run, other bytes refused; settle 10,000 lines ~4 ms, reconcile 10,000 ~55 ms |
-| 16 benchmark and evidence | in review | #18 | auth-spread knee ~1,000/s (p99 9.4 ms at 500, 68 ms at 1,000, median of 3, laptop under a video call); hot card ~500 approvals/s clean; card day: tap p99 6 -> 43 ms during a 10,000-line clearing import + 2,000 expiries, books reconcile (9,940 MATCHED + 60 offline), 0 drift; 20 concurrent copies x 30 auth_ids under load -> 1 row/hold each; 400 early/racing reversals -> each released once; SIGKILLed API -> network and issuer agree, 0 partial holds |
-| 17 load shedding (post-V2 tuning) | in review | #19 | offered 3,000 taps/s: 1,352-1,903 approved/s vs main 60-862 (collapse), excess refused with 503 overloaded; transfers at 2,000/s: 1,481-1,489 accepted, p99 42-44 ms vs main 826-1,607, p99 4-5 s; 100 verifications -> 1 key query; 50 concurrent misses -> 1 query; rate limiter 20-25 % of a transfer below the knee |
+| 16 benchmark and evidence | merged 2026-10-17 | #18 | auth-spread knee ~1,000/s (p99 9.4 ms at 500, 68 ms at 1,000, median of 3, laptop under a video call); hot card ~500 approvals/s clean; card day: tap p99 6 -> 43 ms during a 10,000-line clearing import + 2,000 expiries, books reconcile (9,940 MATCHED + 60 offline), 0 drift; 20 concurrent copies x 30 auth_ids under load -> 1 row/hold each; 400 early/racing reversals -> each released once; SIGKILLed API -> network and issuer agree, 0 partial holds |
+| 17 load shedding (post-V2 tuning) | merged 2026-10-18 | #19 | offered 3,000 taps/s: 1,352-1,903 approved/s vs main 60-862 (collapse), excess refused with 503 overloaded; transfers at 2,000/s: 1,481-1,489 accepted, p99 42-44 ms vs main 826-1,607, p99 4-5 s; 100 verifications -> 1 key query; 50 concurrent misses -> 1 query; rate limiter 20-25 % of a transfer below the knee |
+| 18 rate limiter in Redis (post-V2 tuning) | in review | #20 | 200 concurrent checks through 4 Redis clients, limit 100 -> exactly 100 allowed (GET-then-INCR: 142); Redis down/silent -> served, degraded, at once / within 50 ms + 20; limiter share of a transfer 24-35 % -> 12-17 % (target < 5 % missed, laptop), 0-0.13 % of checks failed open below the knee after warming the pool (2-6 % before) |
 
-**V2 complete when phase 16 merges (2026-10-17):** the debit card backend, phases 8-16. Next: V3 (stablecoin top-up).
+**V2 completed when phase 16 merged (2026-10-17):** the debit card backend, phases 8-16. Next: V3 (stablecoin top-up).
 
 Dated entries per phase are in the [phase log](#phase-log) at the bottom.
 
@@ -329,7 +330,7 @@ later than its chain's first posted purchase (advice or incremental after cleari
 `TestFindingsAreAppendOnly`, `TestStatementIsDeterministic`. Number: see BENCHMARKS.md
 phase 15.
 
-**2026-10-17 — Phase 16, benchmark and evidence (PR #18, in review). V2 complete.**
+**2026-10-17 — Phase 16, benchmark and evidence (PR #18, merged). V2 complete.**
 `scripts/bench-http.sh` runs a discarded warm-up (`WARMUP`, 15 s) per mode and records it.
 `make bench-day` (`scripts/bench-day.sh`, `cmd/benchday`, `bench/k6/day.js`): one card day
 on `payments_bench_day` — simulator scenarios for a 10,000-line clearing file, 2,000 aged
@@ -342,7 +343,7 @@ mechanism removed. README rewritten around the card story. Number: see BENCHMARK
 phase 16. Open risk: past the knee goodput collapses to the 1 s deadline instead of
 shedding early.
 
-**2026-10-18 — Phase 17, load shedding (post-V2 tuning) (PR #19, in review).** Past the knee,
+**2026-10-18 — Phase 17, load shedding (post-V2 tuning) (PR #19, merged).** Past the knee,
 phase 16 measured goodput collapsing to the 1 s deadline. Taps, advices, reversals and
 transfer creations now pass a process-wide admission limit (buffered-channel semaphore,
 3 × pool size, never waits: full -> `503 overloaded`, `Retry-After: 1`) and wait at most
@@ -355,3 +356,17 @@ exports the rate limiter's time. Proof: `TestExcessRequestsAreRefusedImmediately
 `TestAPIKeyCacheServesWithoutTheDatabase`, `TestRevokedKeyIsEvictedLocally`,
 `TestCachedKeyExpiresAfterTTL`, `TestConcurrentMissesQueryOnce`. Number: see BENCHMARKS.md
 phase 17.
+
+**2026-10-22 — Phase 18, rate limiter in Redis (post-V2 tuning) (in review).** The per-key
+fixed window counts in Redis: `ratelimit.RedisLimiter`, one Lua script (`INCR`, `PEXPIRE`
+2 × window on the first hit; key `rl:<key id>:<window start>`), no sweeper. Each check runs
+under a 50 ms deadline on a warm pool (`MinIdleConns` = admission limit; a 10 ms
+deadline on an empty pool failed open on 2–6 % of checks) and fails open on any Redis error (`Decision.Degraded`,
+`payments_ratelimit_failopen_total`, one warning per second at most); the Postgres limiter
+is unchanged and selectable with `RATE_LIMIT_BACKEND=postgres`. `/readyz` does not depend on
+Redis. Compose service `redis` (no volume, no persistence). Proof:
+`TestRedisLimitHoldsAcrossReplicas` (GET-then-INCR demo allows 142 of 200),
+`TestRedisWindowKeyExpires`, `TestRedisDownFailsOpen`,
+`TestRedisSlowFailsOpenWithinDeadline`, `TestRateLimitHeadersAndRefusalWithRedis`. Number:
+see BENCHMARKS.md phase 18 (share 12–17 % vs main 24–35 %, not < 5 %; fail-opens 0–0.13 %
+below the knee; hot ceiling lower than main within main's own noise).

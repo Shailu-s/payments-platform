@@ -18,6 +18,20 @@ services:
       retries: 15
       start_period: 3s
 
+  redis:
+    image: redis:7-alpine
+    container_name: payments-redis
+    # No volume and no persistence: it only holds rate-limit counters, which
+    # expire within two windows and are safe to lose.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   mock-bank:
     build:
       context: ..

@@ -24,6 +24,12 @@ type DB interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
+// rateLimiter is a per-key quota: ratelimit.Limiter (Postgres) or
+// ratelimit.RedisLimiter.
+type rateLimiter interface {
+	Allow(ctx context.Context, apiKeyID string) (ratelimit.Decision, error)
+}
+
 type Server struct {
 	db DB
 	// hot serves the money routes: it refuses rather than queue for a
@@ -31,7 +37,7 @@ type Server struct {
 	hot DB
 	// keys caches verified api keys; nil verifies every request against db.
 	keys    *auth.Cache
-	limiter *ratelimit.Limiter
+	limiter rateLimiter
 	gate    *accountGate
 	// admit holds one token per request in flight on the money routes; nil
 	// admits everything.
@@ -44,6 +50,8 @@ type Server struct {
 	rateLimitChecks  atomic.Uint64
 	rateLimitNanos   atomic.Uint64
 	rateLimitedNanos atomic.Uint64
+	// Requests served unchecked because the limiter's store was unreachable.
+	rateLimitFailOpen atomic.Uint64
 }
 
 const (
@@ -60,8 +68,18 @@ const (
 	requestTimeout = 5 * time.Second
 )
 
-func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte) *Server {
-	return &Server{
+// Option configures a Server built by NewServer.
+type Option func(*Server)
+
+// WithRateLimiter replaces the default Postgres rate limiter, e.g. with
+// ratelimit.NewRedis.
+func WithRateLimiter(l rateLimiter) Option {
+	return func(s *Server) { s.limiter = l }
+}
+
+// NewServer counts rate limits in Postgres unless an option says otherwise.
+func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte, opts ...Option) *Server {
+	s := &Server{
 		db:            pool,
 		hot:           newBoundedPool(pool, poolAcquireWait),
 		keys:          auth.NewCache(pool, auth.DefaultCacheTTL, auth.DefaultCacheSize),
@@ -71,6 +89,10 @@ func NewServer(pool *pgxpool.Pool, webhookSecret, networkSecret []byte) *Server 
 		webhookSecret: append([]byte(nil), webhookSecret...),
 		networkSecret: append([]byte(nil), networkSecret...),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // hotDB is the database for taps, advices, reversals and transfer creations.
@@ -81,12 +103,14 @@ func (s *Server) hotDB() DB {
 	return s.db
 }
 
-// StartRateLimitSweeper bounds retained rate-limit windows until ctx is cancelled.
+// StartRateLimitSweeper bounds retained rate-limit windows until ctx is
+// cancelled. Only the Postgres limiter keeps rows; Redis keys expire.
 func (s *Server) StartRateLimitSweeper(ctx context.Context) {
-	if s.limiter == nil {
+	pg, ok := s.limiter.(*ratelimit.Limiter)
+	if !ok || pg == nil {
 		return
 	}
-	go s.limiter.RunSweeper(ctx, sweepInterval, sweepRetention)
+	go pg.RunSweeper(ctx, sweepInterval, sweepRetention)
 }
 
 // Handler builds the router and middleware stack.

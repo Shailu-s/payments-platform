@@ -165,6 +165,13 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 
 		// Include quota on successes too, so callers can pace requests.
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(decision.Limit))
+		if decision.Degraded {
+			// The counter was unreachable: serve unchecked, and do not
+			// invent a remaining quota or reset time.
+			s.rateLimitFailOpen.Add(1)
+			next.ServeHTTP(w, r)
+			return
+		}
 		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(decision.Remaining))
 		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(decision.ResetAt.Unix(), 10))
 

@@ -13,8 +13,10 @@ import (
 
 	"github.com/Shailu-s/payments-platform/internal/api"
 	"github.com/Shailu-s/payments-platform/internal/config"
+	"github.com/Shailu-s/payments-platform/internal/ratelimit"
 	"github.com/Shailu-s/payments-platform/internal/webhooks"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -25,8 +27,17 @@ func main() {
 	addr := env.Require("API_ADDR")
 	webhookSecret := env.Require("MOCKBANK_WEBHOOK_SECRET")
 	networkSecret := env.Require("NETWORK_SECRET")
+	backend := env.Require("RATE_LIMIT_BACKEND")
+	var redisURL string
+	if backend == "redis" {
+		redisURL = env.Require("REDIS_URL")
+	}
 	if err := env.Err(); err != nil {
 		slog.Error(err.Error())
+		os.Exit(1)
+	}
+	if backend != "redis" && backend != "postgres" {
+		slog.Error("RATE_LIMIT_BACKEND must be redis or postgres", "got", backend)
 		os.Exit(1)
 	}
 
@@ -55,7 +66,29 @@ func main() {
 	backgroundCtx, stopBackground := context.WithCancel(ctx)
 	defer stopBackground()
 
-	apiServer := api.NewServer(pool, []byte(webhookSecret), []byte(networkSecret))
+	var opts []api.Option
+	if backend == "redis" {
+		// At most twice the admission limit (3 per pool connection):
+		// admission bounds the money routes only, and reads are checked too.
+		// The admission limit's worth stays open and warm.
+		admission := 3 * int(pool.Config().MaxConns)
+		redisOpts, err := ratelimit.RedisOptions(redisURL, 2*admission, admission)
+		if err != nil {
+			slog.Error("bad REDIS_URL", "error", err)
+			os.Exit(1)
+		}
+		client := redis.NewClient(redisOpts)
+		if err := client.Ping(ctx).Err(); err != nil {
+			slog.Error("no redis", "error", err)
+			slog.Error("run `docker compose -f docker/docker-compose.yml up -d --wait redis` first")
+			os.Exit(1)
+		}
+		defer client.Close()
+		opts = append(opts, api.WithRateLimiter(ratelimit.NewRedis(client, api.DefaultRateLimit, api.DefaultRateWindow)))
+	}
+	slog.Info("rate limiter", "backend", backend)
+
+	apiServer := api.NewServer(pool, []byte(webhookSecret), []byte(networkSecret), opts...)
 	apiServer.StartRateLimitSweeper(backgroundCtx)
 
 	srv := &http.Server{

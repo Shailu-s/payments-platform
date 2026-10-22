@@ -78,7 +78,7 @@ hold-expirer:
 
 bench:
 	@go test ./internal/api -run '^TestLockStrategyComparison$$' -v -count=3
-	@go test ./internal/ratelimit -run '^$$' -bench 'Benchmark(Allow|BaselineRoundTrip)$$' -benchmem -benchtime=1s -count=3
+	@go test ./internal/ratelimit -run '^$$' -bench 'Benchmark(Allow|BaselineRoundTrip|RedisAllow|RedisRoundTrip)$$' -benchmem -benchtime=1s -count=3
 	@$(MAKE) --no-print-directory bench-reconciliation
 	@$(MAKE) --no-print-directory bench-metrics
 

@@ -22,6 +22,7 @@ import (
 	"github.com/Shailu-s/payments-platform/internal/cards"
 	"github.com/Shailu-s/payments-platform/internal/ledger"
 	"github.com/Shailu-s/payments-platform/internal/testdb"
+	"github.com/Shailu-s/payments-platform/internal/testredis"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -233,13 +234,23 @@ func startAPIProcess(t *testing.T, ctx context.Context, schema, addr string) *ex
 	q.Set("search_path", schema)
 	dsn.RawQuery = q.Encode()
 
+	// The production backend: the child refuses to start without Redis.
+	redisURL, err := testredis.URL()
+	if err == nil {
+		err = testredis.Ping(ctx, redisURL)
+	}
+	if err != nil {
+		t.Fatalf("%s", testredis.ConnectionHint(err))
+	}
+
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.CommandContext(ctx, binary, "-test.run=^TestAPIProcess$")
 	cmd.Env = append(os.Environ(), "PAYMENTS_API_HELPER=1", "DATABASE_URL="+dsn.String(), "API_ADDR="+addr,
-		"MOCKBANK_WEBHOOK_SECRET="+killWebhookSecret, "NETWORK_SECRET="+killNetworkSecret)
+		"MOCKBANK_WEBHOOK_SECRET="+killWebhookSecret, "NETWORK_SECRET="+killNetworkSecret,
+		"RATE_LIMIT_BACKEND=redis", "REDIS_URL="+redisURL)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

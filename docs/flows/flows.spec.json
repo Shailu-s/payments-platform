@@ -1,0 +1,332 @@
+{
+  "title": "payments-platform",
+  "overview": "Payment infrastructure that moves money through an external provider (MockBank) while keeping its own append-only double-entry ledger. Everything hard lives in one gap: our COMMIT is instant, the provider actually moving money happens seconds to days later, maybe twice, maybe never. Each flow below is one way the system crosses that gap without losing, duplicating or inventing a cent.",
+  "system_map": "flowchart LR\n  client([Client app]) -->|POST /v1/transfers| api[cmd/api<br/>auth · rate limit · handlers]\n  api -->|one DB txn: transfer + ledger + outbox| pg[(Postgres<br/>transfers · ledger · outbox_events)]\n  relay[cmd/relay<br/>outbox → Kafka] -->|poll unpublished| pg\n  relay -->|produce key=transfer_id| kafka[[Kafka topic: transfers]]\n  kafka -->|group transfer-sender| sender[cmd/sender]\n  kafka -->|group customer-webhooks| whs[cmd/webhook-sender]\n  kafka -->|group watch| watch[cmd/watch]\n  sender -->|claim + POST /transfers| bank{{cmd/mock-bank}}\n  poller[cmd/worker<br/>poller + resolver] -->|claim stuck · lookup unknown| pg\n  poller --> bank\n  bank -->|signed webhook| api\n  whs -->|signed POST, retries, DLQ| cust([Customer endpoint])\n  recon[cmd/reconcile] -->|GET /settlements| bank\n  recon -->|runs + findings| pg\n  sender --> pg\n  whs --> pg",
+  "participants": [
+    { "id": "client", "label": "Client app", "kind": "actor" },
+    { "id": "api", "label": "API (cmd/api)", "kind": "service" },
+    { "id": "pg", "label": "Postgres", "kind": "database" },
+    { "id": "relay", "label": "Relay (cmd/relay)", "kind": "service" },
+    { "id": "kafka", "label": "Kafka: transfers", "kind": "queue" },
+    { "id": "sender", "label": "Sender (cmd/sender)", "kind": "service" },
+    { "id": "poller", "label": "Poller (cmd/worker)", "kind": "service" },
+    { "id": "bank", "label": "MockBank", "kind": "external" }
+  ],
+  "flows": [
+    {
+      "id": "create-transfer",
+      "name": "1. Create transfer",
+      "trigger": "POST /v1/transfers",
+      "summary": "A company pays a vendor $500: POST /v1/transfers with amount 50000 (cents) and Idempotency-Key 7da2f1c9. The API answers 202 processing. Nothing has reached the vendor; what has happened is that $500 left the company account into our settlement account, and an event to go tell the bank was written in the same commit.",
+      "constraint": "The client will retry, two requests will race for the same balance, and the process can die at any line. The transfer, its ledger entries and the 'go pay the bank' event must exist all together or not at all, exactly once per Idempotency-Key, and never overspend.",
+      "steps": [
+        {
+          "from": "client", "to": "api", "label": "POST /v1/transfers + Idempotency-Key", "arrow": "sync", "level": "HLD", "tx": null,
+          "what": "Request enters the middleware chain: request id → metrics → panic recovery → logging, then /v1/ routes go through auth and rate limit before the handler.",
+          "why": "An unauthenticated POST /transfers moves money for anyone who can reach the port; auth is the precondition for the API existing.",
+          "breaks": "Without the chain order, rate limiting would run before we know who the caller is, so one shared quota for everyone.",
+          "cost": "Every /v1 request pays an auth lookup and a rate-limit write before any business logic.",
+          "code": ["internal/api/server.go:59-77", "internal/api/server.go:85-85"],
+          "covers": ["binary:cmd/api", "route:internal/api POST /v1/transfers", "route:internal/api /v1/"]
+        },
+        {
+          "from": "api", "to": "pg", "label": "auth.Verify(hash(bearer key))", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "Bearer token is hashed and looked up in api_keys; revoked or unknown keys get 401. The key row is put on the request context.",
+          "why": "We only store the hash, so a database leak does not leak usable keys.",
+          "breaks": "Storing plaintext keys: one SQL dump and every customer's key can move money.",
+          "cost": "A hash plus a DB read on every request; key can never be shown again after creation.",
+          "code": ["internal/api/middleware.go:167-192"],
+          "covers": ["table:api_keys"]
+        },
+        {
+          "from": "api", "to": "pg", "label": "rate limit: atomic counter per key", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "limiter.Allow increments this key's window in rate_limits atomically; over 100/min returns 429 with Retry-After.",
+          "why": "With two API instances an in-memory counter lets each allow the full quota. The count must live in shared state, and the only shared state in V1 is Postgres.",
+          "breaks": "Read-then-write counting loses the race exactly like idempotency: N+20 concurrent requests and more than N pass.",
+          "cost": "A database write on the hot path for every request. Redis exists to avoid this.",
+          "code": ["internal/api/middleware.go:131-165"],
+          "covers": ["table:rate_limits"]
+        },
+        {
+          "from": "api", "to": "api", "label": "require Idempotency-Key, validate body", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "Idempotency-Key is mandatory (≤255 chars). Body is validated: different accounts, amount > 0 in minor units, currency USD.",
+          "why": "A retry and a genuine second $500 payment are byte-for-byte identical. Only the client can tell them apart, so only the client can supply the key.",
+          "breaks": "Optional key: it is forgotten exactly in the integration that has the flaky network, and that customer gets double-charged.",
+          "cost": "Every client must generate and persist a key per payment.",
+          "code": ["internal/api/transfers.go:84-99", "internal/api/transfers.go:289-301"],
+          "covers": []
+        },
+        {
+          "from": "api", "to": "pg", "label": "both accounts exist + currency", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "One query loads both accounts with WHERE id = ANY($1) and checks currency.",
+          "why": "A missing account should be a clean 400, not a foreign-key violation surfacing as a 500 halfway through the transaction.",
+          "breaks": "Client sees 500 for its own typo and retries forever.",
+          "cost": "One extra round trip outside the transaction; the account could in theory vanish between check and insert (accounts are never deleted, so accepted).",
+          "code": ["internal/api/transfers.go:327-361"],
+          "covers": ["table:accounts"]
+        },
+        {
+          "from": "api", "to": "pg", "label": "BEGIN · SELECT account FOR UPDATE · derive balance", "arrow": "sync", "level": "LLD", "tx": "TX1 · one commit: transfer + ledger + outbox",
+          "what": "Inside the transaction, lock the source account row, then compute balance = Σcredits − Σdebits from ledger_entries. $1,000 balance, two $700 requests: the second waits on the lock, then sees $300 and gets 422.",
+          "why": "A balance read before BEGIN can be spent by a concurrent transfer before this one writes. Future ledger rows don't exist yet and can't be locked, so we lock the account row.",
+          "breaks": "Two $700 transfers both read $1,000 and both commit: $400 invented out of nothing.",
+          "cost": "All spending from one account is serialised. Measured: chosen over SERIALIZABLE, which lost 72/200 valid payments at 50 concurrent writers; but one hot account is a throughput ceiling.",
+          "code": ["internal/api/transfers.go:158-169", "internal/api/balance_check.go:12-33"],
+          "covers": []
+        },
+        {
+          "from": "api", "to": "pg", "label": "INSERT transfers (UNIQUE idempotency_key)", "arrow": "sync", "level": "LLD", "tx": "TX1 · one commit: transfer + ledger + outbox",
+          "what": "Insert the transfer as processing, with the key and a SHA-256 fingerprint of (api key, source, destination, amount, currency). A unique-violation is mapped to ErrDuplicateKey.",
+          "why": "100 retries arrive at the same instant. A SELECT-then-INSERT lets all 100 see 'not found'. Only the unique index serialises them and picks exactly one winner.",
+          "breaks": "The 'if exists' check: concurrent retries all insert and the vendor is paid N times.",
+          "cost": "Losers pay a failed insert plus a retry-read; the fingerprint must cover every field that makes it a different payment.",
+          "code": ["internal/api/transfers.go:171-184", "internal/transfers/transfer.go:69-90", "db/migrations/000007_transfers_idempotency_unique.up.sql:1-5"],
+          "covers": ["table:transfers"]
+        },
+        {
+          "from": "api", "to": "pg", "label": "ledger.Record: debit source, credit settlement", "arrow": "sync", "level": "LLD", "tx": "TX1 · one commit: transfer + ledger + outbox",
+          "what": "Refuses unless Σdebits == Σcredits, then writes one ledger_transactions row and two ledger_entries (savepoint inside TX1): company −50000, acc_settlement_usd +50000.",
+          "why": "The vendor has nothing yet; the money is ours, earmarked. Crediting the vendor now records a fact that isn't true, and the ledger is append-only, so the lie would be permanent.",
+          "breaks": "Crediting the destination directly: if the bank later fails the payment, the vendor's balance already shows money that never arrived.",
+          "cost": "Settlement needs a second ledger transaction later; balances are derived by summing entries, not read from a column.",
+          "code": ["internal/api/transfers.go:186-198", "internal/ledger/record.go:39-98", "db/migrations/000013_immutable_ledger.up.sql:1-10"],
+          "covers": ["table:ledger_transactions", "table:ledger_entries", "trigger:ledger_entries_immutable", "trigger:ledger_transactions_immutable"]
+        },
+        {
+          "from": "api", "to": "pg", "label": "INSERT outbox_events transfer.created · COMMIT", "arrow": "sync", "level": "LLD", "tx": "TX1 · one commit: transfer + ledger + outbox",
+          "what": "Writes the event row (topic transfers, aggregate_id = transfer id) on the same tx, then COMMIT. All five rows land or none do.",
+          "why": "Two systems cannot commit atomically. INSERT then publish-to-Kafka: process dies between them and the transfer exists with nobody ever told to pay it.",
+          "breaks": "Money debited from the company, sitting in settlement forever, never sent to the bank.",
+          "cost": "Delivery is now asynchronous and at-least-once: a relay must exist, and every consumer must be idempotent.",
+          "code": ["internal/api/transfers.go:200-226", "internal/outbox/outbox.go:22-29"],
+          "covers": ["table:outbox_events", "topic:transfers"]
+        },
+        {
+          "from": "api", "to": "client", "label": "202 {status: processing}", "arrow": "reply", "level": "HLD", "tx": null,
+          "what": "202 Accepted, not 201 and never settled: the instruction is recorded, the money has not moved.",
+          "why": "No system with an external rail can synchronously promise the money arrived.",
+          "breaks": "Returning settled: the client ships goods for a payment the bank later rejects.",
+          "cost": "Clients must poll GET /v1/transfers/{id} or consume our customer webhook to learn the outcome.",
+          "code": ["internal/api/transfers.go:122-132"],
+          "covers": []
+        },
+        {
+          "from": "client", "to": "api", "label": "retry same key → replay original answer", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "The retry's INSERT hits the unique index → ErrDuplicateKey → read the winner by key (up to 10 × 20ms while it becomes visible). Same fingerprint: 202 with the original transfer. Different fingerprint: 422. Winner not committed yet: 409.",
+          "why": "The client retried because it never got an answer. A 409 'duplicate' leaves it no wiser; the original result is what it is missing.",
+          "breaks": "Returning an error on retry: the client can't tell success from failure and support tickets follow.",
+          "cost": "Up to ~200ms of polling on a race loser; key reuse with different terms must be a hard error.",
+          "code": ["internal/api/transfers.go:136-150", "internal/api/transfers.go:229-271"],
+          "covers": []
+        }
+      ],
+      "drills": [
+        { "q": "A customer shows two $500 debits with the same Idempotency-Key in their logs. Your code checks 'does a transfer with this key exist' before inserting. Why didn't that stop it?", "a": "Both requests ran the SELECT before either committed, both saw nothing, both inserted. Only a UNIQUE index on idempotency_key serialises them; the loser gets a unique-violation and replays the winner. Cost: the loser does a failed write plus a read." },
+        { "q": "Account has $1,000. Two $700 transfers commit and the account is now −$400. The balance check is there. What's wrong?", "a": "The balance was read without a lock (or before BEGIN). Fix: SELECT ... FOR UPDATE on the account row inside the spending transaction, then derive the balance. Cost: all spending on that account is serialised." },
+        { "q": "The DB shows a transfer in processing for 3 hours and the bank never heard of it. The API published to Kafka right after COMMIT. What happened?", "a": "Dual write: the process died between COMMIT and publish. The outbox row in the same transaction removes the gap; the relay publishes later, possibly twice, so consumers must be idempotent." },
+        { "q": "Why does the vendor's balance not go up at step 8?", "a": "The provider hasn't paid them. Credit goes to acc_settlement_usd; the vendor is credited by a second ledger transaction when the settled webhook arrives. The ledger is append-only, so a premature credit could only be undone by a reversal, not erased." }
+      ]
+    },
+    {
+      "id": "outbox-to-bank",
+      "name": "2. Outbox → Kafka → bank",
+      "trigger": "relay poll every 500ms; Kafka record on topic transfers",
+      "summary": "The transfer.created row for tr_123 sits unpublished in outbox_events. The relay ships it to Kafka keyed by tr_123; the transfer-sender consumer receives it, claims the transfer, POSTs it to MockBank with client_reference tr_123, stores provider_ref pr_9, and only then commits the Kafka offset.",
+      "constraint": "Every hop here can deliver twice (relay crash after produce, consumer crash before offset commit) and the bank call can time out after the bank already moved the money. Duplicates must never become a second payment, and an unknown outcome must never be guessed.",
+      "steps": [
+        {
+          "from": "relay", "to": "relay", "label": "loop: PublishBatch every 500ms", "arrow": "sync", "level": "HLD", "tx": null,
+          "what": "cmd/relay runs relay.Run: publish a batch of up to 100; if the batch was full, go again immediately, else sleep 500ms. On shutdown it finishes the current batch.",
+          "why": "Something has to move outbox rows to Kafka; polling is the simplest relay that needs no CDC infrastructure.",
+          "breaks": "No relay: every transfer stays processing forever (the poller in step 9 is the only safety net).",
+          "cost": "Up to 500ms added latency and a query every half second even when idle.",
+          "code": ["internal/relay/run.go:11-47"],
+          "covers": ["binary:cmd/relay"]
+        },
+        {
+          "from": "relay", "to": "pg", "label": "BEGIN · SELECT unpublished … FOR UPDATE", "arrow": "sync", "level": "LLD", "tx": "TX2 · relay batch",
+          "what": "Selects published_at IS NULL in created_at order, locked so a second relay instance cannot publish the same rows concurrently.",
+          "why": "Two relay replicas without the lock would both publish every event, doubling consumer work and ordering noise.",
+          "breaks": "Concurrent relays double-publish everything (still safe downstream, but needlessly).",
+          "cost": "Relays serialise on the head of the outbox; the transaction stays open across a network call to Kafka.",
+          "code": ["internal/relay/relay.go:15-37"],
+          "covers": []
+        },
+        {
+          "from": "relay", "to": "kafka", "label": "ProduceSync key=transfer_id", "arrow": "sync", "level": "LLD", "tx": "TX2 · relay batch",
+          "what": "Each row becomes a record on topic transfers, key = aggregate_id (tr_123), headers event_id and event_type. Waits for broker ack.",
+          "why": "Keying by transfer id puts all events for one transfer in one partition, so created is seen before settled by any consumer of that partition.",
+          "breaks": "Random keys: transfer.settled could be consumed before transfer.created.",
+          "cost": "Per-transfer ordering only; a hot transfer id can't be spread across partitions.",
+          "code": ["internal/relay/relay.go:38-66"],
+          "covers": []
+        },
+        {
+          "from": "relay", "to": "pg", "label": "UPDATE published_at · COMMIT", "arrow": "sync", "level": "LLD", "tx": "TX2 · relay batch",
+          "what": "Marks the batch published, commits.",
+          "why": "Marking happens only after Kafka acknowledged, so a crash can never mark an event published that Kafka didn't get.",
+          "breaks": "Mark-then-produce: crash in between and the event is lost forever. Produce-then-mark (what we do): crash in between and it's republished. We pick duplicate over lost.",
+          "cost": "At-least-once: duplicates are guaranteed to happen eventually (proved by relay crash_test).",
+          "code": ["internal/relay/relay.go:68-75"],
+          "covers": []
+        },
+        {
+          "from": "kafka", "to": "sender", "label": "PollFetches (group transfer-sender)", "arrow": "async", "level": "HLD", "tx": null,
+          "what": "cmd/sender joins consumer group transfer-sender with auto-commit disabled. Partitions are assigned per member; records from other event types are acknowledged and skipped.",
+          "why": "Auto-commit would commit offsets on a timer, possibly before the payment call finished, so a crash would silently drop the transfer.",
+          "breaks": "Auto-commit + crash mid-call: offset already committed, record never redelivered, transfer stuck.",
+          "cost": "We own offset management and must make every handler safe to re-run.",
+          "code": ["cmd/sender/main.go:48-91", "internal/consumer/consumer.go:15-33"],
+          "covers": ["binary:cmd/sender", "group:transfer-sender"]
+        },
+        {
+          "from": "sender", "to": "pg", "label": "SendByID: claim … FOR UPDATE SKIP LOCKED", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "One UPDATE claims tr_123 only if status = processing AND provider_ref IS NULL AND not in backoff; bumps attempt_count and sets next_attempt_at. No row returned = someone already sent it → acknowledge and move on.",
+          "why": "This record WILL be delivered twice (relay republish, consumer crash, poller race). The claim guard in the database turns a duplicate delivery into a no-op.",
+          "breaks": "Naive send-on-every-record: measured double-paying 29 of 50 transfers.",
+          "cost": "Write before every provider call; backoff is persisted so a crash cannot cause a hot retry loop.",
+          "code": ["internal/worker/sendbyid.go:12-44"],
+          "covers": []
+        },
+        {
+          "from": "sender", "to": "bank", "label": "POST /transfers client_reference=tr_123", "arrow": "sync", "level": "HLD", "tx": null,
+          "what": "provider.Submit sends amount, accounts and our transfer id as client_reference, and classifies the response: 202 accepted, 422/400/409 rejected, 5xx/429 retryable (per MockBank's contract), transport error or garbled 202 = unknown.",
+          "why": "A stable client_reference lets the bank recognise our retry, and lets us later ask 'did you get tr_123?' when we never saw a provider_ref.",
+          "breaks": "Treating a timeout as failure → we refund, but the bank paid: money created. Treating it as retryable → we resubmit: paid twice.",
+          "cost": "Unknown outcomes are parked as unresolved and need a resolver lookup or webhook, adding latency.",
+          "code": ["internal/worker/send.go:14-45", "internal/provider/client.go:84-142"],
+          "covers": ["binary:cmd/mock-bank", "route:cmd/mock-bank POST /transfers"]
+        },
+        {
+          "from": "bank", "to": "sender", "label": "202 {provider_ref: pr_9} → store it", "arrow": "reply", "level": "LLD", "tx": null,
+          "what": "recordAccepted: UPDATE transfers SET provider_ref = pr_9 WHERE id = tr_123 AND provider_ref IS NULL, on a context that survives shutdown.",
+          "why": "provider_ref is what makes the transfer un-claimable again and how the webhook finds it.",
+          "breaks": "Crash after the bank accepted but before this UPDATE: the transfer is claimable again. Documented gap; the bank's client_reference dedup is what saves us.",
+          "cost": "One more write; the shutdown-safe context protects SIGTERM, not SIGKILL.",
+          "code": ["internal/worker/send.go:47-72"],
+          "covers": []
+        },
+        {
+          "from": "sender", "to": "kafka", "label": "CommitRecords (only after handled)", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "Offsets are committed only for records whose handler returned nil; a failing handler is retried every second and blocks later records on that partition.",
+          "why": "Commit-after-process is what makes delivery at-least-once instead of at-most-once.",
+          "breaks": "SIGKILL between step 8 and here: Kafka redelivers tr_123; the claim guard finds provider_ref set and does nothing (make chaos-kill-consumer proves it).",
+          "cost": "A poison record stalls its partition until fixed (no DLQ on this consumer).",
+          "code": ["internal/consumer/consumer.go:34-60"],
+          "covers": []
+        },
+        {
+          "from": "poller", "to": "pg", "label": "safety net: Claim stuck transfers after 30s", "arrow": "async", "level": "HLD", "tx": null,
+          "what": "cmd/worker claims processing transfers with no provider_ref that are past backoff, or brand-new ones older than a 30s head start, and sends them the same way. It also resolves unresolved transfers by looking them up at the bank.",
+          "why": "If Kafka or the relay is down, the outbox still holds the truth in Postgres; something must act on it without Kafka.",
+          "breaks": "Kafka outage = payments stop entirely (measured: poller submitted after 30.2s with Kafka down).",
+          "cost": "Two paths can send the same transfer; correctness relies entirely on the claim guard being shared.",
+          "code": ["internal/worker/claim.go:21-68", "cmd/worker/main.go:43-47"],
+          "covers": ["binary:cmd/worker"]
+        }
+      ],
+      "drills": [
+        { "q": "You SIGKILL the sender right after MockBank returns 202. On restart, does the vendor get paid twice?", "a": "No. The offset wasn't committed so the record is redelivered, but if provider_ref was stored the claim UPDATE matches zero rows and SendByID returns false. If the kill landed before the provider_ref UPDATE, the claim succeeds again and we rely on the bank deduping client_reference: a documented gap." },
+        { "q": "The bank call timed out after 10s. Why don't we retry it, and why don't we fail it?", "a": "We genuinely don't know if money moved. Retry risks paying twice, failing risks refunding a successful payment. It is parked as unresolved until a webhook or a GetByClientReference lookup tells the truth." },
+        { "q": "Kafka is down for an hour. Do transfers still go out?", "a": "Yes, slower. The outbox row is in Postgres; the cmd/worker poller claims transfers older than its 30s head start and sends them. The relay publishes the backlog when Kafka returns and the claim guard makes those late events no-ops." },
+        { "q": "Why is the Kafka record keyed by transfer id?", "a": "Same key, same partition, so all events for one transfer are consumed in order. Cost: no parallelism within one transfer's events, which never matters here." }
+      ]
+    },
+    {
+      "id": "webhook-settle",
+      "name": "3. Bank webhook → settled",
+      "trigger": "POST /v1/webhooks/mockbank (provider calls us)",
+      "summary": "Seconds later MockBank POSTs {event_id: ev_77, provider_ref: pr_9, status: settled} signed with HMAC. We verify it, record ev_77, flip tr_123 to settled, write a second ledger transaction moving $500 from settlement to the vendor, and queue a transfer.settled event for the customer webhook — all in one commit.",
+      "constraint": "Webhooks are forgeable, replayable, duplicated and out of order, and can arrive before we've stored provider_ref. The financial effect must happen exactly once, only for genuine recent messages, and a failed attempt must leave the event retryable.",
+      "steps": [
+        {
+          "from": "bank", "to": "api", "label": "POST /v1/webhooks/mockbank (signed, may repeat)", "arrow": "async", "level": "HLD", "tx": null,
+          "what": "MockBank signs timestamp + '.' + body with the shared secret, sends it, and retries on 5xx with 1-16s backoff using the same event_id. Some behaviours deliberately send it twice. This route sits outside API-key auth.",
+          "why": "The provider is the source of truth about settlement and it pushes, not us pulling.",
+          "breaks": "Without provider retries one dropped request leaves the transfer processing until reconciliation.",
+          "cost": "We must accept unauthenticated-by-API-key traffic and make the endpoint itself safe.",
+          "code": ["cmd/mock-bank/server.go:166-228", "internal/api/server.go:69-70"],
+          "covers": ["route:internal/api POST /v1/webhooks/mockbank"]
+        },
+        {
+          "from": "api", "to": "api", "label": "read ≤64KB · HMAC verify · 5-min window", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "Reads the raw body (capped), recomputes HMAC-SHA256 over the signed timestamp and body, constant-time compares, rejects timestamps outside ±5 minutes. All before JSON parsing or any DB work.",
+          "why": "The URL is public. Anyone who finds it could POST status: settled and get the vendor credited. Signing proves origin; the timestamp bounds replay of a captured request.",
+          "breaks": "Measured red test: an unsigned request credited 50000 cents. Now 401 with no event and no credit.",
+          "cost": "Shared secret to rotate; clock skew > 5 min rejects real events; within 5 min a replay is possible and is stopped by event_id dedup instead.",
+          "code": ["internal/api/webhooks.go:30-45", "internal/webhooks/signature.go:23-43"],
+          "covers": []
+        },
+        {
+          "from": "api", "to": "pg", "label": "find transfer by provider_ref, else client_reference", "arrow": "sync", "level": "LLD", "tx": null,
+          "what": "Looks up tr_123 by pr_9; if the sender hasn't stored pr_9 yet, falls back to the echoed client_reference. Not found at all → 503 so the bank retries.",
+          "why": "The webhook can beat step 8 of flow 2. A 4xx would tell the bank to give up on a perfectly valid event.",
+          "breaks": "Returning 404 here: the settlement is dropped and only reconciliation would ever catch it.",
+          "cost": "Unknown events are retried by the provider until they resolve or the provider gives up.",
+          "code": ["internal/api/webhooks.go:46-68", "internal/api/webhooks.go:121-146"],
+          "covers": []
+        },
+        {
+          "from": "api", "to": "pg", "label": "BEGIN · INSERT webhook_events ON CONFLICT DO NOTHING", "arrow": "sync", "level": "LLD", "tx": "TX3 · event + status + ledger + outbox",
+          "what": "Records ev_77. RowsAffected = 0 means we've seen it → answer already_processed with no effect.",
+          "why": "Duplicates are guaranteed. Check-then-insert races two concurrent deliveries exactly like idempotency keys; insert-first on a unique event_id picks one.",
+          "breaks": "Earlier bug (fixed): the event was recorded in its own commit, the ledger write then failed with 500, and the retry was skipped as 'seen' — settlement lost forever.",
+          "cost": "webhook_events grows forever; dedup memory is unbounded by design.",
+          "code": ["internal/api/webhooks.go:84-97", "internal/api/webhooks.go:148-165"],
+          "covers": ["table:webhook_events"]
+        },
+        {
+          "from": "api", "to": "pg", "label": "Settle: UPDATE … WHERE status IN (processing, unresolved)", "arrow": "sync", "level": "LLD", "tx": "TX3 · event + status + ledger + outbox",
+          "what": "Flip to settled only from a non-terminal state. Zero rows = already terminal → no ledger effect.",
+          "why": "Different event_ids can still describe the same outcome (or a late failed after settled). The status guard is the second line of defence.",
+          "breaks": "Without the guard a second distinct 'settled' event credits the vendor again.",
+          "cost": "A settled-after-failed contradiction is silently ignored here and has to be caught by reconciliation.",
+          "code": ["internal/transfers/transitions.go:22-49"],
+          "covers": []
+        },
+        {
+          "from": "api", "to": "pg", "label": "ledger: debit settlement, credit vendor", "arrow": "sync", "level": "LLD", "tx": "TX3 · event + status + ledger + outbox",
+          "what": "A NEW balanced ledger transaction 'settlement tr_123': acc_settlement_usd −50000, vendor +50000. The creation entries are never touched (DB trigger rejects UPDATE/DELETE).",
+          "why": "Append-only ledger: the full history of every cent stays auditable and a bug can't rewrite the past.",
+          "breaks": "Updating the original entry instead: no record that the money ever sat in settlement; audits can't reconstruct the timeline.",
+          "cost": "More rows; a failure path writes a third transaction (reversal back to source) instead.",
+          "code": ["internal/transfers/transitions.go:51-56"],
+          "covers": []
+        },
+        {
+          "from": "api", "to": "pg", "label": "outbox transfer.settled · COMMIT", "arrow": "sync", "level": "LLD", "tx": "TX3 · event + status + ledger + outbox",
+          "what": "Queues transfer.settled on the same tx, then commits. Event record, status, ledger and outbox all land together; the customer-webhooks consumer will pick it up via the relay.",
+          "why": "If the COMMIT fails, everything including the event record rolls back, so the bank's retry is treated as a first attempt.",
+          "breaks": "Separate commits: customer told 'settled' for a settlement that rolled back, or settled with nobody notified.",
+          "cost": "One longer transaction holding the transfer row lock.",
+          "code": ["internal/transfers/transitions.go:58-70", "internal/transfers/events.go:23-37", "internal/api/webhooks.go:115-118"],
+          "covers": []
+        },
+        {
+          "from": "api", "to": "bank", "label": "200 processed | already_processed", "arrow": "reply", "level": "HLD", "tx": null,
+          "what": "2xx stops the bank retrying. Duplicates also get 200, so the bank never loops on an event we deliberately ignored.",
+          "why": "From the provider's view a duplicate was handled successfully; a 4xx would look like a rejection.",
+          "breaks": "Non-2xx for duplicates: endless provider retries.",
+          "cost": "The provider can't distinguish 'applied' from 'ignored' except by the body.",
+          "code": ["internal/api/webhooks.go:72-82"],
+          "covers": []
+        }
+      ],
+      "drills": [
+        { "q": "The ledger shows the vendor credited twice for tr_123 from two webhook deliveries ten milliseconds apart. Which line is missing?", "a": "Atomic dedup: INSERT webhook_events ... ON CONFLICT (event_id) DO NOTHING inside the same transaction as the ledger write, plus the status guard on Settle. Check-first loses the race." },
+        { "q": "A webhook returned 500 after recording the event. The bank retried and got 'already_processed', but the vendor was never credited. Why, and what fixed it?", "a": "The event row and the financial effect were in separate commits. Now they share one transaction, so a failure rolls back the event row too and the retry is a first attempt." },
+        { "q": "Someone captures a genuine signed 'settled' webhook and replays it 2 minutes later. What stops it? 10 minutes later?", "a": "At 2 minutes the signature and timestamp are valid; the event_id dedup makes it a no-op. At 10 minutes it fails the 5-minute replay window with 401 before any DB work." },
+        { "q": "The settled webhook arrives before the sender saved provider_ref. Why don't we 404?", "a": "We fall back to client_reference; if still unknown we return 503 so the bank retries. A 4xx would make it stop and the settlement would only surface in reconciliation." }
+      ]
+    }
+  ],
+  "out_of_scope": [
+    { "id": "route:internal/api GET /healthz", "reason": "Liveness probe, no business flow." },
+    { "id": "route:internal/api GET /readyz", "reason": "Readiness probe, no business flow." },
+    { "id": "route:internal/api GET /metrics", "reason": "Operational counters." },
+    { "id": "route:cmd/mock-bank GET /healthz", "reason": "Liveness probe of the simulator." },
+    { "id": "route:cmd/mock-bank POST /sandbox/reset", "reason": "Test-only simulator control." },
+    { "id": "route:cmd/mock-bank GET /sandbox/transfers", "reason": "Test-only simulator inspection." },
+    { "id": "binary:cmd/benchseed", "reason": "Benchmark data seeding, not part of the running system." }
+  ]
+}

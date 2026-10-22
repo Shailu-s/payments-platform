@@ -11,6 +11,7 @@ import (
 
 	"github.com/Shailu-s/payments-platform/internal/auth"
 	"github.com/Shailu-s/payments-platform/internal/testdb"
+	"github.com/Shailu-s/payments-platform/internal/testredis"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -30,6 +31,20 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	testPool = pool
+
+	url, err := testredis.URL()
+	if err == nil {
+		testRedisURL = url
+		err = testredis.Ping(ctx, url)
+	}
+	if err != nil {
+		fmt.Fprint(os.Stderr, testredis.ConnectionHint(err))
+		pool.Close()
+		if os.Getenv("LEDGER_TESTS") == "skip" {
+			os.Exit(0)
+		}
+		os.Exit(1)
+	}
 
 	code := m.Run()
 	pool.Close()

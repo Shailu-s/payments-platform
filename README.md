@@ -136,8 +136,17 @@ BENCHMARKS.md).
 - **Revoked API keys keep working for up to 30 s** on processes other than the one that
   revoked them: verified keys are cached in memory for 30 s. Unknown keys are not cached
   and still cost a query each.
-- **The rate limiter is in Postgres**: about 20–25 % of a transfer's time below the knee
-  ([BENCHMARKS.md](BENCHMARKS.md#phase-17-shed-load-early-cache-api-keys-2026-10-18)).
+- **The rate limiter counts in Redis and fails open.** Each check is one atomic script
+  under a 50 ms deadline on a pre-warmed connection pool; if Redis is down or slower than
+  that, the request is served
+  unchecked and counted in `payments_ratelimit_failopen_total`, so quotas are not enforced
+  during a Redis outage (admission and the bounded pool still protect the database). On
+  the laptop under load the limiter's share of a transfer fell from 24–35 % to 12–17 %
+  (0.2–0.4 ms per check through Docker Desktop), not the < 5 % targeted, and 0–0.13 % of
+  checks below the knee still timed out and failed open during machine-wide stalls
+  ([BENCHMARKS.md](BENCHMARKS.md#phase-18-rate-limiter-in-redis-2026-10-22)).
+  `RATE_LIMIT_BACKEND=postgres` keeps the old limiter. Replicas take the window from their
+  own clocks, so skew can count a request into the adjacent window at a boundary.
 - **Reconciliation holds a day in memory** (~2.9 KB per record; 100,000 lines ≈ 290 MB).
   `HOLD_AFTER_CLEARING` compares transaction start times, so an incremental that started
   before the clearing transaction but waited on its lock is not caught; a late advice is
@@ -573,4 +582,5 @@ show as transient exceptions. 10,000 rows: parse + snapshot + compare + persist 
   Customers must deduplicate `event_id` from the signed envelope.
 - The recurring reconciliation command is process-local, with no durable schedule.
 - Kafka storage is not on a Compose-managed named volume.
-- The auth and rate-limit middleware answer a timeout with 500, not 503.
+- The auth middleware and the Postgres rate limiter answer a timeout with 500, not 503
+  (the Redis rate limiter fails open instead).
