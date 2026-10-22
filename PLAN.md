@@ -1333,3 +1333,30 @@ evidence, V2 complete) merged 2026-10-17; PR #19 (phase 17, load shedding and th
 cache) merged 2026-10-18. The owner added `SYSTEM_DESIGN.md` (the system on one page, the
 scaling steps and their triggers) and `docs/flows/` (request flow diagrams) on `feat/docs`;
 they ship with phase 18. ROADMAP progress rows and phase log updated to merged.
+
+**2026-10-22 — Phase 18 (rate limiter in Redis, docs catch-up) built on
+`phase-18-redis-limiter`; PR open, not merged.** Executor followed
+`briefs/phase-18-redis-limiter.md`. Commits: docs catch-up (phases 16/17 merged, flow docs);
+compose service `redis` (redis:7-alpine, no volume, no persistence) and go-redis v9.23.0;
+`ratelimit.RedisLimiter` (one Lua script: `INCR`, `PEXPIRE` 2 × window on the first hit,
+key `rl:<key id>:<window start unix>`, window computed in Go and shared with the Postgres
+limiter, no sweeper); fail open under a 10 ms per-check deadline (`Decision.Degraded`,
+`payments_ratelimit_failopen_total`, warnings throttled to one a second, `MaxRetries -1`,
+`ContextTimeoutEnabled`); `RATE_LIMIT_BACKEND` (required, redis|postgres) and `REDIS_URL`,
+`api.WithRateLimiter`, sweeper only for Postgres, `/readyz` independent of Redis; bench
+tooling (`BenchmarkRedisAllow`, bench-http flushes Redis db 15 per mode and records the
+backend and fail-open count). Failing first: GET-then-INCR across 4 clients allowed 142 of
+200 against 100; `Allow` returning the error -> `TestRedisDownFailsOpen` and
+`TestRedisSlowFailsOpenWithinDeadline` fail ("want nil: an error answers 500"); no own
+deadline -> 102 ms against a silent Redis (want <= 30 ms); `PEXPIRE` on every hit -> TTL
+reset; middleware without the degraded branch -> Remaining/Reset invented, fail-open count
+0. Benchmarks (battery, machine NOT idle, load 11–12 on 10 cores, 2 pairs vs main
+`dba3f78`): limiter share 26–38 % -> 10–15 % at 500/1,000 (target < 5 % missed); `Allow`
+0.53–1.29 ms vs main 0.58–4.45 ms (serial: 0.10 vs 0.17 ms); 2–6 % of checks failed open
+below the knee (10 ms read timeouts through Docker Desktop; 0.3–0.6 % even at 50 ms);
+spread p99 at 500 43.6/57.3 vs main 50.0/28.8 ms and hot ceiling 871/730 vs 736/851
+(noise larger than the effect); postgres backend ≈ main; 0 drift. Open risks: fail-open
+rate under load on this machine; the regression rule needs a re-run on an idle machine.
+Owner action: add `RATE_LIMIT_BACKEND=redis` and `REDIS_URL=redis://localhost:6379/0` to
+`.env`. Tests in per-package schemas and Redis db 14; benchmarks against `payments_bench`
+(dropped) and Redis db 15; Kafka started for the race suite and stopped.

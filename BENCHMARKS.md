@@ -920,6 +920,116 @@ bounded).
    in-process bucket) would cut that share and free a pool connection per request; see the
    phase 17 log entry for the recommendation.
 
+## Phase 18: rate limiter in Redis (2026-10-22)
+
+The per-key fixed window moves from an `INSERT … ON CONFLICT` on `rate_limits` to one Lua
+script in Redis (`INCR`, `PEXPIRE` on the first hit), under a 10 ms deadline; any Redis
+error or timeout lets the request through (`payments_ratelimit_failopen_total`). Apple M4,
+**battery** (no AC available), `caffeinate -i`, **machine not idle**: other applications
+(browser, editor, a wallet app) and another project's three containers were running, and
+the load average reached 11–12 on 10 cores during the runs. Postgres and Redis both in
+Docker Desktop, reached through its port forwarding. Pool 10, 30 s steps, 15 s discarded
+warm-up per mode. `main` (`dba3f78`) measured from a detached worktree with its own
+scripts, alternating main then branch, two pairs. `balance_drift` 0 and `declined_after` 0
+on every step of every run. Main's numbers are worse than its phase 17 numbers on every
+step (e.g. hot ceiling ~700–850 vs 1,235 accepted/s): treat this section as a same-session
+comparison under load, not a baseline.
+
+```sh
+make bench                                                       # ratelimit lines below
+MODES="spread hot" RATES="500 1000 1500 2000" make bench-http    # main, branch: 2 runs each
+RATE_LIMIT_BACKEND=postgres MODES="spread" RATES="500 1000" make bench-http   # branch, 1 run
+```
+
+New per-step fields: `ratelimit_backend` and `ratelimit_failopen_after` (cumulative; null on
+main).
+
+### One check, serial (`make bench`, 3 runs)
+
+| benchmark | ns/op | allocs |
+|---|---:|---:|
+| `BenchmarkAllow` (Postgres upsert) | 171,000–178,000 | 10 |
+| `BenchmarkBaselineRoundTrip` (Postgres `SELECT 1`) | 88,000–105,000 | 6 |
+| `BenchmarkRedisAllow` (script, production options) | 102,000–115,000, 0 fail-open | 18 |
+| `BenchmarkRedisRoundTrip` (`PING`) | 91,000–119,000 | 6 |
+
+Unloaded, a Redis check is one round trip (~0.1 ms) and the Postgres one is about two
+(~0.17 ms). Most of the 0.1 ms is Docker Desktop's port forwarding, not Redis.
+
+### Transfers (run 1 / run 2)
+
+| step | build | accepted /s | 503s | dropped | p50 ms | p99 ms |
+|---|---|---|---|---|---|---|
+| spread 500 | main | 496 / 499 | 107 / 12 | 0 / 0 | 1.58 / 1.46 | 49.95 / 28.81 |
+| spread 500 | p18 redis | 496 / 492 | 93 / 236 | 0 / 0 | 2.05 / 1.49 | 43.62 / **57.30** |
+| spread 500 | p18 postgres | 495 | 126 | 0 | 1.44 | 27.65 |
+| spread 1,000 | main | 856 / 947 | 4,319 / 1,588 | 0 / 0 | 3.34 / 2.28 | 183.56 / 74.06 |
+| spread 1,000 | p18 redis | 862 / 956 | 4,124 / 1,310 | 0 / 0 | 4.30 / 3.15 | 83.01 / 50.16 |
+| spread 1,000 | p18 postgres | 934 | 1,953 | 0 | 4.67 | 68.43 |
+| spread 1,500 | main | 1,137 / 903 | 10,869 / 17,611 | 0 / 274 | 8.74 / 19.09 | 93.39 / 294.05 |
+| spread 1,500 | p18 redis | 1,294 / 1,056 | 6,164 / 13,296 | 0 / 0 | 9.81 / 10.73 | 54.63 / 100.54 |
+| spread 2,000 | main | 972 / 877 | 30,834 / 33,680 | 0 / 0 | 14.89 / 8.52 | 142.74 / 98.19 |
+| spread 2,000 | p18 redis | 669 / 816 | 39,920 / 35,497 | 0 / 0 | 14.97 / 15.79 | 341.97 / 150.70 |
+| hot 500 | main | 466 / 493 | 999 / 186 | 0 / 0 | 2.37 / 1.48 | 131.59 / 71.76 |
+| hot 500 | p18 redis | 462 / 490 | 1,138 / 298 | 0 / 0 | 2.10 / 1.61 | 257.63 / 83.92 |
+| hot 1,000 | main | 352 / 587 | 19,441 / 12,377 | 0 / 0 | 5.27 / 28.93 | 398.60 / 166.68 |
+| hot 1,000 | p18 redis | 797 / 712 | 6,089 / 8,639 | 0 / 0 | 20.64 / 16.58 | 104.37 / 128.40 |
+| hot 1,500 | main | 695 / **851** | 24,125 / 19,464 | 0 / 0 | 4.51 / 24.92 | 126.85 / 89.84 |
+| hot 1,500 | p18 redis | **871** / 730 | 18,870 / 23,075 | 0 / 0 | 24.17 / 23.80 | 94.20 / 176.93 |
+| hot 2,000 | main | **736** / 515 | 37,920 / 44,539 | 0 / 0 | 0.36 / 0.89 | 102.11 / 349.53 |
+| hot 2,000 | p18 redis | 720 / 424 | 38,401 / 46,458 | 0 / 812 | 1.16 / 5.01 | 342.87 / 643.46 |
+
+### The rate limiter's share of a transfer
+
+From the `/metrics` deltas per step, as in phase 17. `Allow` time includes the checks that
+timed out and failed open (each up to 10 ms).
+
+| spread step | build | time in `Allow` per check | request time from `Allow` on | limiter share | checks failed open |
+|---|---|---:|---:|---:|---:|
+| 500 | main | 3.04 / 0.58 ms | 8.15 / 2.20 ms | 37.2 / 26.1 % | – |
+| 500 | p18 redis | 1.05 / 0.53 ms | 7.41 / 3.59 ms | **14.1 / 14.9 %** | 5.0 / 2.0 % |
+| 500 | p18 postgres | 0.77 ms | 2.56 ms | 30.1 % | – |
+| 1,000 | main | 4.45 / 1.82 ms | 11.62 / 5.83 ms | 38.3 / 31.2 % | – |
+| 1,000 | p18 redis | 1.29 / 0.66 ms | 11.94 / 6.73 ms | **10.8 / 9.8 %** | 6.1 / 1.8 % |
+| 1,000 | p18 postgres | 2.86 ms | 9.48 ms | 30.1 % | – |
+| 1,500 | p18 redis | 0.87 / 1.56 ms | 14.09 / 18.76 ms | 6.2 / 8.3 % | 1.2 / 5.9 % |
+| 2,000 | p18 redis | 2.84 / 2.54 ms | 32.86 / 29.61 ms | 8.6 / 8.6 % | 14.1 / 13.4 % |
+
+The fail-opens are socket read timeouts at the 10 ms deadline (`i/o timeout` in the API
+log), not refused connections. One diagnostic run with the deadline raised to 50 ms (not
+committed) still failed open on 0.6 % / 0.3 % of checks at 500 / 1,000, with 0.88 / 0.64 ms
+per check: under this load some Redis round trips through Docker Desktop take over 50 ms.
+
+### Targets
+
+| Check | Target | Result |
+|---|---|---|
+| Limiter share at 500 / 1,000 | < 5 % (main 20–25 % in phase 17) | **Missed**: 14.1–14.9 % / 9.8–10.8 % vs main 26–37 % / 31–38 % this session (share cut by 43–72 %) |
+| Time in `Allow` per check at 500 / 1,000 | report vs main | 0.53–1.05 / 0.66–1.29 ms vs main 0.58–3.04 / 1.82–4.45 ms (phase 17: 0.27–0.41) |
+| Fail-open count below the knee | 0 | **Missed**: 1.8–6.1 % of checks at 500 and 1,000; 1.2–14.1 % above |
+| Regression rule: transfer spread p99 at 500 | ≤ +20 % vs main | **Mixed**: run 1 43.62 vs 49.95 ms (−13 %); run 2 57.30 vs 28.81 ms (+99 %) |
+| Regression rule: hot transfer ceiling | not lower than main | **Mixed**: best step 871 vs 736 accepted/s (run 1), 730 vs 851 (run 2) |
+| Spread knee / p99 at 1,500 and 2,000 | report | 1,500: 1,056–1,294 accepted, p99 55–101 ms vs main 903–1,137, 93–294 ms; 2,000: 669–816 vs 877–972, p99 151–342 vs 98–143 ms |
+| Balance drift | 0 | **Met** on every step |
+| Branch with `postgres` backend | ≈ main | **Met** within this session's noise: p99 27.65 / 68.43 ms at 500 / 1,000 vs main 28.81–49.95 / 74.06–183.56, share 30.1 % |
+
+### What the numbers say
+
+1. **The limiter's share falls by 43–72 %, not to under 5 %.** Serially a Redis
+   check is one ~0.1 ms round trip against the upsert's ~0.17 ms. Under load both pay
+   Docker Desktop's port forwarding, which shares the 10 cores with k6, the API and
+   Postgres; the Redis check costs 0.5–1.3 ms there, partly from the timed-out checks
+   that each spend up to 10 ms.
+2. **Fail-open is not only an outage mode on this machine.** 2–6 % of checks below the
+   knee timed out at 10 ms and were served unchecked. A timed-out read also discards the
+   connection, so the next check may pay a dial and handshake under the same 10 ms. On a
+   dedicated Redis over a LAN (tens of microseconds) this should be ~0; here it means
+   quotas were enforced on 94–98 % of requests during load.
+3. **The transfer tail is noise-dominated.** The run-to-run spread on main alone (spread
+   500 p99 28.8 vs 50.0 ms; hot ceiling 736 vs 851) is larger than any effect of the
+   limiter, so the regression rule cannot be judged from these runs. Re-run on AC power
+   with the machine idle before relying on them.
+
 ## Regression rule
 
 Each phase's PR must include a re-run of `make bench-http` (same rates) and paste the two

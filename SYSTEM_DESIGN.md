@@ -94,7 +94,7 @@ Do a step **only when its trigger is measured**. Each step has a cost.
 |---|---|---|---|
 | 1 | one hot account slows everyone | fail fast: per-account limit, lock timeout, request deadline | some payments get a fast 503 and must retry |
 | 2 | balance check gets slower with history | keep the balance in one row, DB `CHECK (balance >= 0)` | a stored number that must never drift from the ledger |
-| 3 | every request spends DB trips on auth and rate limits | cache API keys; rate limit in Redis | key revocation delay; one more component |
+| 3 | every request spends DB trips on auth and rate limits | cache API keys (phase 17); rate limit in Redis, failing open (phase 18) | key revocation delay; one more component; quotas unenforced while Redis is down or slow |
 | 4 | one API process is CPU-bound | more API processes + a connection pooler (PgBouncer) | ops; the DB becomes the limit |
 | 5 | tables too big, reads slow down writes | partition ledger by month; read replica for GETs and reconciliation | partition upkeep; replica lag on reads |
 | 6 | one account needs > ~1,000/s | batch its payments into one transaction, or split it into sub-balances | added latency per batch, or more complex balance logic |
